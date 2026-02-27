@@ -159,6 +159,33 @@ def _clean_mask(mask: np.ndarray) -> np.ndarray:
 # Main detection
 # ---------------------------------------------------------------------------
 
+def _grabcut_center_rect(bgr: np.ndarray) -> Optional[np.ndarray]:
+    """
+    GrabCut using a central rectangle as foreground hint.
+    Works on any background type. Returns uint8 mask or None.
+    """
+    h, w = bgr.shape[:2]
+    mx = max(10, int(w * 0.15))
+    my = max(10, int(h * 0.15))
+    rect = (mx, my, w - 2 * mx, h - 2 * my)
+
+    gc_mask  = np.zeros((h, w), dtype=np.uint8)
+    bgd_model = np.zeros((1, 65), dtype=np.float64)
+    fgd_model = np.zeros((1, 65), dtype=np.float64)
+    try:
+        cv2.grabCut(bgr, gc_mask, rect, bgd_model, fgd_model, 4,
+                    cv2.GC_INIT_WITH_RECT)
+        result = np.where(
+            (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0
+        ).astype(np.uint8)
+        ratio = cv2.countNonZero(result) / (h * w)
+        if 0.03 <= ratio <= 0.88:
+            return result
+    except cv2.error:
+        pass
+    return None
+
+
 def detect_putter_bbox(
     bgr: np.ndarray,
     use_grabcut: bool = True,
@@ -167,27 +194,42 @@ def detect_putter_bbox(
     Detect putter bounding box in an image.
     Returns (x_center, y_center, width, height) normalised to [0, 1],
     or None if detection failed or is unreliable.
+
+    Strategy order:
+      1. HSV background removal (green / white / neutral)
+      2. GrabCut with central rectangle (background-agnostic)
+      3. Conservative centre crop (last resort — always succeeds)
     """
     h, w = bgr.shape[:2]
 
-    # Try each background strategy, keep the first one with a usable fg_ratio
-    best_mask = None
+    mask = None
+
+    # --- Strategy 1: HSV background masks ---
     for mask_fn in [_mask_green_bg, _mask_white_bg, _mask_neutral_bg]:
         m = _clean_mask(mask_fn(bgr))
         ratio = cv2.countNonZero(m) / (h * w)
         if 0.03 <= ratio <= 0.85:
-            best_mask = m
+            mask = m
+            # Optionally refine with GrabCut
+            if use_grabcut:
+                refined = _mask_grabcut(bgr, mask)
+                refined = _clean_mask(refined)
+                if cv2.countNonZero(refined) > 0:
+                    mask = refined
             break
 
-    if best_mask is None:
-        return None
-    mask = best_mask
-    fg_ratio = cv2.countNonZero(mask) / (h * w)
+    # --- Strategy 2: GrabCut with centre rect ---
+    if mask is None and use_grabcut:
+        mask = _grabcut_center_rect(bgr)
+        if mask is not None:
+            mask = _clean_mask(mask)
 
-    # Refinement with GrabCut
-    if use_grabcut:
-        mask = _mask_grabcut(bgr, mask)
-        mask = _clean_mask(mask)
+    # --- Strategy 3: centre-crop fallback (always labels something) ---
+    if mask is None:
+        mx = int(w * 0.12)
+        my = int(h * 0.12)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        mask[my:h - my, mx:w - mx] = 255
 
     # Keep largest component (the putter)
     mask = _largest_component(mask)
@@ -201,7 +243,7 @@ def detect_putter_bbox(
     # Quality checks
     if bw < MIN_BOX_PX or bh < MIN_BOX_PX:
         return None
-    if bw / w > 0.98 or bh / h > 0.98:
+    if bw / w > 0.99 or bh / h > 0.99:
         return None   # bbox fills the whole image
 
     # Add small padding
@@ -209,8 +251,8 @@ def detect_putter_bbox(
     pad_y = int(bh * 0.04)
     x  = max(0, x - pad_x)
     y  = max(0, y - pad_y)
-    bw = min(w - x, bw + 2*pad_x)
-    bh = min(h - y, bh + 2*pad_y)
+    bw = min(w - x, bw + 2 * pad_x)
+    bh = min(h - y, bh + 2 * pad_y)
 
     # YOLO format: normalised centre x, centre y, width, height
     cx = (x + bw / 2) / w
