@@ -79,6 +79,16 @@ def _mask_white_bg(bgr: np.ndarray) -> np.ndarray:
     return cv2.bitwise_not(white_mask)
 
 
+def _mask_neutral_bg(bgr: np.ndarray) -> np.ndarray:
+    """Foreground mask for grey/dark/mixed studio backgrounds (low saturation)."""
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    # Neutral/grey = low saturation, any brightness
+    lo = np.array([0,   0,  60])
+    hi = np.array([180, 50, 230])
+    neutral_mask = cv2.inRange(hsv, lo, hi)
+    return cv2.bitwise_not(neutral_mask)
+
+
 def _mask_grabcut(bgr: np.ndarray, rough_mask: np.ndarray) -> np.ndarray:
     """
     Refine a rough foreground mask with GrabCut.
@@ -160,23 +170,19 @@ def detect_putter_bbox(
     """
     h, w = bgr.shape[:2]
 
-    # Try green background first
-    mask = _mask_green_bg(bgr)
-    green_px = cv2.countNonZero(mask)
+    # Try each background strategy, keep the first one with a usable fg_ratio
+    best_mask = None
+    for mask_fn in [_mask_green_bg, _mask_white_bg, _mask_neutral_bg]:
+        m = _clean_mask(mask_fn(bgr))
+        ratio = cv2.countNonZero(m) / (h * w)
+        if 0.03 <= ratio <= 0.85:
+            best_mask = m
+            break
 
-    # If green mask gives very little foreground, try white background
-    if green_px < 0.05 * h * w:
-        mask = _mask_white_bg(bgr)
-
-    mask = _clean_mask(mask)
+    if best_mask is None:
+        return None
+    mask = best_mask
     fg_ratio = cv2.countNonZero(mask) / (h * w)
-
-    # If still mostly empty, give up
-    if fg_ratio < 0.03:
-        return None
-    # If nearly everything is foreground (bad mask), give up
-    if fg_ratio > 0.90:
-        return None
 
     # Refinement with GrabCut
     if use_grabcut:
