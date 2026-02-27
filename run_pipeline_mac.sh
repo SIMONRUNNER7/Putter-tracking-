@@ -92,9 +92,9 @@ echo "[4/5] Augmentation ×5…"
 echo ""
 echo "[5/5] Entraînement YOLOv8 nano (device=$DEVICE)…"
 
-# Batch plus petit sur MPS pour éviter les OOM
+# M3 Max a suffisamment de mémoire unifiée pour un grand batch
 BATCH=8
-[ "$DEVICE" = "mps" ] && BATCH=16
+[ "$DEVICE" = "mps" ] && BATCH=32
 
 "$PY" training/train_detector.py train \
     --data   data/putter_dataset/data.yaml \
