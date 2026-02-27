@@ -138,7 +138,6 @@ def train(
         hsv_h=0.015,          # hue jitter (simulates lighting variation)
         hsv_s=0.5,            # saturation jitter
         hsv_v=0.4,            # value jitter (shadows / highlights)
-        blur=2.0,             # motion blur simulation
         verbose=True,
     )
 

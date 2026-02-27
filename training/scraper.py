@@ -124,24 +124,35 @@ def _ddg_search_images(query: str, max_results: int = 50) -> Iterator[str]:
     Uses the duckduckgo_search library if available,
     otherwise falls back to direct HTTP parsing.
     """
+    # Support both old (duckduckgo_search) and new (ddgs) package names
+    DDGS = None
+    for module_name, class_name in [("ddgs", "DDGS"), ("duckduckgo_search", "DDGS")]:
+        try:
+            mod = __import__(module_name, fromlist=[class_name])
+            DDGS = getattr(mod, class_name)
+            break
+        except ImportError:
+            continue
+
+    if DDGS is None:
+        yield from _ddg_fallback(query, max_results)
+        return
+
     try:
-        from duckduckgo_search import DDGS
-        with DDGS() as ddgs:
-            results = ddgs.images(
+        with DDGS() as ddg_client:
+            results = ddg_client.images(
                 query,
                 max_results=max_results,
-                size="Medium",          # avoid tiny thumbnails
+                size="Medium",
                 type_image="photo",
             )
             for r in results:
                 url = r.get("image") or r.get("url")
                 if url:
                     yield url
-    except ImportError:
-        # Fallback: direct DDG endpoint
-        yield from _ddg_fallback(query, max_results)
     except Exception as e:
         print(f"  [DDG] Error for '{query}': {e}")
+        yield from _ddg_fallback(query, max_results)
 
 
 def _ddg_fallback(query: str, max_results: int) -> Iterator[str]:
