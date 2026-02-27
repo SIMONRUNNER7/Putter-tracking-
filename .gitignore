@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Dataset & generated images (too large for git)
+data/
+
+# YOLO training runs & weights
+runs/
+*.pt
+*.onnx
+*.tflite
+*.torchscript
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
