@@ -24,3 +24,9 @@ imageio>=2.33.0
 
 # Utilities
 Pillow>=10.2.0
+
+# ---- Dataset pipeline (training only) ----
+duckduckgo-search>=6.1.0   # image scraping (no API key needed)
+beautifulsoup4>=4.12.0     # HTML parsing for retailer scrapers
+aiohttp>=3.9.0             # async downloads
+tqdm>=4.66.0               # progress bars
