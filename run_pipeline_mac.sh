@@ -61,8 +61,8 @@ echo ""
 echo "[1/5] Scraping d'images de putters (cible : 300)…"
 "$PY" training/scraper.py scrape \
     --out     data/raw_images \
-    --limit   300 \
-    --workers 6
+    --limit   800 \
+    --workers 8
 
 "$PY" training/scraper.py stats --dir data/raw_images
 
