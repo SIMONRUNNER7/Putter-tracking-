@@ -1,0 +1,26 @@
+# PutterTrack Pro - Dependencies
+# Python 3.10+ required
+
+# GUI Framework (cross-platform Windows/Mac/Linux)
+PyQt6>=6.6.0
+PyQt6-Qt6>=6.6.0
+
+# Computer Vision
+opencv-python>=4.9.0
+opencv-contrib-python>=4.9.0  # for optical flow & extra algorithms
+
+# Numerical computation
+numpy>=1.26.0
+scipy>=1.12.0
+
+# Deep learning tracker (optional but recommended)
+ultralytics>=8.1.0  # YOLOv8
+
+# Data & plotting
+matplotlib>=3.8.0
+
+# Video analysis
+imageio>=2.33.0
+
+# Utilities
+Pillow>=10.2.0
