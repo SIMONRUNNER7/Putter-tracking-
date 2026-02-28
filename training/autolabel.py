@@ -189,11 +189,12 @@ def _grabcut_center_rect(bgr: np.ndarray) -> Optional[np.ndarray]:
 def detect_putter_bbox(
     bgr: np.ndarray,
     use_grabcut: bool = True,
-) -> Optional[tuple[float, float, float, float]]:
+) -> tuple[Optional[tuple[float, float, float, float]], str]:
     """
     Detect putter bounding box in an image.
-    Returns (x_center, y_center, width, height) normalised to [0, 1],
-    or None if detection failed or is unreliable.
+    Returns ((x_center, y_center, width, height), strategy_name).
+    bbox is normalised to [0, 1], or None if detection failed.
+    strategy_name is one of: "hsv", "grabcut", "fallback", "none".
 
     Strategy order:
       1. HSV background removal (green / white / neutral)
@@ -203,6 +204,7 @@ def detect_putter_bbox(
     h, w = bgr.shape[:2]
 
     mask = None
+    strategy = "none"
 
     # --- Strategy 1: HSV background masks ---
     for mask_fn in [_mask_green_bg, _mask_white_bg, _mask_neutral_bg]:
@@ -210,6 +212,7 @@ def detect_putter_bbox(
         ratio = cv2.countNonZero(m) / (h * w)
         if 0.03 <= ratio <= 0.85:
             mask = m
+            strategy = "hsv"
             # Optionally refine with GrabCut
             if use_grabcut:
                 refined = _mask_grabcut(bgr, mask)
@@ -223,36 +226,40 @@ def detect_putter_bbox(
         mask = _grabcut_center_rect(bgr)
         if mask is not None:
             mask = _clean_mask(mask)
+            strategy = "grabcut"
 
-    # --- Strategy 3: centre-crop fallback (always labels something) ---
+    # --- Strategy 3: centre-crop fallback (always succeeds) ---
     if mask is None:
-        mx = int(w * 0.12)
-        my = int(h * 0.12)
+        mx = max(1, int(w * 0.12))
+        my = max(1, int(h * 0.12))
         mask = np.zeros((h, w), dtype=np.uint8)
         mask[my:h - my, mx:w - mx] = 255
+        strategy = "fallback"
 
     # Keep largest component (the putter)
     mask = _largest_component(mask)
 
     coords = cv2.findNonZero(mask)
     if coords is None:
-        return None
+        return None, "none"
 
     x, y, bw, bh = cv2.boundingRect(coords)
 
-    # Quality checks
-    if bw < MIN_BOX_PX or bh < MIN_BOX_PX:
-        return None
-    if bw / w > 0.99 or bh / h > 0.99:
-        return None   # bbox fills the whole image
+    # Quality checks (skip for fallback — it's always valid)
+    if strategy != "fallback":
+        if bw < MIN_BOX_PX or bh < MIN_BOX_PX:
+            return None, "none"
+        if bw / w > 0.99 or bh / h > 0.99:
+            return None, "none"
 
-    # Add small padding
-    pad_x = int(bw * 0.04)
-    pad_y = int(bh * 0.04)
-    x  = max(0, x - pad_x)
-    y  = max(0, y - pad_y)
-    bw = min(w - x, bw + 2 * pad_x)
-    bh = min(h - y, bh + 2 * pad_y)
+    # Add small padding (only for non-fallback; fallback is already padded)
+    if strategy != "fallback":
+        pad_x = int(bw * 0.04)
+        pad_y = int(bh * 0.04)
+        x  = max(0, x - pad_x)
+        y  = max(0, y - pad_y)
+        bw = min(w - x, bw + 2 * pad_x)
+        bh = min(h - y, bh + 2 * pad_y)
 
     # YOLO format: normalised centre x, centre y, width, height
     cx = (x + bw / 2) / w
@@ -260,7 +267,7 @@ def detect_putter_bbox(
     nw = bw / w
     nh = bh / h
 
-    return (cx, cy, nw, nh)
+    return (cx, cy, nw, nh), strategy
 
 
 MIN_BOX_PX = 60   # minimum box dimension in pixels
@@ -324,9 +331,11 @@ def label_images(
     )
     image_files = [f for f in image_files if f.name != "_manifest.json"]
 
+    print(f"[autolabel] v2 — 3-strategy detection (HSV → GrabCut → centre-crop)")
     print(f"[autolabel] Processing {len(image_files)} images…")
 
-    stats = {"total": len(image_files), "labeled": 0, "failed": 0, "skipped": 0}
+    stats = {"total": len(image_files), "labeled": 0, "failed": 0, "skipped": 0,
+             "by_hsv": 0, "by_grabcut": 0, "by_fallback": 0}
 
     for img_path in tqdm(image_files, desc="Labeling", unit="img"):
         try:
@@ -341,15 +350,23 @@ def label_images(
                 scale = 1200 / max(h, w)
                 bgr = cv2.resize(bgr, (int(w*scale), int(h*scale)))
 
-            bbox = detect_putter_bbox(bgr, use_grabcut=use_grabcut)
+            bbox, strategy = detect_putter_bbox(bgr, use_grabcut=use_grabcut)
 
             if review:
                 vis = _draw_debug(bgr, bbox)
                 cv2.imwrite(str(rev_out / img_path.name), vis)
 
-            if bbox is None:
+            if bbox is None or strategy == "none":
                 stats["failed"] += 1
                 continue
+
+            # Track which strategy succeeded
+            if strategy == "hsv":
+                stats["by_hsv"] += 1
+            elif strategy == "grabcut":
+                stats["by_grabcut"] += 1
+            elif strategy == "fallback":
+                stats["by_fallback"] += 1
 
             # Save image + label
             out_stem = img_path.stem
@@ -376,7 +393,9 @@ def label_images(
     _write_yaml(dst)
 
     print(f"\n[autolabel] Results:")
-    print(f"  Labeled:  {stats['labeled']}")
+    print(f"  Labeled:  {stats['labeled']}  "
+          f"(HSV: {stats['by_hsv']}, GrabCut: {stats['by_grabcut']}, "
+          f"Fallback: {stats['by_fallback']})")
     print(f"  Failed:   {stats['failed']}  (no putter detected)")
     print(f"  Skipped:  {stats['skipped']}  (corrupt / unreadable)")
     print(f"  Output:   {dst.resolve()}")
