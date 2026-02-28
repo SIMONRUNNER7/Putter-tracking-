@@ -426,10 +426,14 @@ def split_dataset(
     dataset_dir: str,
     val_ratio: float = 0.2,
     seed: int = 42,
+    purge: bool = False,
 ) -> None:
     """
     Split images/all + labels/all into train/val subsets.
     Moves (not copies) files.
+
+    If purge=True, existing images/train, images/val, labels/train, labels/val
+    are deleted first — useful when switching from synthetic to real images.
     """
     dst = Path(dataset_dir)
     img_all  = dst / "images" / "all"
@@ -438,6 +442,13 @@ def split_dataset(
     if not img_all.exists():
         print(f"[split] images/all not found in {dataset_dir}. Run autolabel first.")
         return
+
+    if purge:
+        for sub in ("images/train", "images/val", "labels/train", "labels/val"):
+            target = dst / sub
+            if target.exists():
+                shutil.rmtree(target)
+                print(f"[split] Purged {target}")
 
     stems = [p.stem for p in img_all.glob("*.jpg")]
     random.seed(seed)
@@ -462,7 +473,8 @@ def split_dataset(
     print(f"[split] Train: {len(trn_set)}  |  Val: {len(val_set)}")
     print(f"[split] Dataset ready at {dst.resolve()}")
     print(f"\n  → Train now:")
-    print(f"    python training/train_detector.py train --data {dst}/data.yaml --epochs 100")
+    print(f"    python training/train_detector.py train --data {dst}/data.yaml"
+          f" --epochs 150 --model yolov8n.pt --output runs/putter_real")
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +500,9 @@ def main() -> None:
     sp = sub.add_parser("split", help="Split labeled dataset into train/val")
     sp.add_argument("--dataset",   default="data/putter_dataset")
     sp.add_argument("--val-ratio", type=float, default=0.2)
+    sp.add_argument("--purge", action="store_true",
+                    help="Delete existing train/val dirs before splitting "
+                         "(use when replacing synthetic data with real images)")
 
     args = parser.parse_args()
 
@@ -499,7 +514,7 @@ def main() -> None:
             use_grabcut=not args.no_grabcut,
         )
     elif args.cmd == "split":
-        split_dataset(args.dataset, val_ratio=args.val_ratio)
+        split_dataset(args.dataset, val_ratio=args.val_ratio, purge=args.purge)
     else:
         parser.print_help()
 
