@@ -186,6 +186,37 @@ def _grabcut_center_rect(bgr: np.ndarray) -> Optional[np.ndarray]:
     return None
 
 
+def _mask_to_bbox(
+    mask: np.ndarray, h: int, w: int, skip_quality: bool = False,
+) -> Optional[tuple[float, float, float, float]]:
+    """Extract YOLO bbox from a binary mask, or None if quality checks fail."""
+    mask = _largest_component(mask)
+    coords = cv2.findNonZero(mask)
+    if coords is None:
+        return None
+
+    x, y, bw, bh = cv2.boundingRect(coords)
+
+    if not skip_quality:
+        if bw < MIN_BOX_PX or bh < MIN_BOX_PX:
+            return None
+        if bw / w > 0.99 or bh / h > 0.99:
+            return None
+        # Add small padding
+        pad_x = int(bw * 0.04)
+        pad_y = int(bh * 0.04)
+        x  = max(0, x - pad_x)
+        y  = max(0, y - pad_y)
+        bw = min(w - x, bw + 2 * pad_x)
+        bh = min(h - y, bh + 2 * pad_y)
+
+    cx = (x + bw / 2) / w
+    cy = (y + bh / 2) / h
+    nw = bw / w
+    nh = bh / h
+    return (cx, cy, nw, nh)
+
+
 def detect_putter_bbox(
     bgr: np.ndarray,
     use_grabcut: bool = True,
@@ -193,8 +224,8 @@ def detect_putter_bbox(
     """
     Detect putter bounding box in an image.
     Returns ((x_center, y_center, width, height), strategy_name).
-    bbox is normalised to [0, 1], or None if detection failed.
-    strategy_name is one of: "hsv", "grabcut", "fallback", "none".
+    Each strategy is tried end-to-end; if the bbox fails quality
+    checks, we fall through to the next strategy.
 
     Strategy order:
       1. HSV background removal (green / white / neutral)
@@ -203,71 +234,39 @@ def detect_putter_bbox(
     """
     h, w = bgr.shape[:2]
 
-    mask = None
-    strategy = "none"
-
     # --- Strategy 1: HSV background masks ---
     for mask_fn in [_mask_green_bg, _mask_white_bg, _mask_neutral_bg]:
         m = _clean_mask(mask_fn(bgr))
         ratio = cv2.countNonZero(m) / (h * w)
         if 0.03 <= ratio <= 0.85:
-            mask = m
-            strategy = "hsv"
-            # Optionally refine with GrabCut
             if use_grabcut:
-                refined = _mask_grabcut(bgr, mask)
+                refined = _mask_grabcut(bgr, m)
                 refined = _clean_mask(refined)
                 if cv2.countNonZero(refined) > 0:
-                    mask = refined
-            break
+                    m = refined
+            bbox = _mask_to_bbox(m, h, w)
+            if bbox is not None:
+                return bbox, "hsv"
 
     # --- Strategy 2: GrabCut with centre rect ---
-    if mask is None and use_grabcut:
-        mask = _grabcut_center_rect(bgr)
-        if mask is not None:
-            mask = _clean_mask(mask)
-            strategy = "grabcut"
+    if use_grabcut:
+        gc = _grabcut_center_rect(bgr)
+        if gc is not None:
+            gc = _clean_mask(gc)
+            bbox = _mask_to_bbox(gc, h, w)
+            if bbox is not None:
+                return bbox, "grabcut"
 
     # --- Strategy 3: centre-crop fallback (always succeeds) ---
-    if mask is None:
-        mx = max(1, int(w * 0.12))
-        my = max(1, int(h * 0.12))
-        mask = np.zeros((h, w), dtype=np.uint8)
-        mask[my:h - my, mx:w - mx] = 255
-        strategy = "fallback"
+    mx = max(1, int(w * 0.12))
+    my = max(1, int(h * 0.12))
+    fallback = np.zeros((h, w), dtype=np.uint8)
+    fallback[my:h - my, mx:w - mx] = 255
+    bbox = _mask_to_bbox(fallback, h, w, skip_quality=True)
+    if bbox is not None:
+        return bbox, "fallback"
 
-    # Keep largest component (the putter)
-    mask = _largest_component(mask)
-
-    coords = cv2.findNonZero(mask)
-    if coords is None:
-        return None, "none"
-
-    x, y, bw, bh = cv2.boundingRect(coords)
-
-    # Quality checks (skip for fallback — it's always valid)
-    if strategy != "fallback":
-        if bw < MIN_BOX_PX or bh < MIN_BOX_PX:
-            return None, "none"
-        if bw / w > 0.99 or bh / h > 0.99:
-            return None, "none"
-
-    # Add small padding (only for non-fallback; fallback is already padded)
-    if strategy != "fallback":
-        pad_x = int(bw * 0.04)
-        pad_y = int(bh * 0.04)
-        x  = max(0, x - pad_x)
-        y  = max(0, y - pad_y)
-        bw = min(w - x, bw + 2 * pad_x)
-        bh = min(h - y, bh + 2 * pad_y)
-
-    # YOLO format: normalised centre x, centre y, width, height
-    cx = (x + bw / 2) / w
-    cy = (y + bh / 2) / h
-    nw = bw / w
-    nh = bh / h
-
-    return (cx, cy, nw, nh), strategy
+    return None, "none"
 
 
 MIN_BOX_PX = 60   # minimum box dimension in pixels
