@@ -5,10 +5,14 @@ On cible exclusivement la vue "adresse" (shaft entrant par le bas de l'image),
 typique des photos produit des marques golf.
 
 Sources:
-  1. Shopify product API  — fairwayjockey, runner.golf, bettinardi, lab golf, evnroll
-  2. Brand direct pages   — Scotty Cameron, Odyssey, TaylorMade, PXG, Mizuno, Miura,
-                            Wilson, Cobra, PGA Tour Superstore, Golf Galaxy
-  3. DuckDuckGo / Bing   — requêtes très ciblées "top view / address view"
+  1. Shopify product API  — fairwayjockey, runner.golf, bettinardi, lab golf, evnroll,
+                            2ndswing, rockbottomgolf, globalgolf, ping store
+  2. eBay search          — requêtes ciblées top-view (HTML statique, fiable)
+  3. Reddit JSON API      — r/golf, r/PuttingReview, r/GolfEquipment
+  4. DuckDuckGo / Bing   — requêtes très ciblées "top view / address view"
+
+Brand scrapers React/Next.js (Scotty Cameron, Odyssey, TaylorMade, PXG, Wilson,
+Cobra) ont été supprimés : ils ne retournent aucune image via BeautifulSoup.
 
 Usage:
     python training/scraper.py scrape --out data/raw_images --limit 400
@@ -22,6 +26,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import random
 import sys
 import time
@@ -40,9 +45,13 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 
 SEARCH_QUERIES: list[str] = [
-    # ── Vue de dessus générique ────────────────────────────────────────────
+    # ── Vue de dessus générique — termes photographiques précis ────────────
     "putter head top view overhead address position product photo",
     "putter head address view from above white background",
+    "putter head flat lay overhead white background product photo",
+    "putter head birds eye view studio photography",
+    "putter head aerial view product shot golf",
+    "golf putter top down flat lay photography",
     "putter overhead view shaft golf product photo",
     "putter top down view blade mallet product",
     "golf putter crown view overhead studio photo",
@@ -87,31 +96,46 @@ SEARCH_QUERIES: list[str] = [
 
     # ── Miura ─────────────────────────────────────────────────────────────
     "miura putter top view overhead address product photo",
-    "miura km-350 putter overhead",
 
-    # ── Wilson ────────────────────────────────────────────────────────────
-    "wilson harmonized putter top view overhead address",
-    "wilson staff putter head overhead product photo",
+    # ── Ping ──────────────────────────────────────────────────────────────
+    "ping putter top view overhead address product photo",
+    "ping anser putter overhead product studio",
+    "ping sigma 2 putter top view",
 
-    # ── Cobra ─────────────────────────────────────────────────────────────
-    "cobra putter top view overhead address product",
-    "cobra king putter overhead studio photo",
+    # ── Cleveland / Srixon ────────────────────────────────────────────────
+    "cleveland huntington beach putter overhead address view",
+    "srixon cleveland putter top view product photo",
 
-    # ── Fairway Jockey / custom ───────────────────────────────────────────
+    # ── Callaway ──────────────────────────────────────────────────────────
+    "callaway odyssey ten putter top view overhead",
+    "callaway jaws putter overhead product photo",
+
+    # ── Autres marques ────────────────────────────────────────────────────
+    "fourteen golf putter top view overhead",
+    "cure putter top view address overhead product",
+    "yes golf putter head top view overhead",
+    "never compromise putter top view overhead address",
+    "la golf putter overhead product photo",
+
+    # ── Sites de review golf (photos haute qualité, vue de dessus) ────────
+    "mygolfspy putter review top view address photo",
+    "golf wrx putter top view review photo",
+    "the hackers paradise putter overhead review",
+    "golf digest putter top view address photo",
+
+    # ── Custom / milled ───────────────────────────────────────────────────
     "fairway jockey custom putter top view overhead",
     "custom putter milled top view overhead white background",
-    "handcrafted putter head top view studio photo",
 ]
 
 # ---------------------------------------------------------------------------
 # URL keywords that suggest a top/address view image
-# (many brands use predictable suffixes in CDN image filenames)
 # ---------------------------------------------------------------------------
 
 TOP_VIEW_URL_HINTS = [
     "top", "overhead", "address", "crown",
-    "_2.", "_02.", "-2.", "-02.",   # typically 2nd product image = top view
-    "_3.", "_03.", "-3.", "-03.",   # sometimes 3rd
+    "_2.", "_02.", "-2.", "-02.",
+    "_3.", "_03.", "-3.", "-03.",
 ]
 
 # ---------------------------------------------------------------------------
@@ -122,7 +146,7 @@ MIN_WIDTH    = 300
 MIN_HEIGHT   = 300
 MAX_WIDTH    = 4000
 MAX_HEIGHT   = 4000
-MIN_FILESIZE = 15_000     # bytes — avoid thumbnails
+MIN_FILESIZE = 15_000
 MAX_FILESIZE = 10_000_000
 ALLOWED_FORMATS = {"JPEG", "PNG", "WEBP"}
 
@@ -148,6 +172,10 @@ SHOPIFY_STORES: list[dict] = [
     {"name": "lab_golf",        "url": "https://labgolf.com"},
     {"name": "evnroll",         "url": "https://evnroll.com"},
     {"name": "miura_golf",      "url": "https://miuragolf.com"},
+    {"name": "2ndswing",        "url": "https://2ndswing.com"},
+    {"name": "rockbottomgolf",  "url": "https://rockbottomgolf.com"},
+    {"name": "globalgolf",      "url": "https://www.globalgolf.com"},
+    {"name": "ping_store",      "url": "https://www.pingstoredirect.com"},
 ]
 
 
@@ -159,7 +187,6 @@ def _shopify_product_images(
     """
     Fetch all product images from a Shopify store via /products.json.
     Filters products whose title contains one of putter_keywords.
-    Tries to return the top-view image (index 1 or 2) rather than all.
     """
     page = 1
     while True:
@@ -179,14 +206,10 @@ def _shopify_product_images(
                     continue
 
                 images = product.get("images", [])
-                # Prefer image index 1 or 2 (= 2nd or 3rd photo, often top view)
-                # but yield all so annotate.py can filter
                 for img in images:
                     src = img.get("src", "")
                     if src:
-                        # Strip Shopify size suffix for full-res
                         src = src.split("?")[0]
-                        # Add _1000x for a decent size
                         yield src
 
             page += 1
@@ -201,164 +224,119 @@ def _shopify_product_images(
 
 
 # ===========================================================================
-# BRAND DIRECT SCRAPERS
+# EBAY SCRAPER — HTML statique, fiable, nombreuses vues de dessus
 # ===========================================================================
 
-def _scrape_brand_generic(
+EBAY_QUERIES: list[str] = [
+    "putter top view address",
+    "scotty cameron putter overhead",
+    "odyssey putter top view",
+    "blade putter top view product",
+    "mallet putter top view studio",
+    "ping putter top view",
+    "taylormade spider putter overhead",
+    "bettinardi putter top view",
+]
+
+
+def _scrape_ebay(
     session: requests.Session,
-    listing_url: str,
-    brand_name: str,
-    img_filter=None,
+    queries: list[str] = EBAY_QUERIES,
+    max_pages: int = 3,
 ) -> Iterator[str]:
     """
-    Generic BeautifulSoup scraper for a product listing page.
-    img_filter(src) -> bool to keep only relevant images.
+    Scrape eBay product listing pages for putter images.
+    eBay uses static HTML — BeautifulSoup works perfectly here.
+    Thumb URLs (s-l225.jpg) are upgraded to full-res (s-l1600.jpg).
     """
     try:
         from bs4 import BeautifulSoup
     except ImportError:
-        print("  [bs4] pip install beautifulsoup4")
+        print("  [eBay] pip install beautifulsoup4")
         return
 
-    try:
-        r = session.get(listing_url, headers=HEADERS, timeout=20)
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        for tag in soup.find_all("img"):
-            src = (tag.get("src") or tag.get("data-src") or
-                   tag.get("data-lazy-src") or tag.get("data-original") or "")
-            if src.startswith("//"):
-                src = "https:" + src
-            if not src.startswith("http"):
-                continue
-            if img_filter and not img_filter(src):
-                continue
-            yield src
-
-    except Exception as e:
-        print(f"  [{brand_name}] {e}")
-
-
-def _scrape_scotty_cameron(session: requests.Session) -> Iterator[str]:
-    """Scotty Cameron product listing + detail pages."""
-    from bs4 import BeautifulSoup
-
-    base_urls = [
-        "https://scottycameron.titleist.com/equipment/putters",
-        "https://scottycameron.titleist.com/equipment/putters/newport",
-        "https://scottycameron.titleist.com/equipment/putters/phantom",
-        "https://scottycameron.titleist.com/equipment/putters/special-select",
-    ]
-
-    for url in base_urls:
-        try:
-            r = session.get(url, headers=HEADERS, timeout=20)
-            soup = BeautifulSoup(r.text, "html.parser")
-            product_links: list[str] = []
-
-            # Try to find product detail links
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if "/equipment/putters/" in href and href != url:
-                    full = href if href.startswith("http") else "https://scottycameron.titleist.com" + href
-                    if full not in product_links:
-                        product_links.append(full)
-
-            # Also yield images from listing page
-            for img in soup.find_all("img"):
-                src = img.get("src") or img.get("data-src") or ""
-                if "putter" in src.lower() or "putters" in src.lower():
-                    if src.startswith("http"):
+    for query in queries:
+        for page in range(1, max_pages + 1):
+            url = (
+                "https://www.ebay.com/sch/i.html"
+                f"?_nkw={urllib.parse.quote(query)}"
+                f"&_sacat=0&_pgn={page}"
+            )
+            try:
+                r = session.get(url, headers=HEADERS, timeout=20)
+                soup = BeautifulSoup(r.text, "html.parser")
+                found = 0
+                for img in soup.find_all("img", src=True):
+                    src = img["src"]
+                    # Upgrade thumbnail to full resolution
+                    src = re.sub(r"s-l\d+\.(jpg|jpeg)", r"s-l1600.\1", src)
+                    if "i.ebayimg.com" in src:
                         yield src
+                        found += 1
+                if found == 0:
+                    break  # No more pages
+                time.sleep(1.5)
+            except Exception as e:
+                print(f"  [eBay:{query} p{page}] {e}")
+                break
 
-            # Visit each product detail page
-            for plink in product_links[:20]:
-                try:
-                    pr = session.get(plink, headers=HEADERS, timeout=20)
-                    psoup = BeautifulSoup(pr.text, "html.parser")
-                    for img in psoup.find_all("img"):
-                        src = img.get("src") or img.get("data-src") or ""
-                        if src.startswith("http"):
+        time.sleep(1.0)
+
+
+# ===========================================================================
+# REDDIT JSON — r/golf, r/PuttingReview (aucun JS requis)
+# ===========================================================================
+
+REDDIT_SUBREDDITS: list[str] = ["golf", "PuttingReview", "GolfEquipment"]
+REDDIT_QUERIES: list[str] = [
+    "putter top view",
+    "putter overhead",
+    "putter address view",
+    "putter flat lay",
+]
+
+
+def _scrape_reddit(session: requests.Session) -> Iterator[str]:
+    """
+    Reddit JSON API — no JavaScript needed, no auth required.
+    Extracts preview image URLs from posts.
+    """
+    reddit_headers = {**HEADERS, "Accept": "application/json"}
+
+    for sub in REDDIT_SUBREDDITS:
+        for q in REDDIT_QUERIES[:2]:  # limit per sub to avoid rate limit
+            url = (
+                f"https://www.reddit.com/r/{sub}/search.json"
+                f"?q={urllib.parse.quote(q)}&type=link&limit=50&restrict_sr=1"
+            )
+            try:
+                r = session.get(url, headers=reddit_headers, timeout=15)
+                if r.status_code != 200:
+                    continue
+                children = r.json().get("data", {}).get("children", [])
+                for post in children:
+                    d = post.get("data", {})
+                    # Direct image URL
+                    url_post = d.get("url", "")
+                    if any(url_post.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
+                        yield url_post
+                    # Preview image (higher quality)
+                    preview = d.get("preview", {}).get("images", [])
+                    if preview:
+                        src = (preview[0].get("source", {}).get("url", "")
+                               .replace("&amp;", "&"))
+                        if src:
                             yield src
-                    time.sleep(0.7)
-                except Exception:
-                    pass
+                time.sleep(2.0)
+            except Exception as e:
+                print(f"  [Reddit r/{sub}] {e}")
 
-            time.sleep(1.0)
-        except Exception as e:
-            print(f"  [ScottyCameron:{url}] {e}")
+        time.sleep(1.5)
 
 
-def _scrape_odyssey(session: requests.Session) -> Iterator[str]:
-    """Odyssey Golf product pages."""
-    urls = [
-        "https://www.odysseygolf.com/en-us/putters/blade.html",
-        "https://www.odysseygolf.com/en-us/putters/mallet.html",
-        "https://www.odysseygolf.com/en-us/putters",
-    ]
-    for url in urls:
-        yield from _scrape_brand_generic(session, url, "Odyssey",
-            img_filter=lambda s: any(x in s.lower() for x in ["putter", "odyssey", "golf"]))
-        time.sleep(1.0)
-
-
-def _scrape_taylormade(session: requests.Session) -> Iterator[str]:
-    """TaylorMade Golf putter pages."""
-    urls = [
-        "https://www.taylormadegolf.com/putters",
-        "https://www.taylormadegolf.com/en-US/putters/all-putters/",
-    ]
-    for url in urls:
-        yield from _scrape_brand_generic(session, url, "TaylorMade",
-            img_filter=lambda s: "putter" in s.lower() or "cdn" in s.lower())
-        time.sleep(1.0)
-
-
-def _scrape_pxg(session: requests.Session) -> Iterator[str]:
-    """PXG putter pages."""
-    urls = [
-        "https://www.pxg.com/en-us/golf-clubs/putters",
-    ]
-    for url in urls:
-        yield from _scrape_brand_generic(session, url, "PXG",
-            img_filter=lambda s: any(x in s.lower() for x in ["putter", "pxg", "cdn"]))
-        time.sleep(1.0)
-
-
-def _scrape_mizuno(session: requests.Session) -> Iterator[str]:
-    """Mizuno Golf putter pages."""
-    urls = [
-        "https://golf.mizunousa.com/collections/putters",
-        "https://golf.mizunousa.com/collections/m-craft-putters",
-    ]
-    # Mizuno USA is likely Shopify
-    for store in urls:
-        base = store.split("/collections/")[0]
-        yield from _shopify_product_images(base, session)
-        time.sleep(1.0)
-
-
-def _scrape_wilson(session: requests.Session) -> Iterator[str]:
-    """Wilson Golf putter pages."""
-    urls = [
-        "https://www.wilson.com/en-us/golf/clubs/putters",
-    ]
-    for url in urls:
-        yield from _scrape_brand_generic(session, url, "Wilson",
-            img_filter=lambda s: any(x in s.lower() for x in ["putter", "wilson", "harmonized"]))
-        time.sleep(1.0)
-
-
-def _scrape_cobra(session: requests.Session) -> Iterator[str]:
-    """Cobra Golf putter pages."""
-    urls = [
-        "https://www.cobragolf.com/putters",
-    ]
-    for url in urls:
-        yield from _scrape_brand_generic(session, url, "Cobra",
-            img_filter=lambda s: any(x in s.lower() for x in ["putter", "cobra", "king"]))
-        time.sleep(1.0)
-
+# ===========================================================================
+# PGA TOUR SUPERSTORE + GOLF GALAXY — kept as HTML scrapers
+# ===========================================================================
 
 def _scrape_pga_tour_superstore(session: requests.Session, max_pages: int = 5) -> Iterator[str]:
     """PGA Tour Superstore putter listing pages."""
@@ -412,43 +390,59 @@ def _scrape_golf_galaxy(session: requests.Session, max_pages: int = 5) -> Iterat
 # ===========================================================================
 
 def _ddg_search(query: str, max_results: int = 40) -> Iterator[str]:
-    """DuckDuckGo image search — tries library then HTTP fallback."""
-    DDGS = None
-    for mod_name, cls in [("ddgs", "DDGS"), ("duckduckgo_search", "DDGS")]:
-        try:
-            mod = __import__(mod_name, fromlist=[cls])
-            DDGS = getattr(mod, cls)
-            break
-        except ImportError:
-            pass
+    """
+    DuckDuckGo image search — robuste face aux changements d'API.
+    Retry ×3 avec backoff exponentiel sur rate-limit.
+    Fallback HTTP si la librairie échoue.
+    """
+    try:
+        from duckduckgo_search import DDGS
 
-    if DDGS:
-        try:
-            with DDGS() as client:
-                for r in client.images(query, max_results=max_results,
-                                       size="Large", type_image="photo"):
-                    url = r.get("image") or r.get("url")
+        for attempt in range(3):
+            try:
+                with DDGS() as d:
+                    results = list(d.images(query, max_results=max_results))
+                for r in results:
+                    url = r.get("image") or r.get("thumbnail")
                     if url:
                         yield url
-            return
-        except Exception as e:
-            print(f"  [DDG] {e}")
+                return  # success
+            except Exception as e:
+                err = str(e)
+                if ("atelimit" in err or "429" in err) and attempt < 2:
+                    wait = 2 ** (attempt + 1)
+                    print(f"  [DDG] rate-limit, attente {wait}s…")
+                    time.sleep(wait)
+                else:
+                    print(f"  [DDG] {e}")
+                    break
+    except ImportError:
+        pass
 
-    # HTTP fallback
+    # ── HTTP fallback ──────────────────────────────────────────────────────
     try:
-        vqd_r = requests.get("https://duckduckgo.com/", params={"q": query},
-                              headers=HEADERS, timeout=10)
+        vqd_r = requests.get(
+            "https://duckduckgo.com/",
+            params={"q": query},
+            headers=HEADERS,
+            timeout=10,
+        )
         vqd = None
         for part in vqd_r.text.split("vqd="):
             if len(part) > 5:
-                vqd = part.split('"')[1] if '"' in part[:30] else part.split("'")[1]
-                break
+                candidate = part.split('"')[1] if '"' in part[:30] else part.split("'")[1]
+                if candidate:
+                    vqd = candidate
+                    break
         if not vqd:
             return
-        r = requests.get("https://duckduckgo.com/i.js",
-                         params={"l": "us-en", "o": "json", "q": query,
-                                 "vqd": vqd, "f": ",,,,,", "p": "1"},
-                         headers=HEADERS, timeout=10)
+        r = requests.get(
+            "https://duckduckgo.com/i.js",
+            params={"l": "us-en", "o": "json", "q": query,
+                    "vqd": vqd, "f": ",,,,,", "p": "1"},
+            headers=HEADERS,
+            timeout=10,
+        )
         for item in r.json().get("results", [])[:max_results]:
             url = item.get("image")
             if url:
@@ -458,27 +452,46 @@ def _ddg_search(query: str, max_results: int = 40) -> Iterator[str]:
 
 
 def _bing_search(query: str, max_results: int = 25) -> Iterator[str]:
-    """Bing image search fallback."""
+    """
+    Bing image search — deux méthodes d'extraction pour robustesse.
+    1. Attributs data-src des balises <img>
+    2. Attributs JSON "m" des balises <a> (fallback)
+    """
     try:
         from bs4 import BeautifulSoup
         r = requests.get(
             "https://www.bing.com/images/search",
             params={"q": query, "form": "HDRSC2", "first": "1"},
-            headers=HEADERS, timeout=12,
+            headers=HEADERS,
+            timeout=12,
         )
         soup = BeautifulSoup(r.text, "html.parser")
         count = 0
-        for tag in soup.find_all("a", class_="iusc"):
+
+        # Méthode 1 : attributs data-src
+        for img in soup.find_all("img", attrs={"data-src": True}):
+            src = img["data-src"]
+            if src.startswith("http") and any(
+                ext in src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]
+            ):
+                yield src
+                count += 1
+                if count >= max_results:
+                    return
+
+        # Méthode 2 : attributs JSON "m" (ancienne structure Bing)
+        for tag in soup.find_all(attrs={"m": True}):
+            if count >= max_results:
+                break
             try:
                 m = json.loads(tag.get("m", "{}"))
                 url = m.get("murl") or m.get("turl")
                 if url:
                     yield url
                     count += 1
-                    if count >= max_results:
-                        break
             except Exception:
                 continue
+
     except Exception as e:
         print(f"  [Bing] {e}")
 
@@ -488,25 +501,82 @@ def _bing_search(query: str, max_results: int = 25) -> Iterator[str]:
 # ===========================================================================
 
 def _score_url_for_top_view(url: str) -> int:
-    """
-    Heuristic: return a score >0 if the URL suggests a top/address view image.
-    Higher = more likely to be the right angle.
-    """
     lower = url.lower()
     score = 0
-    for hint in ("top", "overhead", "address", "crown", "above"):
+    for hint in ("top", "overhead", "address", "crown", "above", "flatlay", "flat_lay"):
         if hint in lower:
             score += 3
-    # 2nd or 3rd product image is often the top view on e-commerce sites
     for suffix in ("_2.", "_02.", "-2.", "-02.", "/2.", "_3.", "_03.", "-3.", "-03."):
         if suffix in lower:
             score += 2
-    # Penalise images likely to be "face on" (front of putter)
     for bad in ("face", "front", "detail", "grip", "shaft", "back", "sole",
-                "lifestyle", "hero", "model", "green", "grass"):
+                "lifestyle", "hero", "model", "green", "grass", "putting"):
         if bad in lower:
             score -= 1
     return score
+
+
+# ===========================================================================
+# POST-DOWNLOAD CV FILTER — rejette les images clairement pas vue de dessus
+# ===========================================================================
+
+def _passes_top_view_filter(img_path: Path) -> bool:
+    """
+    Filtre rapide OpenCV : rejette les images où l'objet principal est
+    très allongé verticalement (= vue de face, pas vue de dessus).
+
+    Returns True  → garder l'image
+    Returns False → rejeter (supprimer)
+    """
+    try:
+        import cv2
+        import numpy as np
+
+        img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return True  # erreur de lecture → laisser passer par défaut
+
+        h, w = img.shape
+
+        # Threshold inversé : isole les objets sombres sur fond clair
+        _, thresh = cv2.threshold(img, 60, 255, cv2.THRESH_BINARY_INV)
+
+        # Ignorer les bords (évite les artefacts JPEG aux coins)
+        border = 5
+        thresh[:border, :] = 0
+        thresh[-border:, :] = 0
+        thresh[:, :border] = 0
+        thresh[:, -border:] = 0
+
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours:
+            # Essai sur fond sombre (putter noir sur fond vert)
+            _, thresh2 = cv2.threshold(img, 200, 255, cv2.THRESH_BINARY)
+            contours, _ = cv2.findContours(thresh2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours:
+            return True  # pas de contour détectable → laisser passer
+
+        largest = max(contours, key=cv2.contourArea)
+        area_ratio = cv2.contourArea(largest) / (h * w)
+
+        # Objet trop petit → probablement un logo ou une miniature
+        if area_ratio < 0.03:
+            return False
+
+        # Ratio d'aspect du bounding box
+        _, _, cw, ch = cv2.boundingRect(largest)
+        aspect = max(cw, ch) / max(min(cw, ch), 1)
+
+        # Trop allongé → probablement vue de côté ou shaft complet
+        if aspect > 6:
+            return False
+
+        return True
+
+    except Exception:
+        return True  # si OpenCV non disponible ou erreur → laisser passer
 
 
 # ===========================================================================
@@ -559,6 +629,11 @@ def _download_image(
         else:
             img.save(fname, fmt)
 
+        # Post-download CV filter
+        if not _passes_top_view_filter(fname):
+            fname.unlink(missing_ok=True)
+            return False, "cv_filter:not_top_view"
+
         return True, str(fname)
 
     except Exception as e:
@@ -598,21 +673,35 @@ def scrape(
             all_urls.extend(urls)
 
         # ------------------------------------------------------------------
-        # 2. Brand direct scrapers
+        # 2. eBay
         # ------------------------------------------------------------------
-        print("\n[scrape] ── Brand direct pages ──────────────────────────")
-        brand_scrapers = [
-            ("Scotty Cameron",      _scrape_scotty_cameron),
-            ("Odyssey",             _scrape_odyssey),
-            ("TaylorMade",          _scrape_taylormade),
-            ("PXG",                 _scrape_pxg),
-            ("Mizuno",              _scrape_mizuno),
-            ("Wilson",              _scrape_wilson),
-            ("Cobra",               _scrape_cobra),
+        print("\n[scrape] ── eBay (HTML statique) ────────────────────────")
+        try:
+            urls = list(_scrape_ebay(session))
+            print(f"  {len(urls)} images trouvées sur eBay")
+            all_urls.extend(urls)
+        except Exception as e:
+            print(f"  [eBay] ERREUR: {e}")
+
+        # ------------------------------------------------------------------
+        # 3. Reddit
+        # ------------------------------------------------------------------
+        print("\n[scrape] ── Reddit JSON API ──────────────────────────────")
+        try:
+            urls = list(_scrape_reddit(session))
+            print(f"  {len(urls)} images trouvées sur Reddit")
+            all_urls.extend(urls)
+        except Exception as e:
+            print(f"  [Reddit] ERREUR: {e}")
+
+        # ------------------------------------------------------------------
+        # 4. PGA Superstore + Golf Galaxy
+        # ------------------------------------------------------------------
+        print("\n[scrape] ── PGA Superstore + Golf Galaxy ─────────────────")
+        for name, fn in [
             ("PGA Tour Superstore", _scrape_pga_tour_superstore),
             ("Golf Galaxy",         _scrape_golf_galaxy),
-        ]
-        for name, fn in brand_scrapers:
+        ]:
             try:
                 print(f"  → {name}")
                 urls = list(fn(session))
@@ -622,7 +711,7 @@ def scrape(
                 print(f"    ERROR: {e}")
 
     # ------------------------------------------------------------------
-    # 3. Search engines
+    # 5. Search engines
     # ------------------------------------------------------------------
     if not skip_search:
         print("\n[scrape] ── Search engines (top-view queries) ────────────")
@@ -632,30 +721,29 @@ def scrape(
             all_urls.extend(urls)
             time.sleep(delay + random.uniform(0.1, 0.3))
 
-        print("[scrape] Bing fallback for top 12 queries…")
-        for q in tqdm(SEARCH_QUERIES[:12], desc="Bing", unit="query"):
+        print("[scrape] Bing fallback pour les 15 premières requêtes…")
+        for q in tqdm(SEARCH_QUERIES[:15], desc="Bing", unit="query"):
             urls = list(_bing_search(q, max_results=20))
             all_urls.extend(urls)
             time.sleep(delay + random.uniform(0.2, 0.4))
 
     # ------------------------------------------------------------------
-    # 4. Prioritise + deduplicate URLs
+    # 6. Prioritise + deduplicate URLs
     # ------------------------------------------------------------------
     print(f"\n[scrape] {len(all_urls)} total URLs before dedup")
     seen_urls: set[str] = set()
-    unique_urls: list[tuple[int, str]] = []   # (score, url)
+    unique_urls: list[tuple[int, str]] = []
     for url in all_urls:
         if url not in seen_urls:
             seen_urls.add(url)
             unique_urls.append((_score_url_for_top_view(url), url))
 
-    # Higher score first — more likely to be top-view
     unique_urls.sort(key=lambda x: -x[0])
     sorted_urls = [u for _, u in unique_urls]
-    print(f"[scrape] {len(sorted_urls)} unique URLs. Downloading up to {limit}…")
+    print(f"[scrape] {len(sorted_urls)} unique URLs. Téléchargement jusqu'à {limit}…")
 
     # ------------------------------------------------------------------
-    # 5. Parallel download
+    # 7. Parallel download
     # ------------------------------------------------------------------
     saved = 0
     failed = 0
@@ -664,7 +752,7 @@ def scrape(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(_download_image, url, out_path, session, seen_hashes): url
-            for url in sorted_urls[: limit * 4]
+            for url in sorted_urls[: limit * 5]  # pool 5× plus grand pour compenser le filtre CV
         }
         with tqdm(total=limit, desc="Downloading", unit="img") as pbar:
             for future in as_completed(futures):
@@ -681,20 +769,28 @@ def scrape(
                     errors[reason] = errors.get(reason, 0) + 1
 
     # ------------------------------------------------------------------
-    # 6. Manifest
+    # 8. Manifest
     # ------------------------------------------------------------------
     manifest = {
         "total_downloaded": saved,
         "total_failed": failed,
         "failure_reasons": errors,
         "output_dir": str(out_path.resolve()),
-        "note": "Images prioritised by top/address-view URL score. Use annotate.py to curate.",
+        "queries_used": SEARCH_QUERIES,
+        "note": (
+            "Images prioritisées par score URL top/address-view. "
+            "Filtre CV post-download appliqué (rejet si objet trop allongé). "
+            "Utilise annotate.py pour la curation finale."
+        ),
     }
     with open(out_path / "_manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
 
     print(f"\n[scrape] Done: {saved} images → {out_path}")
-    print(f"         Failed: {failed}  |  Top reasons: {dict(list(errors.items())[:5])}")
+    print(f"         Failed: {failed}  |  Top raisons: {dict(list(errors.items())[:5])}")
+    cv_filtered = errors.get("cv_filter:not_top_view", 0)
+    if cv_filtered:
+        print(f"         Filtre CV: {cv_filtered} images rejetées (vue de face détectée)")
     print(f"\nProchaine étape : python3 annotate.py {out_path}/")
     return saved
 
@@ -742,7 +838,7 @@ def main() -> None:
     sc.add_argument("--workers",      type=int,   default=6)
     sc.add_argument("--delay",        type=float, default=0.4)
     sc.add_argument("--skip-search",  action="store_true", help="Ne pas utiliser DDG/Bing")
-    sc.add_argument("--skip-brands",  action="store_true", help="Ne pas scraper les marques directement")
+    sc.add_argument("--skip-brands",  action="store_true", help="Ne pas scraper les marques/eBay/Reddit")
 
     st = sub.add_parser("stats", help="Statistiques d'un dossier")
     st.add_argument("--dir", default="data/raw_images")
