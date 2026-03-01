@@ -276,7 +276,7 @@ MIN_BOX_PX = 60   # minimum box dimension in pixels
 # Debug visualisation
 # ---------------------------------------------------------------------------
 
-def _draw_debug(bgr: np.ndarray, bbox: Optional[tuple]) -> np.ndarray:
+def _draw_debug(bgr: np.ndarray, bbox: Optional[tuple], strategy: str = "") -> np.ndarray:
     vis = bgr.copy()
     h, w = vis.shape[:2]
     if bbox:
@@ -285,9 +285,17 @@ def _draw_debug(bgr: np.ndarray, bbox: Optional[tuple]) -> np.ndarray:
         y1 = int((cy - bh/2) * h)
         x2 = int((cx + bw/2) * w)
         y2 = int((cy + bh/2) * h)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(vis, "putter", (x1, y1 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        # colour by reliability: green=hsv, orange=grabcut, red=fallback
+        if strategy == "hsv":
+            color = (0, 255, 0)
+        elif strategy == "grabcut":
+            color = (0, 165, 255)
+        else:
+            color = (0, 0, 255)   # fallback — red alert
+        label = f"putter [{strategy}]" if strategy else "putter"
+        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(vis, label, (x1, max(0, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
     else:
         cv2.putText(vis, "NO DETECTION", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
@@ -303,6 +311,7 @@ def label_images(
     out_dir: str,
     review: bool = False,
     use_grabcut: bool = True,
+    allow_fallback: bool = True,
     min_confidence: float = 0.0,   # reserved for future ML confidence
 ) -> dict:
     """
@@ -352,7 +361,7 @@ def label_images(
             bbox, strategy = detect_putter_bbox(bgr, use_grabcut=use_grabcut)
 
             if review:
-                vis = _draw_debug(bgr, bbox)
+                vis = _draw_debug(bgr, bbox, strategy)
                 cv2.imwrite(str(rev_out / img_path.name), vis)
 
             if bbox is None or strategy == "none":
@@ -366,6 +375,9 @@ def label_images(
                 stats["by_grabcut"] += 1
             elif strategy == "fallback":
                 stats["by_fallback"] += 1
+                if not allow_fallback:
+                    stats["rejected_fallback"] = stats.get("rejected_fallback", 0) + 1
+                    continue
 
             # Save image + label
             out_stem = img_path.stem
@@ -395,6 +407,8 @@ def label_images(
     print(f"  Labeled:  {stats['labeled']}  "
           f"(HSV: {stats['by_hsv']}, GrabCut: {stats['by_grabcut']}, "
           f"Fallback: {stats['by_fallback']})")
+    if stats.get("rejected_fallback"):
+        print(f"  Rejected: {stats['rejected_fallback']}  (fallback centre-crop, --no-fallback active)")
     print(f"  Failed:   {stats['failed']}  (no putter detected)")
     print(f"  Skipped:  {stats['skipped']}  (corrupt / unreadable)")
     print(f"  Output:   {dst.resolve()}")
@@ -495,6 +509,8 @@ def main() -> None:
                     help="Save debug visualisations to <out>/review/")
     lp.add_argument("--no-grabcut", action="store_true",
                     help="Skip GrabCut refinement (faster but less accurate)")
+    lp.add_argument("--no-fallback", action="store_true",
+                    help="Reject images that could only be labelled via centre-crop fallback")
 
     # split command
     sp = sub.add_parser("split", help="Split labeled dataset into train/val")
@@ -512,6 +528,7 @@ def main() -> None:
             out_dir=args.out,
             review=args.review,
             use_grabcut=not args.no_grabcut,
+            allow_fallback=not args.no_fallback,
         )
     elif args.cmd == "split":
         split_dataset(args.dataset, val_ratio=args.val_ratio, purge=args.purge)
