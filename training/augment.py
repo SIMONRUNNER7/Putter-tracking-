@@ -213,6 +213,69 @@ def aug_background_swap(
     return result, bboxes
 
 
+def aug_gaussian_blur(bgr: np.ndarray, bboxes: BBoxes) -> tuple:
+    """Soft defocus / out-of-focus blur (different from motion blur)."""
+    ksize = random.choice([3, 5, 7, 9])
+    result = cv2.GaussianBlur(bgr, (ksize, ksize), 0)
+    return result, bboxes
+
+
+def aug_barrel_distortion(bgr: np.ndarray, bboxes: BBoxes) -> tuple:
+    """Lens distortion — barrel (k<0) or pincushion (k>0)."""
+    h, w = bgr.shape[:2]
+    k = random.uniform(-0.3, 0.3)
+    K = np.array([[w, 0, w / 2],
+                  [0, w, h / 2],
+                  [0, 0, 1]], dtype=np.float32)
+    D = np.array([k, 0, 0, 0], dtype=np.float32)
+    result = cv2.undistort(bgr, K, D)
+    return result, bboxes  # bbox centre unchanged for small k
+
+
+def aug_jpeg_artifact(bgr: np.ndarray, bboxes: BBoxes) -> tuple:
+    """Simulate heavy JPEG compression (blocky artifacts)."""
+    quality = random.randint(20, 55)
+    _, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    result = cv2.imdecode(enc, cv2.IMREAD_COLOR)
+    return result, bboxes
+
+
+def aug_vignette(bgr: np.ndarray, bboxes: BBoxes) -> tuple:
+    """Darken image corners (cheap-lens / phone camera vignette)."""
+    h, w = bgr.shape[:2]
+    sigma_x = w * random.uniform(0.4, 0.7)
+    sigma_y = h * random.uniform(0.4, 0.7)
+    X = cv2.getGaussianKernel(w, sigma_x)
+    Y = cv2.getGaussianKernel(h, sigma_y)
+    mask = Y @ X.T
+    mask = mask / mask.max()
+    strength = random.uniform(0.4, 0.85)
+    kernel = strength + (1.0 - strength) * mask
+    result = (bgr * kernel[..., np.newaxis]).clip(0, 255).astype(np.uint8)
+    return result, bboxes
+
+
+def aug_elastic_distort(bgr: np.ndarray, bboxes: BBoxes,
+                        alpha: float = 60.0, sigma: float = 6.0) -> tuple:
+    """Smooth elastic deformation — wavy / rubber-sheet effect."""
+    h, w = bgr.shape[:2]
+    alpha = random.uniform(30, 80)
+    sigma = random.uniform(4, 10)
+    dx = cv2.GaussianBlur(
+        np.random.randn(h, w).astype(np.float32), (0, 0), sigma
+    ) * alpha
+    dy = cv2.GaussianBlur(
+        np.random.randn(h, w).astype(np.float32), (0, 0), sigma
+    ) * alpha
+    grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
+    map_x = (grid_x + dx).astype(np.float32)
+    map_y = (grid_y + dy).astype(np.float32)
+    result = cv2.remap(bgr, map_x, map_y,
+                       interpolation=cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_REFLECT)
+    return result, bboxes
+
+
 def aug_reflection(bgr: np.ndarray, bboxes: BBoxes) -> tuple:
     """Add a subtle metallic sheen / highlight on the putter head."""
     h, w = bgr.shape[:2]
@@ -240,15 +303,21 @@ def aug_reflection(bgr: np.ndarray, bboxes: BBoxes) -> tuple:
 
 # Available augmentations with their probability of being applied
 AUG_MENU = [
-    (aug_motion_blur,      0.40),
-    (aug_shadow,           0.50),
-    (aug_brightness,       0.70),
-    (aug_hue_shift,        0.60),
-    (aug_noise,            0.35),
-    (aug_flip_horizontal,  0.50),
-    (aug_rotate,           0.45),
-    (aug_perspective,      0.30),
-    (aug_reflection,       0.25),
+    (aug_motion_blur,       0.40),
+    (aug_shadow,            0.50),
+    (aug_brightness,        0.70),
+    (aug_hue_shift,         0.60),
+    (aug_noise,             0.35),
+    (aug_flip_horizontal,   0.50),
+    (aug_rotate,            0.45),
+    (aug_perspective,       0.30),
+    (aug_reflection,        0.25),
+    # --- nouvelles augmentations ---
+    (aug_gaussian_blur,     0.40),
+    (aug_barrel_distortion, 0.25),
+    (aug_jpeg_artifact,     0.30),
+    (aug_vignette,          0.35),
+    (aug_elastic_distort,   0.30),
 ]
 
 
