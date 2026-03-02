@@ -139,6 +139,8 @@ def train(
         hsv_s=0.5,            # saturation jitter
         hsv_v=0.4,            # value jitter (shadows / highlights)
         verbose=True,
+        workers=2,            # reduce dataloader threads (default 8 causes OOM on MPS)
+        cache=False,          # do not cache dataset in RAM
     )
 
     best_weights = Path(output_dir) / "putter_detector" / "weights" / "best.pt"
