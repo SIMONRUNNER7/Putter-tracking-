@@ -297,6 +297,59 @@ def aug_reflection(bgr: np.ndarray, bboxes: BBoxes) -> tuple:
     return overlay.clip(0, 255).astype(np.uint8), bboxes
 
 
+def generate_procedural_backgrounds(
+    n: int = 20,
+    size: tuple = (480, 640),
+) -> list:
+    """
+    Generate n procedural backgrounds (grass, carpet, concrete, wood)
+    using OpenCV only — no external images required.
+    """
+    h, w = size
+    bgs = []
+    for i in range(n):
+        kind = i % 4  # 0=grass, 1=carpet, 2=concrete, 3=wood
+
+        if kind == 0:  # Green grass
+            base = np.zeros((h, w, 3), dtype=np.uint8)
+            base[:, :, 0] = np.random.randint(10, 45, (h, w), dtype=np.uint8)
+            base[:, :, 1] = np.random.randint(70, 150, (h, w), dtype=np.uint8)
+            base[:, :, 2] = np.random.randint(20, 60, (h, w), dtype=np.uint8)
+            noise = np.random.randint(-15, 15, (h, w, 3), dtype=np.int16)
+            bg = np.clip(base.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+            bg = cv2.GaussianBlur(bg, (3, 3), 0)
+
+        elif kind == 1:  # Dark carpet
+            val = random.randint(40, 100)
+            base = np.zeros((h, w, 3), dtype=np.uint8)
+            base[:, :, 0] = val // 2
+            base[:, :, 1] = val // 2
+            base[:, :, 2] = val
+            noise = np.random.randint(-20, 20, (h, w, 3), dtype=np.int16)
+            bg = np.clip(base.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+        elif kind == 2:  # Grey concrete
+            val = random.randint(120, 200)
+            base = np.full((h, w, 3), val, dtype=np.uint8)
+            noise = np.random.randint(-25, 25, (h, w, 3), dtype=np.int16)
+            bg = np.clip(base.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+        else:  # Wood floor
+            bg = np.zeros((h, w, 3), dtype=np.uint8)
+            stripe_w = random.randint(30, 60)
+            for x in range(0, w, stripe_w):
+                r = random.randint(80, 130)
+                bg[:, x:min(x + stripe_w, w), 0] = r // 3
+                bg[:, x:min(x + stripe_w, w), 1] = r // 2
+                bg[:, x:min(x + stripe_w, w), 2] = r
+            noise = np.random.randint(-10, 10, (h, w, 3), dtype=np.int16)
+            bg = np.clip(bg.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+            bg = cv2.GaussianBlur(bg, (5, 5), 0)
+
+        bgs.append(bg)
+    return bgs
+
+
 # ---------------------------------------------------------------------------
 # Augmentation sequence
 # ---------------------------------------------------------------------------
@@ -318,6 +371,7 @@ AUG_MENU = [
     (aug_jpeg_artifact,     0.30),
     (aug_vignette,          0.35),
     (aug_elastic_distort,   0.30),
+    (aug_background_swap,   0.35),
 ]
 
 
@@ -383,6 +437,17 @@ def augment_dataset(
             if img is not None:
                 bg_images.append(img)
         print(f"[augment] Loaded {len(bg_images)} background images.")
+
+    # Auto-generate procedural backgrounds if none were provided
+    if not bg_images:
+        first = next(iter(img_dir.glob("*.jpg")), None)
+        h, w = 480, 640
+        if first is not None:
+            sample = cv2.imread(str(first))
+            if sample is not None:
+                h, w = sample.shape[:2]
+        bg_images = generate_procedural_backgrounds(n=20, size=(h, w))
+        print(f"[augment] Généré {len(bg_images)} fonds proceduraux (herbe/moquette/béton/bois).")
 
     originals = list(img_dir.glob("*.jpg"))
     print(f"[augment] Augmenting {len(originals)} images × {factor} = "
