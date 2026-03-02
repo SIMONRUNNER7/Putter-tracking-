@@ -209,11 +209,11 @@ class ImageCanvas(QWidget):
 # ---------------------------------------------------------------------------
 
 class LabelTool(QMainWindow):
-    def __init__(self, images_dir: str, out_dir: str):
+    def __init__(self, images_dir: str, out_dir: str, labels_dir: str = None):
         super().__init__()
         self.images_dir = Path(images_dir)
         self.out_dir    = Path(out_dir)
-        self.out_labels = self.out_dir / "labels" / "all"
+        self.out_labels = Path(labels_dir) if labels_dir else self.out_dir / "labels" / "all"
         self.out_images = self.out_dir / "images" / "all"
         self.out_labels.mkdir(parents=True, exist_ok=True)
         self.out_images.mkdir(parents=True, exist_ok=True)
@@ -413,11 +413,12 @@ def main():
     parser = argparse.ArgumentParser(description="Outil de labeling manuel — putter bbox")
     parser.add_argument("--images", required=True, help="Dossier d'images brutes")
     parser.add_argument("--out",    required=True, help="Dossier dataset de sortie (data/putter_dataset)")
+    parser.add_argument("--labels", default=None,  help="Dossier des labels existants (optionnel, ex: data/putter_dataset/labels/train)")
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    window = LabelTool(args.images, args.out)
+    window = LabelTool(args.images, args.out, args.labels)
     window.show()
     sys.exit(app.exec())
 
