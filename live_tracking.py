@@ -440,8 +440,9 @@ def pick_camera(forced_index: Optional[int]) -> int:
 #  Boucle principale
 # ═══════════════════════════════════════════════════════════════════════════
 def run_live(source, lefty: bool = False) -> None:
+    avf = getattr(cv2, "CAP_AVFOUNDATION", None)
     if isinstance(source, int):
-        cap = cv2.VideoCapture(source, cv2.CAP_AVFOUNDATION)
+        cap = cv2.VideoCapture(source, avf) if avf else cv2.VideoCapture(source)
         if not cap.isOpened():
             cap = cv2.VideoCapture(source)
     else:
