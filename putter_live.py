@@ -170,11 +170,11 @@ class PutterLive:
         self._strobe_indices: list = []
 
         # KEYFRAMES state
-        self._kf_init   = False
-        self._kf_idx    = 0
-        self._kf_last   = 0.0
-        self._kf_done   = False
-        self._kf_flash: dict = {}          # col → timestamp of flash
+        self._kf_init    = False
+        self._kf_idx     = 0
+        self._kf_last    = 0.0
+        self._kf_done    = False
+        self._kf_cur_col: Optional[int] = None   # column currently flashing
         self._kf_bg: Optional[np.ndarray] = None
         self._sel_mode  = False
         self._sel_start: Optional[tuple] = None
@@ -649,7 +649,7 @@ class PutterLive:
 
     # ── Strobe composite ──────────────────────────────────────────────────────
 
-    def _draw_strobe_composite(self, flash_cols: set = None) -> np.ndarray:
+    def _draw_strobe_composite(self) -> np.ndarray:
         """
         Stroboscopic composite:
           - Background = first recorded frame (full view, no crop)
@@ -678,23 +678,13 @@ class PutterLive:
         # Start with first frame as background
         composite = frames[0].copy()
 
-        if flash_cols is None:
-            flash_cols = set()
-
         # Lay in captured columns; uncaptured columns keep the background
-        indices = self._strobe_indices[:N_COLS]
-        for i in range(min(len(indices), N_COLS)):
-            frame_idx = indices[i]
+        for i, frame_idx in enumerate(self._strobe_indices[:N_COLS]):
             if frame_idx is None:
                 continue                   # not yet captured — keep bg
             x0 = i * col_w
             x1 = sf_w if i == N_COLS - 1 else x0 + col_w
             composite[:, x0:x1] = frames[frame_idx][:, x0:x1]
-            # Flash: brighten newly-captured column
-            if i in flash_cols:
-                composite[:, x0:x1] = np.clip(
-                    composite[:, x0:x1].astype(np.int32) + 70, 0, 255
-                ).astype(np.uint8)
 
         # Resize composite to display area (no distortion — same aspect ratio)
         out[:vid_h] = cv2.resize(composite, (self.W, vid_h))
@@ -876,7 +866,7 @@ class PutterLive:
                     self._kf_idx       = 0
                     self._kf_last      = now
                     self._kf_done      = False
-                    self._kf_flash     = {}
+                    self._kf_cur_col   = None
                     self._strobe_indices = [None] * 7
                     if self._rep_frames:
                         bg_raw         = cv2.cvtColor(self._rep_frames[0],
@@ -884,26 +874,53 @@ class PutterLive:
                         self._kf_bg    = cv2.GaussianBlur(
                             bg_raw, (21, 21), 0).astype(np.float32)
 
+                KF_FPS  = 6          # ~0.4× of 15 fps stored
+                N_COLS  = 7
+                vid_h   = int(self.H * 0.60)
+                col_w_d = self.W // N_COLS   # column width in display space
+
                 # ── Advance one frame at 0.4× speed ───────────────────────
-                KF_FPS = 6   # 6 frames/s ≈ 0.4× of 15 fps stored
                 if not self._kf_done and self._rep_frames:
                     if now - self._kf_last >= 1.0 / KF_FPS:
                         self._kf_last = now
-                        if self._kf_idx < len(self._rep_frames):
-                            col = self._detect_putter_col(self._kf_idx)
-                            if col is not None and \
-                                    self._strobe_indices[col] is None:
+                        col = self._detect_putter_col(self._kf_idx)
+                        if col is not None:
+                            self._kf_cur_col = col
+                            if self._strobe_indices[col] is None:
                                 self._strobe_indices[col] = self._kf_idx
-                                self._kf_flash[col]       = now
                                 print(f"[kf] col {col} ← frame {self._kf_idx}")
-                            self._kf_idx += 1
                         else:
+                            self._kf_cur_col = None
+                        self._kf_idx += 1
+                        if self._kf_idx >= len(self._rep_frames):
                             self._kf_done = True
 
-                # ── Draw composite (flash cols captured in last 0.4 s) ─────
-                flash_cols = {c for c, t in self._kf_flash.items()
-                              if now - t < 0.4}
-                frame = self._draw_strobe_composite(flash_cols)
+                if not self._kf_done:
+                    # ── PHASE 1: show current frame + flash active column ──
+                    f_idx = min(self._kf_idx, len(self._rep_frames) - 1)
+                    disp  = cv2.resize(self._rep_frames[f_idx], (self.W, vid_h))
+                    frame = np.zeros((self.H, self.W, 3), dtype=np.uint8)
+                    frame[:vid_h] = disp
+
+                    # Highlight active column
+                    if self._kf_cur_col is not None:
+                        c   = self._kf_cur_col
+                        x0  = c * col_w_d
+                        x1  = x0 + col_w_d if c < N_COLS - 1 else self.W
+                        frame[:vid_h, x0:x1] = np.clip(
+                            frame[:vid_h, x0:x1].astype(np.int32) + 80,
+                            0, 255
+                        ).astype(np.uint8)
+
+                    # Column dividers
+                    for i in range(1, N_COLS):
+                        cv2.line(frame, (i * col_w_d, 0),
+                                 (i * col_w_d, vid_h), (80, 80, 80), 1)
+
+                else:
+                    # ── PHASE 2: composite with all 7 frames at once ───────
+                    frame = self._draw_strobe_composite()
+
                 self._draw_hud(frame, fps, ["SPACE = new shot"])
 
             # ── ROI selection overlay ─────────────────────────────────────
