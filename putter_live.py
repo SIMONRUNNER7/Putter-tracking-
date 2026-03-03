@@ -38,6 +38,7 @@ SMOOTH_WIN       = 5      # moving-average window (frames)
 REPLAY_FPS       = 12     # slow-motion replay speed
 REPLAY_SUB       = 2      # store every Nth frame for replay (memory saving)
 TARGET_FPS       = 60
+PANEL_H          = 130    # height of metrics panel below video (px)
 ARUCO_DICT_ID    = cv2.aruco.DICT_4X4_50 if hasattr(cv2, "aruco") else None
 
 ARC_STRAIGHT_PX  = 12    # max deviation → "Straight"
@@ -216,7 +217,7 @@ class PutterLive:
 
         # OpenCV window
         cv2.namedWindow("Putter Live", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Putter Live", self.W, self.H)
+        cv2.resizeWindow("Putter Live", self.W, self.H + PANEL_H)
         cv2.setMouseCallback("Putter Live", self._on_mouse)
 
     # ── Camera ────────────────────────────────────────────────────────────────
@@ -662,10 +663,10 @@ class PutterLive:
         N_COLS  = 7
         n_frames = len(frames)
 
-        vid_h   = int(self.H * 0.60)
-        panel_h = self.H - vid_h
+        vid_h   = self.H
+        panel_h = PANEL_H
 
-        out = np.zeros((self.H, self.W, 3), dtype=np.uint8)
+        out = np.zeros((self.H + PANEL_H, self.W, 3), dtype=np.uint8)
 
         if n_frames == 0:
             return out
@@ -876,7 +877,7 @@ class PutterLive:
 
                 KF_FPS  = 6          # ~0.4× of 15 fps stored
                 N_COLS  = 7
-                vid_h   = int(self.H * 0.60)
+                vid_h   = self.H
                 col_w_d = self.W // N_COLS   # column width in display space
 
                 # ── Advance one frame at 0.4× speed ───────────────────────
@@ -898,9 +899,9 @@ class PutterLive:
                 if not self._kf_done:
                     # ── PHASE 1: show current frame + flash active column ──
                     f_idx = min(self._kf_idx, len(self._rep_frames) - 1)
-                    disp  = cv2.resize(self._rep_frames[f_idx], (self.W, vid_h))
-                    frame = np.zeros((self.H, self.W, 3), dtype=np.uint8)
-                    frame[:vid_h] = disp
+                    disp  = cv2.resize(self._rep_frames[f_idx], (self.W, self.H))
+                    frame = np.zeros((self.H + PANEL_H, self.W, 3), dtype=np.uint8)
+                    frame[:self.H] = disp
 
                     # Highlight active column
                     if self._kf_cur_col is not None:
@@ -931,6 +932,11 @@ class PutterLive:
             if self.debug:
                 self._draw_debug(frame)
 
+            # Pad camera-height frames to full window height
+            if frame.shape[0] == self.H:
+                padded = np.zeros((self.H + PANEL_H, self.W, 3), dtype=np.uint8)
+                padded[:self.H] = frame
+                frame = padded
             cv2.imshow("Putter Live", frame)
 
             # ── Key handling ──────────────────────────────────────────────
