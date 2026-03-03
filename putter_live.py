@@ -858,13 +858,13 @@ class PutterLive:
                 result.append(None)
                 continue
             preds = self._yolo.predict(kf, conf=0.10, verbose=False)
-            boxes = preds[0].boxes
-            if len(boxes) == 0:
+            obb = preds[0].obb
+            if obb is None or len(obb) == 0:
                 result.append(None)
                 continue
-            confs  = boxes.conf.tolist()
+            confs  = obb.conf.tolist()
             best_i = int(max(range(len(confs)), key=lambda k: confs[k]))
-            bx1, by1, bx2, by2 = boxes.xyxy[best_i].tolist()
+            bx1, by1, bx2, by2 = obb.xyxy[best_i].tolist()
             result.append((bx1, by1, bx2, by2))
         return result
 
