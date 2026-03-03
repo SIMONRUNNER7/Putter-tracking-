@@ -840,31 +840,39 @@ class PutterLive:
     def _run_yolo_strobe(self) -> list:
         N_COLS = 7
         if self._yolo is None:
+            print("[yolo] model is None – skipping detection")
             return [None] * N_COLS
 
         src_cols = self._kf_col_frames
+        n_kf = sum(1 for f in src_cols if f is not None)
+        print(f"[yolo] _kf_col_frames non-None: {n_kf}/7")
         if not any(f is not None for f in src_cols):
             frames = self._rep_frames
             if not frames:
+                print("[yolo] no replay frames either – nothing to detect")
                 return [None] * N_COLS
             src_cols = [
                 frames[idx] if idx is not None and idx < len(frames) else None
                 for idx in (list(self._strobe_indices[:N_COLS]) + [None] * N_COLS)[:N_COLS]
             ]
+            n_fb = sum(1 for f in src_cols if f is not None)
+            print(f"[yolo] fallback frames non-None: {n_fb}/7  strobe_indices={self._strobe_indices}")
 
         result = []
         for i, kf in enumerate(src_cols[:N_COLS]):
             if kf is None:
                 result.append(None)
                 continue
-            preds = self._yolo.predict(kf, conf=0.10, verbose=False)
+            preds = self._yolo.predict(kf, conf=0.01, verbose=False)
             obb = preds[0].obb
             if obb is None or len(obb) == 0:
+                print(f"[yolo] col {i}: no detection  (img shape={kf.shape})")
                 result.append(None)
                 continue
             confs  = obb.conf.tolist()
             best_i = int(max(range(len(confs)), key=lambda k: confs[k]))
             bx1, by1, bx2, by2 = obb.xyxy[best_i].tolist()
+            print(f"[yolo] col {i}: detected conf={confs[best_i]:.2f}  box=({bx1:.0f},{by1:.0f},{bx2:.0f},{by2:.0f})")
             result.append((bx1, by1, bx2, by2))
         return result
 
