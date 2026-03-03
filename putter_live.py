@@ -164,9 +164,10 @@ class PutterLive:
         self.tracker: Optional[object] = None
         self.roi:     Optional[tuple]  = None
 
-        # Motion-based tracking (background subtraction)
-        self._bg_frame: Optional[np.ndarray] = None
-        self._track_mode = "none"   # "aruco" | "csrt" | "motion" | "none"
+        self._track_mode = "none"   # "aruco" | "csrt" | "none"
+
+        # Indices into _rep_frames for the 7 strobe composite frames
+        self._strobe_indices: list = []
         self._sel_mode  = False
         self._sel_start: Optional[tuple] = None
         self._sel_end:   Optional[tuple] = None
@@ -318,27 +319,6 @@ class PutterLive:
                 self._track_mode = "csrt"
                 self._dbg_info = {"roi": (x, y, w, h), "fallback": True}
                 return center, raw
-
-        # ── Motion / background-subtraction fallback ──────────────────────
-        if self._bg_frame is not None:
-            blur = cv2.GaussianBlur(gray, (21, 21), 0)
-            diff = cv2.absdiff(blur, self._bg_frame)
-            _, thresh = cv2.threshold(diff, 12, 255, cv2.THRESH_BINARY)
-            thresh = cv2.dilate(thresh, None, iterations=3)
-            cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
-                                        cv2.CHAIN_APPROX_SIMPLE)
-            if cnts:
-                c = max(cnts, key=cv2.contourArea)
-                if cv2.contourArea(c) > 400:
-                    M = cv2.moments(c)
-                    if M["m00"] > 0:
-                        cx = int(M["m10"] / M["m00"])
-                        cy = int(M["m01"] / M["m00"])
-                        self.using_aruco = False
-                        self._track_mode = "motion"
-                        x, y, w, h = cv2.boundingRect(c)
-                        self._dbg_info = {"roi": (x, y, w, h)}
-                        return (cx, cy), None
 
         self._track_mode = "none"
         return None, None
@@ -629,6 +609,74 @@ class PutterLive:
             cv2.rectangle(frame, (x, y), (x + w, y + h), C["blue"], 1)
             self._put(frame, "CSRT", (x, y - 4), scale=0.38, color=C["blue"])
 
+    # ── Post-recording frame analysis ─────────────────────────────────────────
+
+    def _find_strobe_frames(self) -> list:
+        """
+        After recording, analyse _rep_frames to find 7 frames where the
+        putter is at 7 evenly-spaced horizontal positions across the stroke.
+
+        Algorithm:
+          1. Use the first stored frame as a static background.
+          2. For every subsequent frame, subtract background → find the
+             largest moving region → record its x centroid.
+          3. Sort these (frame_idx, cx) pairs by x, then pick 7 evenly
+             spaced across the horizontal range.
+        """
+        frames = self._rep_frames
+        N = 7
+        n = len(frames)
+        fallback = [int(round(i * (n - 1) / max(N - 1, 1))) for i in range(min(N, n))]
+
+        if n < N:
+            return fallback
+
+        # Background: first frame (putter at address, not yet moving)
+        bg = cv2.GaussianBlur(
+            cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY), (21, 21), 0
+        ).astype(np.float32)
+
+        # Find x centroid of the moving object in each frame
+        detections = []   # list of (cx, frame_idx)
+        for i, f in enumerate(frames):
+            gray = cv2.GaussianBlur(
+                cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), (21, 21), 0
+            ).astype(np.float32)
+            diff  = np.abs(gray - bg)
+            _, th = cv2.threshold(diff.astype(np.uint8), 10, 255, cv2.THRESH_BINARY)
+            th    = cv2.dilate(th, None, iterations=3)
+            cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts:
+                continue
+            c = max(cnts, key=cv2.contourArea)
+            if cv2.contourArea(c) < 60:
+                continue
+            M = cv2.moments(c)
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"])
+                detections.append((cx, i))
+
+        if len(detections) < N:
+            print(f"[strobe] only {len(detections)} frames with motion — using fallback")
+            return fallback
+
+        min_cx = min(d[0] for d in detections)
+        max_cx = max(d[0] for d in detections)
+        if max_cx - min_cx < 10:
+            print("[strobe] not enough horizontal movement — using fallback")
+            return fallback
+
+        # Pick 7 frames whose putter x is closest to 7 evenly-spaced targets
+        result = []
+        for i in range(N):
+            target = min_cx + i * (max_cx - min_cx) / (N - 1)
+            best   = min(detections, key=lambda d: abs(d[0] - target))
+            result.append(best[1])
+
+        print(f"[strobe] x range {min_cx}–{max_cx}px, frames: {result}")
+        return result
+
     # ── Strobe composite ──────────────────────────────────────────────────────
 
     def _draw_strobe_composite(self) -> np.ndarray:
@@ -660,37 +708,12 @@ class PutterLive:
         # Start with first frame as background
         composite = frames[0].copy()
 
-        r = self.result
-        if r and len(r.positions) >= 2:
-            # timestamps are in the same unit as records
-            t0    = r.timestamps[0]
-            t_rng = max(r.timestamps[-1] - t0, 1e-6)
-            n_rec = len(r.positions)
-
-            for i in range(N_COLS):
-                # Column center in stored-frame space → original-frame space
-                cx_sf   = (i + 0.5) * sf_w / N_COLS
-                cx_orig = cx_sf * (self.W / sf_w)   # scale to original W
-
-                # Find the record whose x is closest to this column center
-                best_j = min(range(n_rec),
-                             key=lambda j: abs(r.positions[j][0] - cx_orig))
-
-                # Map record timestamp → rep_frame index (linear interpolation)
-                rel_t   = (r.timestamps[best_j] - t0) / t_rng
-                rep_idx = int(round(rel_t * (n_frames - 1)))
-                rep_idx = max(0, min(rep_idx, n_frames - 1))
-
-                x0 = i * col_w
-                x1 = sf_w if i == N_COLS - 1 else x0 + col_w
-                composite[:, x0:x1] = frames[rep_idx][:, x0:x1]
-        else:
-            # No tracking data: evenly-spaced frames, same column logic
-            for i in range(N_COLS):
-                idx = int(round(i * (n_frames - 1) / max(N_COLS - 1, 1)))
-                x0  = i * col_w
-                x1  = sf_w if i == N_COLS - 1 else x0 + col_w
-                composite[:, x0:x1] = frames[idx][:, x0:x1]
+        # Use the 7 frames found by post-recording background subtraction
+        indices = self._strobe_indices[:N_COLS]
+        for i, frame_idx in enumerate(indices):
+            x0 = i * col_w
+            x1 = sf_w if i == N_COLS - 1 else x0 + col_w
+            composite[:, x0:x1] = frames[frame_idx][:, x0:x1]
 
         # Resize composite to display area (no distortion — same aspect ratio)
         out[:vid_h] = cv2.resize(composite, (self.W, vid_h))
@@ -792,9 +815,6 @@ class PutterLive:
                     self._rep_ctr   = 0
                     self._pos_buf.clear()
                     self._ang_buf.clear()
-                    # Freeze background for motion tracking
-                    _g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    self._bg_frame = cv2.GaussianBlur(_g, (21, 21), 0)
 
             # ── RECORDING ─────────────────────────────────────────────────
             elif self.state == AppState.RECORDING:
@@ -833,6 +853,7 @@ class PutterLive:
                 if self.result:
                     self._save_json(self.result)
                     self._last_path = list(self.result.positions)
+                self._strobe_indices = self._find_strobe_frames()
                 self._rep_idx   = 0
                 self._rep_loops = 0
                 self._rep_last  = now
