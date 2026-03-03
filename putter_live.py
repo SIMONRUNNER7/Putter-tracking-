@@ -634,8 +634,8 @@ class PutterLive:
                     ))
                 self._rep_ctr += 1
                 if self._rep_ctr % REPLAY_SUB == 0:
-                    small = cv2.resize(frame, (self.W // 2, self.H // 2))
-                    self._rep_frames.append(small)
+                    # Store raw frame BEFORE drawing overlays
+                    self._rep_frames.append(cv2.resize(frame, (self.W // 2, self.H // 2)))
 
                 self._draw_target_line(frame)
                 if self.records:
@@ -669,21 +669,25 @@ class PutterLive:
             # ── REPLAY ────────────────────────────────────────────────────
             elif self.state == AppState.REPLAY:
                 r = self.result
-                if r and self._rep_frames:
+                # Always show captured frames (independent of tracking result)
+                if self._rep_frames:
                     if now - self._rep_last >= 1.0 / REPLAY_FPS:
                         self._rep_idx  = (self._rep_idx + 1) % len(self._rep_frames)
                         self._rep_last = now
                     frame = cv2.resize(self._rep_frames[self._rep_idx],
                                        (self.W, self.H))
+                self._draw_target_line(frame)
                 if r:
-                    self._draw_target_line(frame)
                     self._draw_path(frame, r.positions)
                     if 0 <= r.impact_idx < len(r.positions):
                         imp_pos = r.positions[r.impact_idx]
                         cv2.circle(frame, imp_pos, 14, C["yellow"], 2)
                         self._draw_face_arrow(frame, imp_pos, r.face_impact)
                     self._draw_results(frame, r)
-                    self._draw_hud(frame, fps, ["REPLAY  (SPACE = new shot)"])
+                hud_extra = ["REPLAY  (SPACE = new shot)"]
+                if not r:
+                    hud_extra.append("No tracking — add ArUco or press F")
+                self._draw_hud(frame, fps, hud_extra)
 
             # ── ROI selection overlay ─────────────────────────────────────
             if self._sel_mode:
