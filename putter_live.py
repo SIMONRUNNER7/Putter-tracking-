@@ -166,8 +166,16 @@ class PutterLive:
 
         self._track_mode = "none"   # "aruco" | "csrt" | "none"
 
-        # Indices into _rep_frames for the 7 strobe composite frames
+        # Strobe composite: one frame index per column (None = not yet captured)
         self._strobe_indices: list = []
+
+        # KEYFRAMES state
+        self._kf_init   = False
+        self._kf_idx    = 0
+        self._kf_last   = 0.0
+        self._kf_done   = False
+        self._kf_flash: dict = {}          # col → timestamp of flash
+        self._kf_bg: Optional[np.ndarray] = None
         self._sel_mode  = False
         self._sel_start: Optional[tuple] = None
         self._sel_end:   Optional[tuple] = None
@@ -609,77 +617,39 @@ class PutterLive:
             cv2.rectangle(frame, (x, y), (x + w, y + h), C["blue"], 1)
             self._put(frame, "CSRT", (x, y - 4), scale=0.38, color=C["blue"])
 
-    # ── Post-recording frame analysis ─────────────────────────────────────────
+    # ── Keyframe detection helper ─────────────────────────────────────────────
 
-    def _find_strobe_frames(self) -> list:
+    def _detect_putter_col(self, idx: int) -> Optional[int]:
         """
-        After recording, analyse _rep_frames to find 7 frames where the
-        putter is at 7 evenly-spaced horizontal positions across the stroke.
-
-        Algorithm:
-          1. Use the first stored frame as a static background.
-          2. For every subsequent frame, subtract background → find the
-             largest moving region → record its x centroid.
-          3. Sort these (frame_idx, cx) pairs by x, then pick 7 evenly
-             spaced across the horizontal range.
+        Background-subtract frame idx against frame 0 (background).
+        Return column 0-6 where the putter centroid sits, or None.
         """
-        frames = self._rep_frames
-        N = 7
-        n = len(frames)
-        fallback = [int(round(i * (n - 1) / max(N - 1, 1))) for i in range(min(N, n))]
-
-        if n < N:
-            return fallback
-
-        # Background: first frame (putter at address, not yet moving)
-        bg = cv2.GaussianBlur(
-            cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY), (21, 21), 0
+        if self._kf_bg is None or idx == 0:
+            return None
+        f    = self._rep_frames[idx]
+        gray = cv2.GaussianBlur(
+            cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), (21, 21), 0
         ).astype(np.float32)
-
-        # Find x centroid of the moving object in each frame
-        detections = []   # list of (cx, frame_idx)
-        for i, f in enumerate(frames):
-            gray = cv2.GaussianBlur(
-                cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), (21, 21), 0
-            ).astype(np.float32)
-            diff  = np.abs(gray - bg)
-            _, th = cv2.threshold(diff.astype(np.uint8), 10, 255, cv2.THRESH_BINARY)
-            th    = cv2.dilate(th, None, iterations=3)
-            cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL,
-                                        cv2.CHAIN_APPROX_SIMPLE)
-            if not cnts:
-                continue
-            c = max(cnts, key=cv2.contourArea)
-            if cv2.contourArea(c) < 60:
-                continue
-            M = cv2.moments(c)
-            if M["m00"] > 0:
-                cx = int(M["m10"] / M["m00"])
-                detections.append((cx, i))
-
-        if len(detections) < N:
-            print(f"[strobe] only {len(detections)} frames with motion — using fallback")
-            return fallback
-
-        min_cx = min(d[0] for d in detections)
-        max_cx = max(d[0] for d in detections)
-        if max_cx - min_cx < 10:
-            print("[strobe] not enough horizontal movement — using fallback")
-            return fallback
-
-        # Pick 7 frames whose putter x is closest to 7 evenly-spaced targets
-        result = []
-        for i in range(N):
-            target = min_cx + i * (max_cx - min_cx) / (N - 1)
-            best   = min(detections, key=lambda d: abs(d[0] - target))
-            result.append(best[1])
-
-        print(f"[strobe] x range {min_cx}–{max_cx}px, frames: {result}")
-        return result
+        diff  = np.abs(gray - self._kf_bg)
+        _, th = cv2.threshold(diff.astype(np.uint8), 10, 255, cv2.THRESH_BINARY)
+        th    = cv2.dilate(th, None, iterations=3)
+        cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return None
+        c = max(cnts, key=cv2.contourArea)
+        if cv2.contourArea(c) < 60:
+            return None
+        M = cv2.moments(c)
+        if M["m00"] <= 0:
+            return None
+        cx    = int(M["m10"] / M["m00"])
+        sf_w  = self._rep_frames[0].shape[1]
+        col_w = sf_w // 7
+        return min(cx // col_w, 6)
 
     # ── Strobe composite ──────────────────────────────────────────────────────
 
-    def _draw_strobe_composite(self) -> np.ndarray:
+    def _draw_strobe_composite(self, flash_cols: set = None) -> np.ndarray:
         """
         Stroboscopic composite:
           - Background = first recorded frame (full view, no crop)
@@ -708,12 +678,23 @@ class PutterLive:
         # Start with first frame as background
         composite = frames[0].copy()
 
-        # Use the 7 frames found by post-recording background subtraction
+        if flash_cols is None:
+            flash_cols = set()
+
+        # Lay in captured columns; uncaptured columns keep the background
         indices = self._strobe_indices[:N_COLS]
-        for i, frame_idx in enumerate(indices):
+        for i in range(min(len(indices), N_COLS)):
+            frame_idx = indices[i]
+            if frame_idx is None:
+                continue                   # not yet captured — keep bg
             x0 = i * col_w
             x1 = sf_w if i == N_COLS - 1 else x0 + col_w
             composite[:, x0:x1] = frames[frame_idx][:, x0:x1]
+            # Flash: brighten newly-captured column
+            if i in flash_cols:
+                composite[:, x0:x1] = np.clip(
+                    composite[:, x0:x1].astype(np.int32) + 70, 0, 255
+                ).astype(np.uint8)
 
         # Resize composite to display area (no distortion — same aspect ratio)
         out[:vid_h] = cv2.resize(composite, (self.W, vid_h))
@@ -853,7 +834,7 @@ class PutterLive:
                 if self.result:
                     self._save_json(self.result)
                     self._last_path = list(self.result.positions)
-                self._strobe_indices = self._find_strobe_frames()
+                self._kf_init   = False   # will be initialized on KEYFRAMES entry
                 self._rep_idx   = 0
                 self._rep_loops = 0
                 self._rep_last  = now
@@ -889,7 +870,40 @@ class PutterLive:
 
             # ── KEYFRAMES ─────────────────────────────────────────────────
             elif self.state == AppState.KEYFRAMES:
-                frame = self._draw_strobe_composite()
+                # ── Init on first entry ────────────────────────────────────
+                if not self._kf_init:
+                    self._kf_init      = True
+                    self._kf_idx       = 0
+                    self._kf_last      = now
+                    self._kf_done      = False
+                    self._kf_flash     = {}
+                    self._strobe_indices = [None] * 7
+                    if self._rep_frames:
+                        bg_raw         = cv2.cvtColor(self._rep_frames[0],
+                                                      cv2.COLOR_BGR2GRAY)
+                        self._kf_bg    = cv2.GaussianBlur(
+                            bg_raw, (21, 21), 0).astype(np.float32)
+
+                # ── Advance one frame at 0.4× speed ───────────────────────
+                KF_FPS = 6   # 6 frames/s ≈ 0.4× of 15 fps stored
+                if not self._kf_done and self._rep_frames:
+                    if now - self._kf_last >= 1.0 / KF_FPS:
+                        self._kf_last = now
+                        if self._kf_idx < len(self._rep_frames):
+                            col = self._detect_putter_col(self._kf_idx)
+                            if col is not None and \
+                                    self._strobe_indices[col] is None:
+                                self._strobe_indices[col] = self._kf_idx
+                                self._kf_flash[col]       = now
+                                print(f"[kf] col {col} ← frame {self._kf_idx}")
+                            self._kf_idx += 1
+                        else:
+                            self._kf_done = True
+
+                # ── Draw composite (flash cols captured in last 0.4 s) ─────
+                flash_cols = {c for c, t in self._kf_flash.items()
+                              if now - t < 0.4}
+                frame = self._draw_strobe_composite(flash_cols)
                 self._draw_hud(frame, fps, ["SPACE = new shot"])
 
             # ── ROI selection overlay ─────────────────────────────────────
@@ -931,6 +945,8 @@ class PutterLive:
                 self.result       = None
                 self._pos_buf.clear()
                 self._ang_buf.clear()
+                self._kf_init     = False
+                self._strobe_indices = []
                 print("[reset]")
 
             elif key in (ord('f'), ord('F')):            # F → fallback ROI
