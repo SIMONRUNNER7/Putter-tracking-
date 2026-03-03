@@ -615,13 +615,18 @@ class PutterLive:
 
         out = np.zeros((self.H, self.W, 3), dtype=np.uint8)
 
-        # ── stroboscopic blend ────────────────────────────────────────────
+        # ── 7 vertical strips (one frame each) ───────────────────────────
         if n > 0:
             indices = [int(round(i * (len(frames) - 1) / max(n - 1, 1)))
                        for i in range(n)]
-            stack = np.stack([cv2.resize(frames[idx], (self.W, vid_h))
-                              for idx in indices])          # (n, H, W, 3)
-            out[:vid_h] = np.max(stack, axis=0)             # max-blend
+            strip_w = self.W // n
+            for i, idx in enumerate(indices):
+                x0 = i * strip_w
+                x1 = self.W if i == n - 1 else x0 + strip_w
+                img = cv2.resize(frames[idx], (x1 - x0, vid_h))
+                out[:vid_h, x0:x1] = img
+                if i > 0:   # thin divider between strips
+                    cv2.line(out, (x0, 0), (x0, vid_h), (60, 60, 60), 1)
 
         # thin separator line
         cv2.line(out, (0, vid_h), (self.W, vid_h), (60, 60, 60), 1)
