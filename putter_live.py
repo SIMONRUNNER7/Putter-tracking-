@@ -615,7 +615,7 @@ class PutterLive:
 
         out = np.zeros((self.H, self.W, 3), dtype=np.uint8)
 
-        # ── 7 vertical strips (one frame each) ───────────────────────────
+        # ── 7 vertical strips — scale-to-fill + center crop, no distortion ─
         if n > 0:
             indices = [int(round(i * (len(frames) - 1) / max(n - 1, 1)))
                        for i in range(n)]
@@ -623,9 +623,23 @@ class PutterLive:
             for i, idx in enumerate(indices):
                 x0 = i * strip_w
                 x1 = self.W if i == n - 1 else x0 + strip_w
-                img = cv2.resize(frames[idx], (x1 - x0, vid_h))
-                out[:vid_h, x0:x1] = img
-                if i > 0:   # thin divider between strips
+                sw  = x1 - x0
+
+                src      = frames[idx]          # stored at W//2 × H//2
+                sh, sw_s = src.shape[:2]
+
+                # Scale so height fills vid_h, preserve aspect ratio
+                scale    = vid_h / sh
+                scaled_w = int(sw_s * scale)
+                scaled   = cv2.resize(src, (scaled_w, vid_h))
+
+                # Center-crop horizontally to the strip width
+                cx   = scaled_w // 2
+                left = max(cx - sw // 2, 0)
+                left = min(left, scaled_w - sw)
+                out[:vid_h, x0:x1] = scaled[:, left:left + sw]
+
+                if i > 0:   # thin divider
                     cv2.line(out, (x0, 0), (x0, vid_h), (60, 60, 60), 1)
 
         # thin separator line
