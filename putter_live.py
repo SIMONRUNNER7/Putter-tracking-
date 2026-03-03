@@ -24,6 +24,17 @@ import math
 import os
 import sys
 import time
+
+try:
+    from ultralytics import YOLO as _YOLO
+    _YOLO_AVAILABLE = True
+except ImportError:
+    _YOLO_AVAILABLE = False
+
+_MODEL_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "runs", "detect", "runs", "putter", "putter_detector", "weights", "best.pt"
+)
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -180,6 +191,18 @@ class PutterLive:
         self._kf_flash_t    = 0.0                # timestamp of last flash
         self._kf_best_off: dict = {}             # col → best centroid offset
         self._kf_bg: Optional[np.ndarray] = None
+        # YOLO detections cache: list of (x1,y1,x2,y2) per column in stored-frame
+        # space, or None if no detection. Computed once in phase 2.
+        self._strobe_det: Optional[list] = None
+
+        # Load trained YOLOv8 putter detector
+        self._yolo = None
+        if _YOLO_AVAILABLE and os.path.isfile(_MODEL_PATH):
+            self._yolo = _YOLO(_MODEL_PATH)
+            print(f"[yolo] model loaded: {_MODEL_PATH}")
+        else:
+            print("[yolo] model not found or ultralytics missing – boxes disabled")
+
         self._sel_mode  = False
         self._sel_start: Optional[tuple] = None
         self._sel_end:   Optional[tuple] = None
@@ -663,6 +686,48 @@ class PutterLive:
 
     # ── Strobe composite ──────────────────────────────────────────────────────
 
+    def _run_yolo_strobe(self) -> list:
+        """
+        Run YOLOv8 on each of the 7 keyframes and return a list of
+        (x1, y1, x2, y2) in stored-frame pixel space, or None per column.
+        Only considers boxes whose centroid falls inside the column's x range.
+        """
+        N_COLS = 7
+        frames = self._rep_frames
+        if not frames or self._yolo is None:
+            return [None] * N_COLS
+
+        sf_w   = frames[0].shape[1]
+        col_w  = sf_w // N_COLS
+        result = []
+
+        for i, fidx in enumerate(self._strobe_indices[:N_COLS]):
+            if fidx is None:
+                result.append(None)
+                continue
+
+            x0_col = i * col_w
+            x1_col = sf_w if i == N_COLS - 1 else x0_col + col_w
+
+            preds = self._yolo.predict(frames[fidx], conf=0.20, verbose=False)
+            best  = None        # (x1, y1, x2, y2, conf)
+            for box in preds[0].boxes:
+                bx1, by1, bx2, by2 = box.xyxy[0].tolist()
+                bcx = (bx1 + bx2) / 2
+                conf = float(box.conf[0])
+                if x0_col <= bcx < x1_col:
+                    if best is None or conf > best[4]:
+                        best = (bx1, by1, bx2, by2, conf)
+
+            if best:
+                result.append(best[:4])
+                print(f"[yolo] col {i} → box {[int(v) for v in best[:4]]} "
+                      f"conf={best[4]:.2f}")
+            else:
+                result.append(None)
+
+        return result
+
     def _draw_strobe_composite(self) -> np.ndarray:
         """
         Stroboscopic composite:
@@ -702,6 +767,46 @@ class PutterLive:
 
         # Resize composite to display area (no distortion — same aspect ratio)
         out[:vid_h] = cv2.resize(composite, (self.W, vid_h))
+
+        # ── YOLO boxes + arc ──────────────────────────────────────────────
+        if self._strobe_det is None:
+            self._strobe_det = self._run_yolo_strobe()
+
+        scale_x = self.W  / sf_w
+        scale_y = vid_h   / sf_h
+        centers_disp = []   # (dx, dy) for valid detections, in display space
+
+        for i, box in enumerate(self._strobe_det):
+            if box is None:
+                centers_disp.append(None)
+                continue
+            bx1, by1, bx2, by2 = box
+            dx1 = int(bx1 * scale_x);  dy1 = int(by1 * scale_y)
+            dx2 = int(bx2 * scale_x);  dy2 = int(by2 * scale_y)
+            dcx = (dx1 + dx2) // 2;    dcy = (dy1 + dy2) // 2
+            # Bounding box
+            cv2.rectangle(out, (dx1, dy1), (dx2, dy2), (0, 255, 100), 2)
+            # Centre dot
+            cv2.circle(out, (dcx, dcy), 4, (0, 255, 100), -1)
+            centers_disp.append((dcx, dcy))
+
+        # Arc through centres (parabolic fit on display coords)
+        valid_pts = [(cx, cy) for cx, cy in centers_disp if cx is not None]
+        if len(valid_pts) >= 3:
+            xs = np.array([p[0] for p in valid_pts], dtype=np.float64)
+            ys = np.array([p[1] for p in valid_pts], dtype=np.float64)
+            coeffs = np.polyfit(xs, ys, 2)
+            x_lo, x_hi = int(xs.min()), int(xs.max())
+            arc_xs = np.linspace(x_lo, x_hi, 300)
+            arc_ys = np.polyval(coeffs, arc_xs)
+            arc_pts = np.array(
+                [[int(x), int(y)] for x, y in zip(arc_xs, arc_ys)
+                 if 0 <= y < vid_h],
+                dtype=np.int32
+            )
+            if len(arc_pts) >= 2:
+                cv2.polylines(out, [arc_pts.reshape(-1, 1, 2)],
+                              False, (0, 180, 255), 3, cv2.LINE_AA)
 
         # Column dividers
         col_w_disp = self.W // N_COLS
@@ -838,7 +943,8 @@ class PutterLive:
                 if self.result:
                     self._save_json(self.result)
                     self._last_path = list(self.result.positions)
-                self._kf_init   = False   # will be initialized on KEYFRAMES entry
+                self._kf_init     = False   # will be initialized on KEYFRAMES entry
+                self._strobe_det  = None
                 self._rep_idx   = 0
                 self._rep_loops = 0
                 self._rep_last  = now
@@ -1000,6 +1106,7 @@ class PutterLive:
                 self._ang_buf.clear()
                 self._kf_init     = False
                 self._strobe_indices = []
+                self._strobe_det  = None
                 print("[reset]")
 
             elif key in (ord('f'), ord('F')):            # F → fallback ROI
