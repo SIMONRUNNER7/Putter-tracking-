@@ -40,6 +40,7 @@ class Detection:
     shaft_angle: Optional[float] = None   # degrees
     confidence:  float = 0.0
     method: str = "none"
+    bbox: Optional[tuple] = None          # (x1, y1, x2, y2) pixels
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +395,7 @@ class PutterDetector:
                 head_x=cx, head_y=cy,
                 confidence=float(best_conf),
                 method="yolo",
+                bbox=(float(x1), float(y1), float(x2), float(y2)),
             )
         except Exception:
             return None

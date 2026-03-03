@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Live putter tracking via webcam.
+Live putter tracking via webcam — YOLO mode.
 
 Usage:
     python live_tracking.py              # scan auto + caméra USB en priorité
@@ -22,11 +22,19 @@ from typing import Optional, Union
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tracking.putter_detector import PutterDetector
-from models.shot_data import PutterPosition, SwingPhase
-from utils.drawing import draw_putter, draw_hud
+from models.shot_data import PutterPosition
+from utils.drawing import draw_hud
+
+# Chemin vers le modèle YOLO entraîné
+YOLO_MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "runs", "detect", "runs", "putter", "putter_detector", "weights", "best.pt"
+)
 
 WARMUP_FRAMES = 30
-TRAIL_LENGTH = 60  # frames de trajectoire affichées
+TRAIL_LENGTH  = 60   # frames de trajectoire affichées
+BBOX_COLOR    = (255, 80, 0)   # bleu BGR
+TRAIL_COLOR   = (255, 80, 200) # violet
 
 
 def list_cameras(max_index: int = 5) -> list:
@@ -35,8 +43,8 @@ def list_cameras(max_index: int = 5) -> list:
     for i in range(max_index):
         cap = cv2.VideoCapture(i)
         if cap.isOpened():
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             fps = cap.get(cv2.CAP_PROP_FPS)
             cap.release()
             found.append({"index": i, "width": w, "height": h, "fps": fps})
@@ -44,12 +52,6 @@ def list_cameras(max_index: int = 5) -> list:
 
 
 def pick_camera(forced_index: Optional[int]) -> int:
-    """
-    Retourne l'index à utiliser.
-    - Si forced_index est donné, l'utilise directement.
-    - Sinon, préfère la caméra USB (index > 0) si disponible,
-      sinon la caméra intégrée (index 0).
-    """
     if forced_index is not None:
         return forced_index
 
@@ -62,16 +64,25 @@ def pick_camera(forced_index: Optional[int]) -> int:
     for c in cams:
         print(f"  index {c['index']} — {c['width']}x{c['height']} @ {c['fps']:.0f} fps")
 
-    # Priorité à la dernière caméra détectée (USB branchée après la built-in)
     chosen = cams[-1]["index"] if len(cams) > 1 else cams[0]["index"]
     print(f"[INFO] Caméra sélectionnée : index {chosen} "
           f"({'USB/externe' if chosen > 0 else 'intégrée'})")
     return chosen
 
 
+def draw_bbox(frame: np.ndarray, bbox: tuple, conf: float) -> None:
+    """Cadre bleu autour de la tête du putter."""
+    x1, y1, x2, y2 = (int(v) for v in bbox)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), BBOX_COLOR, 2, cv2.LINE_AA)
+    label = f"putter {conf:.0%}"
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), BBOX_COLOR, -1)
+    cv2.putText(frame, label, (x1 + 2, y1 - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+
 def run_live(source: Union[int, str]) -> None:
     if isinstance(source, int):
-        # Sur macOS : AVFoundation donne de meilleurs résultats
         cap = cv2.VideoCapture(source, cv2.CAP_AVFOUNDATION)
         if not cap.isOpened():
             cap = cv2.VideoCapture(source)
@@ -83,12 +94,22 @@ def run_live(source: Union[int, str]) -> None:
         sys.exit(1)
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    print(f"[INFO] Source ouverte — FPS : {fps:.1f}")
-    print("[INFO] Chauffe du modèle de fond ({} frames)...".format(WARMUP_FRAMES))
 
-    detector = PutterDetector(target_line_angle=0.0)
+    # --- Chargement YOLO --------------------------------------------------
+    use_yolo = os.path.exists(YOLO_MODEL_PATH)
+    if use_yolo:
+        print(f"[INFO] Modèle YOLO chargé : {YOLO_MODEL_PATH}")
+    else:
+        print(f"[WARN] Modèle YOLO introuvable ({YOLO_MODEL_PATH}), fallback MOG2.")
+
+    detector = PutterDetector(
+        target_line_angle=0.0,
+        use_yolo=use_yolo,
+        yolo_model_path=YOLO_MODEL_PATH if use_yolo else None,
+    )
 
     # --- Warmup -----------------------------------------------------------
+    print(f"[INFO] Chauffe ({WARMUP_FRAMES} frames)...")
     warmup_frames = []
     for _ in range(WARMUP_FRAMES):
         ret, frame = cap.read()
@@ -97,10 +118,10 @@ def run_live(source: Union[int, str]) -> None:
         warmup_frames.append(frame)
     if warmup_frames:
         detector.initialize_background(warmup_frames)
-    print("[INFO] Prêt — appuie sur Q ou Echap pour quitter, R pour reset.")
+    print("[INFO] Prêt — Q/Echap : quitter  |  R : reset fond")
 
     frame_idx = WARMUP_FRAMES
-    trail: list[tuple[float, float]] = []  # historique positions tête
+    trail: list = []
 
     while True:
         ret, frame = cap.read()
@@ -108,70 +129,62 @@ def run_live(source: Union[int, str]) -> None:
             print("[INFO] Fin de la source.")
             break
 
-        # Détection
         det = detector.detect(frame, frame_idx)
         frame_idx += 1
 
-        # Mise à jour de la trajectoire
+        # Trail
         if det.confidence > 0.1:
             trail.append((det.head_x, det.head_y))
         if len(trail) > TRAIL_LENGTH:
             trail.pop(0)
 
-        # Construction d'un PutterPosition pour les helpers de dessin
-        pos = PutterPosition(
-            frame_index=frame_idx,
-            timestamp=frame_idx / fps,
-            head_x=det.head_x,
-            head_y=det.head_y,
-            shaft_start=det.shaft_start,
-            shaft_end=det.shaft_end,
-            face_angle=det.face_angle,
-            shaft_angle=det.shaft_angle,
-            confidence=det.confidence,
-            detection_method=det.method,
-        )
-
-        # Dessin de la trajectoire (trail)
+        # Dessin trail
         for i in range(1, len(trail)):
             frac = i / len(trail)
-            color = tuple(int(ch * frac) for ch in (200, 80, 255))
+            color = tuple(int(ch * frac) for ch in TRAIL_COLOR)
             cv2.line(
                 frame,
                 (int(trail[i - 1][0]), int(trail[i - 1][1])),
-                (int(trail[i][0]), int(trail[i][1])),
+                (int(trail[i][0]),     int(trail[i][1])),
                 color, 2, cv2.LINE_AA,
             )
 
-        # Dessin du putter
-        if det.confidence > 0.05:
-            draw_putter(frame, pos)
+        # Cadre bleu YOLO ou point de fallback
+        if det.bbox is not None and det.confidence > 0.1:
+            draw_bbox(frame, det.bbox, det.confidence)
+        elif det.confidence > 0.05:
+            # Fallback : simple croix si pas de bbox YOLO
+            cx, cy = int(det.head_x), int(det.head_y)
+            cv2.drawMarker(frame, (cx, cy), BBOX_COLOR,
+                           cv2.MARKER_CROSS, 20, 2, cv2.LINE_AA)
 
         # HUD
         metrics = {
-            "Méthode": det.method,
-            "Face angle": f"{det.face_angle:.1f}°" if det.face_angle else "—",
+            "Méthode":     det.method,
+            "Face angle":  f"{det.face_angle:.1f}°" if det.face_angle else "—",
             "Shaft angle": f"{det.shaft_angle:.1f}°" if det.shaft_angle else "—",
-            "Head X": f"{det.head_x:.0f} px",
-            "Head Y": f"{det.head_y:.0f} px",
         }
         draw_hud(frame, metrics, confidence=det.confidence)
 
         cv2.imshow("PutterTrack Live  |  Q=quitter  R=reset", frame)
 
         key = cv2.waitKey(1) & 0xFF
-        if key in (ord('q'), ord('Q'), 27):  # Q ou Echap
+        if key in (ord('q'), ord('Q'), 27):
             break
         elif key in (ord('r'), ord('R')):
-            print("[INFO] Reset du modèle de fond...")
-            detector = PutterDetector(target_line_angle=0.0)
-            warmup_buf = []
+            print("[INFO] Reset...")
+            detector = PutterDetector(
+                target_line_angle=0.0,
+                use_yolo=use_yolo,
+                yolo_model_path=YOLO_MODEL_PATH if use_yolo else None,
+            )
+            buf = []
             for _ in range(WARMUP_FRAMES):
                 r, f = cap.read()
                 if r:
-                    warmup_buf.append(f)
-            if warmup_buf:
-                detector.initialize_background(warmup_buf)
+                    buf.append(f)
+            if buf:
+                detector.initialize_background(buf)
             trail.clear()
             frame_idx = 0
             print("[INFO] Reset terminé.")
@@ -201,9 +214,5 @@ if __name__ == "__main__":
             print("Aucune caméra détectée.")
         sys.exit(0)
 
-    if args.video:
-        source = args.video
-    else:
-        source = pick_camera(args.camera)
-
+    source = args.video if args.video else pick_camera(args.camera)
     run_live(source)
