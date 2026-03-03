@@ -791,7 +791,7 @@ class PutterLive:
             centers_disp.append((dcx, dcy))
 
         # Arc through centres (parabolic fit on display coords)
-        valid_pts = [(cx, cy) for cx, cy in centers_disp if cx is not None]
+        valid_pts = [pt for pt in centers_disp if pt is not None]
         if len(valid_pts) >= 3:
             xs = np.array([p[0] for p in valid_pts], dtype=np.float64)
             ys = np.array([p[1] for p in valid_pts], dtype=np.float64)
