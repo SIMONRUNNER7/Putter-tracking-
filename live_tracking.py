@@ -17,6 +17,7 @@ import os
 import argparse
 import cv2
 import numpy as np
+from typing import Optional, Union
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -28,7 +29,7 @@ WARMUP_FRAMES = 30
 TRAIL_LENGTH = 60  # frames de trajectoire affichées
 
 
-def list_cameras(max_index: int = 5) -> list[dict]:
+def list_cameras(max_index: int = 5) -> list:
     """Scan les indices 0..max_index et retourne les caméras disponibles."""
     found = []
     for i in range(max_index):
@@ -42,7 +43,7 @@ def list_cameras(max_index: int = 5) -> list[dict]:
     return found
 
 
-def pick_camera(forced_index: int | None) -> int:
+def pick_camera(forced_index: Optional[int]) -> int:
     """
     Retourne l'index à utiliser.
     - Si forced_index est donné, l'utilise directement.
@@ -68,7 +69,7 @@ def pick_camera(forced_index: int | None) -> int:
     return chosen
 
 
-def run_live(source: int | str) -> None:
+def run_live(source: Union[int, str]) -> None:
     if isinstance(source, int):
         # Sur macOS : AVFoundation donne de meilleurs résultats
         cap = cv2.VideoCapture(source, cv2.CAP_AVFOUNDATION)
