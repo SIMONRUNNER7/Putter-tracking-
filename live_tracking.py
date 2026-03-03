@@ -3,8 +3,9 @@
 Live putter tracking via webcam.
 
 Usage:
-    python live_tracking.py              # webcam par défaut (index 0)
-    python live_tracking.py --camera 1  # autre caméra
+    python live_tracking.py              # scan auto + caméra USB en priorité
+    python live_tracking.py --camera 1  # forcer un index précis
+    python live_tracking.py --list      # lister les caméras disponibles
     python live_tracking.py --video fichier.mp4  # vidéo fichier
 
 Commandes pendant le live :
@@ -27,8 +28,55 @@ WARMUP_FRAMES = 30
 TRAIL_LENGTH = 60  # frames de trajectoire affichées
 
 
+def list_cameras(max_index: int = 5) -> list[dict]:
+    """Scan les indices 0..max_index et retourne les caméras disponibles."""
+    found = []
+    for i in range(max_index):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            cap.release()
+            found.append({"index": i, "width": w, "height": h, "fps": fps})
+    return found
+
+
+def pick_camera(forced_index: int | None) -> int:
+    """
+    Retourne l'index à utiliser.
+    - Si forced_index est donné, l'utilise directement.
+    - Sinon, préfère la caméra USB (index > 0) si disponible,
+      sinon la caméra intégrée (index 0).
+    """
+    if forced_index is not None:
+        return forced_index
+
+    cams = list_cameras()
+    if not cams:
+        print("[ERREUR] Aucune caméra détectée.")
+        sys.exit(1)
+
+    print("[INFO] Caméras détectées :")
+    for c in cams:
+        print(f"  index {c['index']} — {c['width']}x{c['height']} @ {c['fps']:.0f} fps")
+
+    # Priorité à la dernière caméra détectée (USB branchée après la built-in)
+    chosen = cams[-1]["index"] if len(cams) > 1 else cams[0]["index"]
+    print(f"[INFO] Caméra sélectionnée : index {chosen} "
+          f"({'USB/externe' if chosen > 0 else 'intégrée'})")
+    return chosen
+
+
 def run_live(source: int | str) -> None:
-    cap = cv2.VideoCapture(source)
+    if isinstance(source, int):
+        # Sur macOS : AVFoundation donne de meilleurs résultats
+        cap = cv2.VideoCapture(source, cv2.CAP_AVFOUNDATION)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(source)
+    else:
+        cap = cv2.VideoCapture(source)
+
     if not cap.isOpened():
         print(f"[ERREUR] Impossible d'ouvrir la source : {source}")
         sys.exit(1)
@@ -134,11 +182,27 @@ def run_live(source: int | str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Live putter tracking")
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--camera", type=int, default=0,
-                       help="Index de la webcam (défaut: 0)")
+    group.add_argument("--camera", type=int, default=None,
+                       help="Index de la webcam (défaut: auto-détection USB)")
     group.add_argument("--video", type=str,
                        help="Chemin vers une vidéo fichier")
+    parser.add_argument("--list", action="store_true",
+                        help="Lister les caméras disponibles et quitter")
     args = parser.parse_args()
 
-    source = args.video if args.video else args.camera
+    if args.list:
+        cams = list_cameras()
+        if cams:
+            print("Caméras disponibles :")
+            for c in cams:
+                print(f"  --camera {c['index']}  →  {c['width']}x{c['height']} @ {c['fps']:.0f} fps")
+        else:
+            print("Aucune caméra détectée.")
+        sys.exit(0)
+
+    if args.video:
+        source = args.video
+    else:
+        source = pick_camera(args.camera)
+
     run_live(source)
