@@ -171,11 +171,14 @@ class PutterLive:
         self._strobe_indices: list = []
 
         # KEYFRAMES state
-        self._kf_init    = False
-        self._kf_idx     = 0
-        self._kf_last    = 0.0
-        self._kf_done    = False
-        self._kf_cur_col: Optional[int] = None   # column currently flashing
+        self._kf_init       = False
+        self._kf_idx        = 0
+        self._kf_last       = 0.0
+        self._kf_done       = False
+        self._kf_cur_col: Optional[int]  = None  # column where putter is now
+        self._kf_flash_col  = -1                 # column to flash (new best)
+        self._kf_flash_t    = 0.0                # timestamp of last flash
+        self._kf_best_off: dict = {}             # col → best centroid offset
         self._kf_bg: Optional[np.ndarray] = None
         self._sel_mode  = False
         self._sel_start: Optional[tuple] = None
@@ -236,6 +239,12 @@ class PutterLive:
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
                 cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+                # Short exposure to freeze motion (reduce blur)
+                # V4L2: 1=manual, 3=auto  |  value: log₂ seconds (−7 ≈ 1/128 s)
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+                cap.set(cv2.CAP_PROP_EXPOSURE, -7)
+                actual = cap.get(cv2.CAP_PROP_EXPOSURE)
+                print(f"[cam] exposure={actual}  (increase toward 0 if too dark)")
                 return cap
 
         raise RuntimeError(
@@ -620,10 +629,12 @@ class PutterLive:
 
     # ── Keyframe detection helper ─────────────────────────────────────────────
 
-    def _detect_putter_col(self, idx: int) -> Optional[int]:
+    def _detect_putter_col(self, idx: int):
         """
-        Background-subtract frame idx against frame 0 (background).
-        Return column 0-6 where the putter centroid sits, or None.
+        Background-subtract frame idx against frame 0.
+        Returns (col 0-6, offset_from_center_px) or None.
+        offset is how far the centroid is from the column's x-midpoint —
+        lower = putter more centred in that column = better keyframe.
         """
         if self._kf_bg is None or idx == 0:
             return None
@@ -632,7 +643,7 @@ class PutterLive:
             cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), (21, 21), 0
         ).astype(np.float32)
         diff  = np.abs(gray - self._kf_bg)
-        _, th = cv2.threshold(diff.astype(np.uint8), 10, 255, cv2.THRESH_BINARY)
+        _, th = cv2.threshold(diff.astype(np.uint8), 8, 255, cv2.THRESH_BINARY)
         th    = cv2.dilate(th, None, iterations=3)
         cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not cnts:
@@ -643,10 +654,12 @@ class PutterLive:
         M = cv2.moments(c)
         if M["m00"] <= 0:
             return None
-        cx    = int(M["m10"] / M["m00"])
-        sf_w  = self._rep_frames[0].shape[1]
-        col_w = sf_w // 7
-        return min(cx // col_w, 6)
+        cx     = int(M["m10"] / M["m00"])
+        sf_w   = self._rep_frames[0].shape[1]
+        col_w  = sf_w // 7
+        col    = min(cx // col_w, 6)
+        offset = abs(cx - (col + 0.5) * col_w)   # distance to column centre
+        return col, offset
 
     # ── Strobe composite ──────────────────────────────────────────────────────
 
@@ -863,11 +876,14 @@ class PutterLive:
             elif self.state == AppState.KEYFRAMES:
                 # ── Init on first entry ────────────────────────────────────
                 if not self._kf_init:
-                    self._kf_init      = True
-                    self._kf_idx       = 0
-                    self._kf_last      = now
-                    self._kf_done      = False
-                    self._kf_cur_col   = None
+                    self._kf_init        = True
+                    self._kf_idx         = 0
+                    self._kf_last        = now
+                    self._kf_done        = False
+                    self._kf_cur_col     = None
+                    self._kf_flash_col   = -1
+                    self._kf_flash_t     = 0.0
+                    self._kf_best_off    = {}
                     self._strobe_indices = [None] * 7
                     if self._rep_frames:
                         bg_raw         = cv2.cvtColor(self._rep_frames[0],
@@ -878,18 +894,24 @@ class PutterLive:
                 KF_FPS  = 6          # ~0.4× of 15 fps stored
                 N_COLS  = 7
                 vid_h   = self.H
-                col_w_d = self.W // N_COLS   # column width in display space
+                col_w_d = self.W // N_COLS
 
                 # ── Advance one frame at 0.4× speed ───────────────────────
                 if not self._kf_done and self._rep_frames:
                     if now - self._kf_last >= 1.0 / KF_FPS:
                         self._kf_last = now
-                        col = self._detect_putter_col(self._kf_idx)
-                        if col is not None:
+                        det = self._detect_putter_col(self._kf_idx)
+                        if det is not None:
+                            col, offset = det
                             self._kf_cur_col = col
-                            if self._strobe_indices[col] is None:
+                            # Keep the frame where putter is most centred
+                            # in this column (beats backswing frames too)
+                            best = self._kf_best_off.get(col, float('inf'))
+                            if offset < best:
+                                self._kf_best_off[col]    = offset
                                 self._strobe_indices[col] = self._kf_idx
-                                print(f"[kf] col {col} ← frame {self._kf_idx}")
+                                self._kf_flash_col        = col
+                                self._kf_flash_t          = now
                         else:
                             self._kf_cur_col = None
                         self._kf_idx += 1
@@ -897,21 +919,29 @@ class PutterLive:
                             self._kf_done = True
 
                 if not self._kf_done:
-                    # ── PHASE 1: show current frame + flash active column ──
+                    # ── PHASE 1: show current frame + column highlights ────
                     f_idx = min(self._kf_idx, len(self._rep_frames) - 1)
                     disp  = cv2.resize(self._rep_frames[f_idx], (self.W, self.H))
                     frame = np.zeros((self.H + PANEL_H, self.W, 3), dtype=np.uint8)
                     frame[:self.H] = disp
 
-                    # Highlight active column
+                    # Soft tint on column where putter currently is
                     if self._kf_cur_col is not None:
-                        c   = self._kf_cur_col
-                        x0  = c * col_w_d
-                        x1  = x0 + col_w_d if c < N_COLS - 1 else self.W
+                        c  = self._kf_cur_col
+                        x0 = c * col_w_d
+                        x1 = x0 + col_w_d if c < N_COLS - 1 else self.W
                         frame[:vid_h, x0:x1] = np.clip(
-                            frame[:vid_h, x0:x1].astype(np.int32) + 80,
-                            0, 255
-                        ).astype(np.uint8)
+                            frame[:vid_h, x0:x1].astype(np.int32) + 50,
+                            0, 255).astype(np.uint8)
+
+                    # Bright flash on newly-improved column (lasts 0.5 s)
+                    if self._kf_flash_col >= 0 and now - self._kf_flash_t < 0.5:
+                        c  = self._kf_flash_col
+                        x0 = c * col_w_d
+                        x1 = x0 + col_w_d if c < N_COLS - 1 else self.W
+                        frame[:vid_h, x0:x1] = np.clip(
+                            frame[:vid_h, x0:x1].astype(np.int32) + 110,
+                            0, 255).astype(np.uint8)
 
                     # Column dividers
                     for i in range(1, N_COLS):
