@@ -690,41 +690,34 @@ class PutterLive:
         """
         Run YOLOv8 on each of the 7 keyframes and return a list of
         (x1, y1, x2, y2) in stored-frame pixel space, or None per column.
-        Only considers boxes whose centroid falls inside the column's x range.
+        Takes the highest-confidence detection in the full frame (no column
+        filtering — each keyframe already shows the putter in its column).
         """
         N_COLS = 7
         frames = self._rep_frames
         if not frames or self._yolo is None:
             return [None] * N_COLS
 
-        sf_w   = frames[0].shape[1]
-        col_w  = sf_w // N_COLS
         result = []
-
         for i, fidx in enumerate(self._strobe_indices[:N_COLS]):
             if fidx is None:
                 result.append(None)
                 continue
 
-            x0_col = i * col_w
-            x1_col = sf_w if i == N_COLS - 1 else x0_col + col_w
-
-            preds = self._yolo.predict(frames[fidx], conf=0.20, verbose=False)
-            best  = None        # (x1, y1, x2, y2, conf)
-            for box in preds[0].boxes:
-                bx1, by1, bx2, by2 = box.xyxy[0].tolist()
-                bcx = (bx1 + bx2) / 2
-                conf = float(box.conf[0])
-                if x0_col <= bcx < x1_col:
-                    if best is None or conf > best[4]:
-                        best = (bx1, by1, bx2, by2, conf)
-
-            if best:
-                result.append(best[:4])
-                print(f"[yolo] col {i} → box {[int(v) for v in best[:4]]} "
-                      f"conf={best[4]:.2f}")
-            else:
+            preds = self._yolo.predict(frames[fidx], conf=0.10, verbose=False)
+            boxes = preds[0].boxes
+            if len(boxes) == 0:
                 result.append(None)
+                print(f"[yolo] col {i} → no detection")
+                continue
+
+            # Pick highest-confidence box
+            confs = boxes.conf.tolist()
+            best_i = int(max(range(len(confs)), key=lambda k: confs[k]))
+            bx1, by1, bx2, by2 = boxes.xyxy[best_i].tolist()
+            result.append((bx1, by1, bx2, by2))
+            print(f"[yolo] col {i} → box {[int(v) for v in (bx1,by1,bx2,by2)]} "
+                  f"conf={confs[best_i]:.2f}")
 
         return result
 
