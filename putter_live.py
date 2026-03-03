@@ -94,6 +94,7 @@ class Result:
     arc_devs:       list   # signed perpendicular distances (px)
     arc_max_px:     float
     arc_class:      str    # "Straight" / "Slight Arc" / "Strong Arc"
+    launch_dir:     float  = 0.0   # path direction at impact (°, + = right)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -382,6 +383,19 @@ class PutterLive:
         imp     = self._find_impact(recs)
         devs, mx, cls = self._arc_metrics(recs)
         angles  = [r.angle for r in recs]
+
+        # Path direction at impact: angle of velocity vector vs target line
+        launch_dir = 0.0
+        if 0 < imp < len(recs) - 1:
+            p1 = np.array(recs[imp - 1].pos, dtype=float)
+            p2 = np.array(recs[imp + 1].pos, dtype=float)
+            dx, dy = p2 - p1
+            if dx != 0 or dy != 0:
+                path_abs = math.degrees(math.atan2(-dy, dx))
+                raw = path_abs - self.tgt_angle
+                # normalise to (-180, 180]
+                launch_dir = (raw + 180) % 360 - 180
+
         return Result(
             positions   = [r.pos   for r in recs],
             angles      = angles,
@@ -396,6 +410,7 @@ class PutterLive:
             arc_devs    = devs,
             arc_max_px  = mx,
             arc_class   = cls,
+            launch_dir  = launch_dir,
         )
 
     def _save_json(self, r: Result):
@@ -584,46 +599,62 @@ class PutterLive:
             cv2.rectangle(frame, (x, y), (x + w, y + h), C["blue"], 1)
             self._put(frame, "CSRT", (x, y - 4), scale=0.38, color=C["blue"])
 
-    # ── Key-frame grid ────────────────────────────────────────────────────────
+    # ── Strobe composite ──────────────────────────────────────────────────────
 
-    def _draw_keyframe_grid(self) -> np.ndarray:
+    def _draw_strobe_composite(self) -> np.ndarray:
         """
-        Build a composite image of 7 evenly-spaced replay frames.
-        Layout: 4 frames (top row) + 3 frames centred (bottom row).
+        Stroboscopic composite: 7 evenly-spaced frames max-blended onto one
+        image (shows every putter position simultaneously), plus a metrics
+        panel at the bottom — style inspired by WellPutt.
         """
         frames = self._rep_frames
-        n = min(7, len(frames))
+        n      = min(7, len(frames))
+
+        vid_h   = int(self.H * 0.60)   # top 60 % = video composite
+        panel_h = self.H - vid_h        # bottom 40 % = black metrics panel
+
         out = np.zeros((self.H, self.W, 3), dtype=np.uint8)
-        if n == 0:
-            return out
 
-        indices = [int(round(i * (len(frames) - 1) / max(n - 1, 1)))
-                   for i in range(n)]
+        # ── stroboscopic blend ────────────────────────────────────────────
+        if n > 0:
+            indices = [int(round(i * (len(frames) - 1) / max(n - 1, 1)))
+                       for i in range(n)]
+            stack = np.stack([cv2.resize(frames[idx], (self.W, vid_h))
+                              for idx in indices])          # (n, H, W, 3)
+            out[:vid_h] = np.max(stack, axis=0)             # max-blend
 
-        cols_top = min(4, n)
-        cols_bot = n - cols_top
+        # thin separator line
+        cv2.line(out, (0, vid_h), (self.W, vid_h), (60, 60, 60), 1)
 
-        fw = self.W // 4            # cell width
-        fh = self.H // 2            # cell height
-        pad = 2                     # gap between cells
+        # ── metrics panel ─────────────────────────────────────────────────
+        r = self.result
 
-        for i in range(cols_top):
-            img = cv2.resize(frames[indices[i]], (fw - pad, fh - pad))
-            x = i * fw
-            out[0: fh - pad, x: x + fw - pad] = img
-            label = f"{i + 1}/{n}"
-            cv2.putText(out, label, (x + 5, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+        def _angle_str(v: Optional[float]) -> str:
+            if v is None:
+                return "--"
+            side = "R" if v > 0.05 else ("L" if v < -0.05 else "")
+            return f"{side}{abs(v):.1f}°"
 
-        if cols_bot > 0:
-            offset_x = (self.W - cols_bot * fw) // 2
-            for j in range(cols_bot):
-                img = cv2.resize(frames[indices[cols_top + j]], (fw - pad, fh - pad))
-                x = offset_x + j * fw
-                out[fh: fh + fh - pad, x: x + fw - pad] = img
-                label = f"{cols_top + j + 1}/{n}"
-                cv2.putText(out, label, (x + 5, fh + 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+        face_str = _angle_str(r.face_impact if r else None)
+        path_str = _angle_str(r.launch_dir  if r else None)
+
+        col_l = self.W // 4          # centre of left column
+        col_r = 3 * self.W // 4     # centre of right column
+        lbl_y = vid_h + int(panel_h * 0.30)
+        val_y = vid_h + int(panel_h * 0.80)
+
+        for label, value, cx in [("Face Angle", face_str, col_l),
+                                   ("Launch Direction", path_str, col_r)]:
+            # label (small, grey)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 1)
+            cv2.putText(out, label, (cx - tw // 2, lbl_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (160, 160, 160), 1, cv2.LINE_AA)
+            # value (large, white)
+            scale = 2.8
+            thick = 4
+            (vw, vh), _ = cv2.getTextSize(value, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+            cv2.putText(out, value, (cx - vw // 2, val_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), thick, cv2.LINE_AA)
 
         return out
 
@@ -756,10 +787,8 @@ class PutterLive:
 
             # ── KEYFRAMES ─────────────────────────────────────────────────
             elif self.state == AppState.KEYFRAMES:
-                frame = self._draw_keyframe_grid()
-                if self.result:
-                    self._draw_results(frame, self.result)
-                self._draw_hud(frame, fps, ["7 FRAMES  (SPACE = new shot)"])
+                frame = self._draw_strobe_composite()
+                self._draw_hud(frame, fps, ["SPACE = new shot"])
 
             # ── ROI selection overlay ─────────────────────────────────────
             if self._sel_mode:
