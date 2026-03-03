@@ -163,6 +163,10 @@ class PutterLive:
         # Fallback tracker
         self.tracker: Optional[object] = None
         self.roi:     Optional[tuple]  = None
+
+        # Motion-based tracking (background subtraction)
+        self._bg_frame: Optional[np.ndarray] = None
+        self._track_mode = "none"   # "aruco" | "csrt" | "motion" | "none"
         self._sel_mode  = False
         self._sel_start: Optional[tuple] = None
         self._sel_end:   Optional[tuple] = None
@@ -280,7 +284,8 @@ class PutterLive:
         if self._aruco_fn is not None:
             corners, ids, _ = self._aruco_fn(gray)
             if ids is not None and len(ids) > 0:
-                self.using_aruco = True
+                self.using_aruco  = True
+                self._track_mode  = "aruco"
                 c = corners[0][0]                         # shape (4, 2)
                 center = tuple(c.mean(axis=0).astype(int))
                 dx = float(c[1][0] - c[0][0])
@@ -309,9 +314,33 @@ class PutterLive:
                         for l in lines
                     ]
                     raw = float(np.median(angs)) if angs else None
+                self.using_aruco = False
+                self._track_mode = "csrt"
                 self._dbg_info = {"roi": (x, y, w, h), "fallback": True}
                 return center, raw
 
+        # ── Motion / background-subtraction fallback ──────────────────────
+        if self._bg_frame is not None:
+            blur = cv2.GaussianBlur(gray, (21, 21), 0)
+            diff = cv2.absdiff(blur, self._bg_frame)
+            _, thresh = cv2.threshold(diff, 12, 255, cv2.THRESH_BINARY)
+            thresh = cv2.dilate(thresh, None, iterations=3)
+            cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+            if cnts:
+                c = max(cnts, key=cv2.contourArea)
+                if cv2.contourArea(c) > 400:
+                    M = cv2.moments(c)
+                    if M["m00"] > 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        self.using_aruco = False
+                        self._track_mode = "motion"
+                        x, y, w, h = cv2.boundingRect(c)
+                        self._dbg_info = {"roi": (x, y, w, h)}
+                        return (cx, cy), None
+
+        self._track_mode = "none"
         return None, None
 
     # ── Smoothing ─────────────────────────────────────────────────────────────
@@ -491,7 +520,8 @@ class PutterLive:
                      lighter, 1, cv2.LINE_AA)
 
     def _draw_hud(self, frame, fps: float, extra: list = None):
-        track_label = "ArUco" if self.using_aruco else "Fallback ⚠"
+        track_label = {"aruco": "ArUco", "csrt": "CSRT",
+                       "motion": "Motion", "none": "None ✗"}.get(self._track_mode, "?")
         lines = [
             f"STATE : {self.state.value}",
             f"FPS   : {fps:>4.0f}",
@@ -762,6 +792,9 @@ class PutterLive:
                     self._rep_ctr   = 0
                     self._pos_buf.clear()
                     self._ang_buf.clear()
+                    # Freeze background for motion tracking
+                    _g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    self._bg_frame = cv2.GaussianBlur(_g, (21, 21), 0)
 
             # ── RECORDING ─────────────────────────────────────────────────
             elif self.state == AppState.RECORDING:
