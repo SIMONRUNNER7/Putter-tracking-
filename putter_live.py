@@ -234,6 +234,7 @@ class PutterLive:
         # Replay
         self.result: Optional[Result]        = None
         self._rep_frames: list[np.ndarray]   = []
+        self._rep_positions: list            = []   # (x,y) or None per stored frame
         self._rep_idx  = 0
         self._rep_last = 0.0
         self._rep_ctr  = 0       # subsampling counter
@@ -811,23 +812,44 @@ class PutterLive:
             cv2.circle(out, (dcx, dcy), 4, (0, 255, 100), -1)
             centers_disp.append((dcx, dcy))
 
-        # Arc through centres (parabolic fit on display coords)
-        valid_pts = [pt for pt in centers_disp if pt is not None]
-        if len(valid_pts) >= 3:
-            xs = np.array([p[0] for p in valid_pts], dtype=np.float64)
-            ys = np.array([p[1] for p in valid_pts], dtype=np.float64)
-            coeffs = np.polyfit(xs, ys, 2)
-            x_lo, x_hi = int(xs.min()), int(xs.max())
-            arc_xs = np.linspace(x_lo, x_hi, 300)
-            arc_ys = np.polyval(coeffs, arc_xs)
-            arc_pts = np.array(
-                [[int(x), int(y)] for x, y in zip(arc_xs, arc_ys)
-                 if 0 <= y < vid_h],
-                dtype=np.int32
-            )
-            if len(arc_pts) >= 2:
-                cv2.polylines(out, [arc_pts.reshape(-1, 1, 2)],
-                              False, (0, 180, 255), 3, cv2.LINE_AA)
+        # ── Fallback: fill missing centres from stored tracking positions ────
+        r_fb = self.result
+        col_w_disp_fb = self.W // N_COLS
+        for i in range(N_COLS):
+            if centers_disp[i] is not None:
+                continue
+            # Option A: _rep_positions at _strobe_indices
+            fidx = (self._strobe_indices[i]
+                    if i < len(self._strobe_indices) else None)
+            if (fidx is not None
+                    and fidx < len(self._rep_positions)
+                    and self._rep_positions[fidx] is not None):
+                centers_disp[i] = self._rep_positions[fidx]
+                continue
+            # Option B: pick from result.positions by column x-range
+            if r_fb and r_fb.positions:
+                x0 = i * col_w_disp_fb
+                x1 = (i + 1) * col_w_disp_fb if i < N_COLS - 1 else self.W
+                in_col = [p for p in r_fb.positions if x0 <= p[0] < x1]
+                if in_col:
+                    centers_disp[i] = in_col[len(in_col) // 2]
+
+        # ── Full recorded trajectory (smooth red arc) ─────────────────────
+        r = self.result
+        if r and len(r.positions) >= 2:
+            step = max(1, len(r.positions) // 80)
+            traj = np.array(r.positions[::step], np.int32).reshape(-1, 1, 2)
+            cv2.polylines(out, [traj], False, ( 20,  20, 160), 7, cv2.LINE_AA)
+            cv2.polylines(out, [traj], False, ( 50,  50, 255), 4, cv2.LINE_AA)
+            cv2.polylines(out, [traj], False, (180, 180, 255), 2, cv2.LINE_AA)
+
+        # ── Head markers at each keyframe position ────────────────────────
+        for pt in centers_disp:
+            if pt is None:
+                continue
+            cv2.circle(out, pt, 16, (  0,   0,   0), -1, cv2.LINE_AA)
+            cv2.circle(out, pt, 13, ( 50,  50, 255), -1, cv2.LINE_AA)
+            cv2.circle(out, pt, 16, (255, 255, 255),  2, cv2.LINE_AA)
 
         # Column dividers
         col_w_disp = self.W // N_COLS
@@ -923,6 +945,7 @@ class PutterLive:
                     self._rec_start     = now
                     self.records        = []
                     self._rep_frames    = []
+                    self._rep_positions = []
                     self._rep_ctr       = 0
                     self._pos_buf.clear()
                     self._ang_buf.clear()
@@ -989,6 +1012,7 @@ class PutterLive:
                 if self._rep_ctr % REPLAY_SUB == 0:
                     # Store raw frame BEFORE drawing overlays (for slow-mo animation)
                     self._rep_frames.append(cv2.resize(frame, (self.W // 2, self.H // 2)))
+                    self._rep_positions.append(pos)  # may be None
 
                 self._draw_target_line(frame)
                 if self.records:
@@ -1173,6 +1197,7 @@ class PutterLive:
                 self.state = AppState.READY
                 self.records        = []
                 self._rep_frames    = []
+                self._rep_positions = []
                 self.result         = None
                 self._pos_buf.clear()
                 self._ang_buf.clear()
