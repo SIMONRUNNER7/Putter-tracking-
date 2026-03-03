@@ -63,11 +63,12 @@ C = {
 # Data structures
 # ──────────────────────────────────────────────────────────────────────────────
 class AppState(Enum):
-    READY     = "READY"
-    COUNTDOWN = "COUNTDOWN"
-    RECORDING = "RECORDING"
-    ANALYSIS  = "ANALYSIS"
-    REPLAY    = "REPLAY"
+    READY      = "READY"
+    COUNTDOWN  = "COUNTDOWN"
+    RECORDING  = "RECORDING"
+    ANALYSIS   = "ANALYSIS"
+    REPLAY     = "REPLAY"
+    KEYFRAMES  = "KEYFRAMES"
 
 
 @dataclass
@@ -108,6 +109,12 @@ def _build_aruco():
     try:
         d = cv2.aruco.getPredefinedDictionary(ARUCO_DICT_ID)
         p = cv2.aruco.DetectorParameters()
+        # More permissive params: detect small/distant markers
+        p.adaptiveThreshWinSizeMin = 3
+        p.adaptiveThreshWinSizeMax = 53
+        p.adaptiveThreshConstant   = 7
+        p.minMarkerPerimeterRate   = 0.01
+        p.errorCorrectionRate      = 0.8
         det = cv2.aruco.ArucoDetector(d, p)
         return det.detectMarkers, d
     except AttributeError:
@@ -115,6 +122,9 @@ def _build_aruco():
     try:
         d = cv2.aruco.Dictionary_get(ARUCO_DICT_ID)
         p = cv2.aruco.DetectorParameters_create()
+        p.adaptiveThreshWinSizeMin = 3
+        p.adaptiveThreshWinSizeMax = 53
+        p.minMarkerPerimeterRate   = 0.01
         return lambda g: cv2.aruco.detectMarkers(g, d, parameters=p), d
     except Exception:
         return None, None
@@ -178,6 +188,10 @@ class PutterLive:
         self._rep_idx  = 0
         self._rep_last = 0.0
         self._rep_ctr  = 0       # subsampling counter
+        self._rep_loops = 0      # full replay loops completed
+
+        # Last captured frame (used for CSRT init without timing mismatch)
+        self._last_frame: Optional[np.ndarray] = None
 
         # Ghost path from previous session
         self._last_path: list = []
@@ -239,8 +253,9 @@ class PutterLive:
                 self._init_fallback()
 
     def _init_fallback(self):
-        ret, frame = self.cap.read()
-        if not ret or self.roi is None:
+        # Use the last displayed frame so the ROI matches exactly what the user drew on
+        frame = self._last_frame
+        if frame is None or self.roi is None:
             return
         try:
             self.tracker = cv2.TrackerCSRT_create()
@@ -248,7 +263,7 @@ class PutterLive:
             self.tracker = cv2.TrackerKCF_create()
         self.tracker.init(frame, self.roi)
         self.using_aruco = False
-        print("[fallback] CSRT tracker initialised.")
+        print("[fallback] CSRT tracker initialised on stored frame.")
 
     # ── Detection ─────────────────────────────────────────────────────────────
 
@@ -569,6 +584,49 @@ class PutterLive:
             cv2.rectangle(frame, (x, y), (x + w, y + h), C["blue"], 1)
             self._put(frame, "CSRT", (x, y - 4), scale=0.38, color=C["blue"])
 
+    # ── Key-frame grid ────────────────────────────────────────────────────────
+
+    def _draw_keyframe_grid(self) -> np.ndarray:
+        """
+        Build a composite image of 7 evenly-spaced replay frames.
+        Layout: 4 frames (top row) + 3 frames centred (bottom row).
+        """
+        frames = self._rep_frames
+        n = min(7, len(frames))
+        out = np.zeros((self.H, self.W, 3), dtype=np.uint8)
+        if n == 0:
+            return out
+
+        indices = [int(round(i * (len(frames) - 1) / max(n - 1, 1)))
+                   for i in range(n)]
+
+        cols_top = min(4, n)
+        cols_bot = n - cols_top
+
+        fw = self.W // 4            # cell width
+        fh = self.H // 2            # cell height
+        pad = 2                     # gap between cells
+
+        for i in range(cols_top):
+            img = cv2.resize(frames[indices[i]], (fw - pad, fh - pad))
+            x = i * fw
+            out[0: fh - pad, x: x + fw - pad] = img
+            label = f"{i + 1}/{n}"
+            cv2.putText(out, label, (x + 5, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+
+        if cols_bot > 0:
+            offset_x = (self.W - cols_bot * fw) // 2
+            for j in range(cols_bot):
+                img = cv2.resize(frames[indices[cols_top + j]], (fw - pad, fh - pad))
+                x = offset_x + j * fw
+                out[fh: fh + fh - pad, x: x + fw - pad] = img
+                label = f"{cols_top + j + 1}/{n}"
+                cv2.putText(out, label, (x + 5, fh + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+
+        return out
+
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run(self):
@@ -580,6 +638,7 @@ class PutterLive:
             if not ret:
                 print("[error] Camera read failed – check connection.")
                 break
+            self._last_frame = frame.copy()   # keep for CSRT init
 
             now = time.time()
             fps_buf.append(1.0 / max(1e-6, now - t_last))
@@ -662,9 +721,10 @@ class PutterLive:
                 if self.result:
                     self._save_json(self.result)
                     self._last_path = list(self.result.positions)
-                self._rep_idx  = 0
-                self._rep_last = now
-                self.state     = AppState.REPLAY
+                self._rep_idx   = 0
+                self._rep_loops = 0
+                self._rep_last  = now
+                self.state      = AppState.REPLAY
 
             # ── REPLAY ────────────────────────────────────────────────────
             elif self.state == AppState.REPLAY:
@@ -672,8 +732,13 @@ class PutterLive:
                 # Always show captured frames (independent of tracking result)
                 if self._rep_frames:
                     if now - self._rep_last >= 1.0 / REPLAY_FPS:
-                        self._rep_idx  = (self._rep_idx + 1) % len(self._rep_frames)
+                        next_idx = (self._rep_idx + 1) % len(self._rep_frames)
+                        if next_idx == 0:           # completed one full loop
+                            self._rep_loops += 1
+                        self._rep_idx  = next_idx
                         self._rep_last = now
+                        if self._rep_loops >= 1:    # after one pass → key frames
+                            self.state = AppState.KEYFRAMES
                     frame = cv2.resize(self._rep_frames[self._rep_idx],
                                        (self.W, self.H))
                 self._draw_target_line(frame)
@@ -684,10 +749,17 @@ class PutterLive:
                         cv2.circle(frame, imp_pos, 14, C["yellow"], 2)
                         self._draw_face_arrow(frame, imp_pos, r.face_impact)
                     self._draw_results(frame, r)
-                hud_extra = ["REPLAY  (SPACE = new shot)"]
+                hud_extra = ["REPLAY"]
                 if not r:
                     hud_extra.append("No tracking — add ArUco or press F")
                 self._draw_hud(frame, fps, hud_extra)
+
+            # ── KEYFRAMES ─────────────────────────────────────────────────
+            elif self.state == AppState.KEYFRAMES:
+                frame = self._draw_keyframe_grid()
+                if self.result:
+                    self._draw_results(frame, self.result)
+                self._draw_hud(frame, fps, ["7 FRAMES  (SPACE = new shot)"])
 
             # ── ROI selection overlay ─────────────────────────────────────
             if self._sel_mode:
@@ -706,7 +778,7 @@ class PutterLive:
                 break
 
             elif key == ord(' '):                        # Space → start
-                if self.state in (AppState.READY, AppState.REPLAY):
+                if self.state in (AppState.READY, AppState.REPLAY, AppState.KEYFRAMES):
                     self.state     = AppState.COUNTDOWN
                     self._cd_start = now
 
