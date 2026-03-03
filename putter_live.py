@@ -181,6 +181,14 @@ class PutterLive:
         # Strobe composite: one frame index per column (None = not yet captured)
         self._strobe_indices: list = []
 
+        # Live keyframe capture: one half-res frame per column, captured in
+        # real-time during RECORDING at full fps (avoids subsampling gaps)
+        self._kf_col_frames: list = [None] * 7   # Optional[np.ndarray]
+        self._kf_col_offs:   list = [float('inf')] * 7  # best centroid offset
+        self._rec_bg_live:   Optional[np.ndarray] = None
+        self._ball_roi_ref:  Optional[np.ndarray] = None
+        self._ball_moved:    bool = False
+
         # KEYFRAMES state
         self._kf_init       = False
         self._kf_idx        = 0
@@ -694,17 +702,28 @@ class PutterLive:
         filtering — each keyframe already shows the putter in its column).
         """
         N_COLS = 7
-        frames = self._rep_frames
-        if not frames or self._yolo is None:
+        if self._yolo is None:
             return [None] * N_COLS
 
+        # Prefer live-captured frames; fall back to subsampled _rep_frames
+        src_cols = self._kf_col_frames
+        if not any(f is not None for f in src_cols):
+            frames = self._rep_frames
+            if not frames:
+                return [None] * N_COLS
+            src_cols = [
+                frames[idx] if idx is not None and idx < len(frames) else None
+                for idx in (list(self._strobe_indices[:N_COLS]) + [None] * N_COLS)[:N_COLS]
+            ]
+
         result = []
-        for i, fidx in enumerate(self._strobe_indices[:N_COLS]):
-            if fidx is None:
+        for i, kf in enumerate(src_cols[:N_COLS]):
+            if kf is None:
                 result.append(None)
+                print(f"[yolo] col {i} → no frame")
                 continue
 
-            preds = self._yolo.predict(frames[fidx], conf=0.10, verbose=False)
+            preds = self._yolo.predict(kf, conf=0.10, verbose=False)
             boxes = preds[0].boxes
             if len(boxes) == 0:
                 result.append(None)
@@ -730,33 +749,42 @@ class PutterLive:
             of that column → putter appears at 7 positions on one image.
           - Bottom panel: Face Angle + Launch Direction metrics.
         """
-        frames  = self._rep_frames
         N_COLS  = 7
-        n_frames = len(frames)
-
         vid_h   = self.H
-        panel_h = PANEL_H
-
         out = np.zeros((self.H + PANEL_H, self.W, 3), dtype=np.uint8)
 
-        if n_frames == 0:
+        # Prefer live-captured column frames; fall back to subsampled _rep_frames
+        src_cols = self._kf_col_frames  # list of 7 Optional[ndarray]
+        if not any(f is not None for f in src_cols):
+            frames = self._rep_frames
+            if not frames:
+                return out
+            src_cols = [
+                frames[idx] if idx is not None and idx < len(frames) else None
+                for idx in (list(self._strobe_indices[:N_COLS]) + [None] * N_COLS)[:N_COLS]
+            ]
+
+        ref_frame = next((f for f in src_cols if f is not None), None)
+        if ref_frame is None:
             return out
 
         # ── Work in stored-frame space (W//2 × H//2) ─────────────────────
-        sf_w = frames[0].shape[1]   # e.g. 640
-        sf_h = frames[0].shape[0]   # e.g. 360
-        col_w = sf_w // N_COLS      # column width in stored-frame space
+        sf_w = ref_frame.shape[1]
+        sf_h = ref_frame.shape[0]
+        col_w = sf_w // N_COLS
 
-        # Start with first frame as background
-        composite = frames[0].copy()
+        # Background = first subsampled frame (full scene, no putter overlay)
+        frames = self._rep_frames
+        composite = frames[0].copy() if frames else np.zeros(
+            (sf_h, sf_w, 3), dtype=np.uint8)
 
         # Lay in captured columns; uncaptured columns keep the background
-        for i, frame_idx in enumerate(self._strobe_indices[:N_COLS]):
-            if frame_idx is None:
-                continue                   # not yet captured — keep bg
+        for i, kf in enumerate(src_cols[:N_COLS]):
+            if kf is None:
+                continue
             x0 = i * col_w
             x1 = sf_w if i == N_COLS - 1 else x0 + col_w
-            composite[:, x0:x1] = frames[frame_idx][:, x0:x1]
+            composite[:, x0:x1] = kf[:, x0:x1]
 
         # Resize composite to display area (no distortion — same aspect ratio)
         out[:vid_h] = cv2.resize(composite, (self.W, vid_h))
@@ -891,13 +919,18 @@ class PutterLive:
                 self._draw_countdown(frame, rem)
                 self._draw_hud(frame, fps)
                 if rem <= 0:
-                    self.state      = AppState.RECORDING
-                    self._rec_start = now
-                    self.records    = []
-                    self._rep_frames = []
-                    self._rep_ctr   = 0
+                    self.state          = AppState.RECORDING
+                    self._rec_start     = now
+                    self.records        = []
+                    self._rep_frames    = []
+                    self._rep_ctr       = 0
                     self._pos_buf.clear()
                     self._ang_buf.clear()
+                    self._kf_col_frames = [None] * 7
+                    self._kf_col_offs   = [float('inf')] * 7
+                    self._rec_bg_live   = None
+                    self._ball_roi_ref  = None
+                    self._ball_moved    = False
 
             # ── RECORDING ─────────────────────────────────────────────────
             elif self.state == AppState.RECORDING:
@@ -906,9 +939,55 @@ class PutterLive:
                     self.records.append(FrameRec(
                         ts=now, pos=pos, angle=angle or 0.0, vel=vel
                     ))
+                # ── Live centroid tracker: capture best frame per column ───────
+                _half = cv2.resize(frame, (self.W // 2, self.H // 2))
+                _gray_h = cv2.GaussianBlur(
+                    cv2.cvtColor(_half, cv2.COLOR_BGR2GRAY), (21, 21), 0)
+                if self._rec_bg_live is None:
+                    self._rec_bg_live  = _gray_h.astype(np.float32)
+                    # Freeze ball-ROI reference (center 80×40 of half-frame)
+                    _bh, _bw = _half.shape[:2]
+                    _bry1, _bry2 = _bh // 2 - 20, _bh // 2 + 20
+                    _brx1, _brx2 = _bw // 2 - 40, _bw // 2 + 40
+                    self._ball_roi_ref = _gray_h[_bry1:_bry2, _brx1:_brx2].astype(np.float32)
+                else:
+                    _diff_h = np.abs(_gray_h.astype(np.float32) - self._rec_bg_live)
+                    _, _th_h = cv2.threshold(
+                        _diff_h.astype(np.uint8), 8, 255, cv2.THRESH_BINARY)
+                    _th_h = cv2.dilate(_th_h, None, iterations=3)
+                    _cnts_h, _ = cv2.findContours(
+                        _th_h, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    _col_h = None
+                    if _cnts_h:
+                        _c_h = max(_cnts_h, key=cv2.contourArea)
+                        if cv2.contourArea(_c_h) >= 60:
+                            _M_h = cv2.moments(_c_h)
+                            if _M_h["m00"] > 0:
+                                _cx_h = int(_M_h["m10"] / _M_h["m00"])
+                                _col_w_h = _half.shape[1] // 7
+                                _col_h = min(_cx_h // _col_w_h, 6)
+                                _off_h = abs(_cx_h - (_col_h + 0.5) * _col_w_h)
+                                if _off_h < self._kf_col_offs[_col_h]:
+                                    self._kf_col_offs[_col_h] = _off_h
+                                    self._kf_col_frames[_col_h] = _half.copy()
+                    # ── Ball-impact detection (center ROI) ────────────────────
+                    if (not self._ball_moved
+                            and any(f is not None for f in self._kf_col_frames)
+                            and self._ball_roi_ref is not None):
+                        _bh2, _bw2 = _half.shape[:2]
+                        _bry1, _bry2 = _bh2 // 2 - 20, _bh2 // 2 + 20
+                        _brx1, _brx2 = _bw2 // 2 - 40, _bw2 // 2 + 40
+                        _roi_now = _gray_h[_bry1:_bry2, _brx1:_brx2].astype(np.float32)
+                        if np.mean(np.abs(_roi_now - self._ball_roi_ref)) > 15.0:
+                            self._ball_moved = True
+                            # Override col 3 with the frame at ball contact
+                            self._kf_col_frames[3] = _half.copy()
+                            self._kf_col_offs[3]   = 0.0
+                            print("[impact] ball movement detected → col 3 captured")
+
                 self._rep_ctr += 1
                 if self._rep_ctr % REPLAY_SUB == 0:
-                    # Store raw frame BEFORE drawing overlays
+                    # Store raw frame BEFORE drawing overlays (for slow-mo animation)
                     self._rep_frames.append(cv2.resize(frame, (self.W // 2, self.H // 2)))
 
                 self._draw_target_line(frame)
@@ -1092,14 +1171,19 @@ class PutterLive:
 
             elif key in (ord('r'), ord('R')):            # R → reset
                 self.state = AppState.READY
-                self.records      = []
-                self._rep_frames  = []
-                self.result       = None
+                self.records        = []
+                self._rep_frames    = []
+                self.result         = None
                 self._pos_buf.clear()
                 self._ang_buf.clear()
-                self._kf_init     = False
+                self._kf_init        = False
                 self._strobe_indices = []
-                self._strobe_det  = None
+                self._strobe_det     = None
+                self._kf_col_frames  = [None] * 7
+                self._kf_col_offs    = [float('inf')] * 7
+                self._rec_bg_live    = None
+                self._ball_roi_ref   = None
+                self._ball_moved     = False
                 print("[reset]")
 
             elif key in (ord('f'), ord('F')):            # F → fallback ROI
