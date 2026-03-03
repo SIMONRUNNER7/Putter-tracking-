@@ -37,7 +37,7 @@ except ImportError:
 
 _MODEL_PATH = os.path.join(
     os.path.dirname(__file__),
-    "runs", "detect", "runs", "putter", "putter_detector", "weights", "best.pt"
+    "runs", "obb", "runs", "obb", "putter_obb", "weights", "best.pt"
 )
 from collections import deque
 from dataclasses import dataclass, field
