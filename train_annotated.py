@@ -5,29 +5,33 @@ train_annotated.py – Build a YOLO OBB dataset from annotations and launch trai
 Usage:
     python3 train_annotated.py
 
-Reads all ann_*.jpg / ann_*.txt pairs from ./annotations/
+Reads annotations from ./annotation_output/labels/ + ./annotation_output/images/
 Splits 80/20 train/val, writes a YOLO dataset structure, then calls:
     yolo obb train ...
 """
-import os, shutil, random, yaml, sys
+import os, shutil, random, yaml, sys, glob
 
-ANN_DIR   = "annotations"
-DS_DIR    = "putter_dataset"
+LBL_DIR    = os.path.join("annotation_output", "labels")
+IMG_DIR    = os.path.join("annotation_output", "images")
+DS_DIR     = "putter_dataset"
 MODEL_BASE = "yolov8n-obb.pt"   # nano OBB – fast to train
 
 def build_dataset():
     pairs = []
-    for f in sorted(os.listdir(ANN_DIR)):
-        if not f.endswith(".txt"):
-            continue
-        img = f.replace(".txt", ".jpg")
-        img_path = os.path.join(ANN_DIR, img)
-        lbl_path = os.path.join(ANN_DIR, f)
-        if os.path.isfile(img_path):
+    for lbl_path in sorted(glob.glob(os.path.join(LBL_DIR, "*.txt"))):
+        base = os.path.splitext(os.path.basename(lbl_path))[0]
+        # Try .jpg, .jpeg, .png
+        img_path = None
+        for ext in (".jpg", ".jpeg", ".png", ".JPG", ".PNG"):
+            candidate = os.path.join(IMG_DIR, base + ext)
+            if os.path.isfile(candidate):
+                img_path = candidate
+                break
+        if img_path:
             pairs.append((img_path, lbl_path))
 
     if len(pairs) < 2:
-        print(f"[train] Need at least 2 annotated sessions in {ANN_DIR}/")
+        print(f"[train] Need at least 2 annotated images in {LBL_DIR}/")
         return False
 
     random.shuffle(pairs)
