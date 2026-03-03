@@ -603,44 +603,73 @@ class PutterLive:
 
     def _draw_strobe_composite(self) -> np.ndarray:
         """
-        Stroboscopic composite: 7 evenly-spaced frames max-blended onto one
-        image (shows every putter position simultaneously), plus a metrics
-        panel at the bottom — style inspired by WellPutt.
+        Stroboscopic composite:
+          - Background = first recorded frame (full view, no crop)
+          - For each of 7 columns: replace that column's pixels with the
+            strip taken from the frame where the putter was at the center
+            of that column → putter appears at 7 positions on one image.
+          - Bottom panel: Face Angle + Launch Direction metrics.
         """
-        frames = self._rep_frames
-        n      = min(7, len(frames))
+        frames  = self._rep_frames
+        N_COLS  = 7
+        n_frames = len(frames)
 
-        vid_h   = int(self.H * 0.60)   # top 60 % = video composite
-        panel_h = self.H - vid_h        # bottom 40 % = black metrics panel
+        vid_h   = int(self.H * 0.60)
+        panel_h = self.H - vid_h
 
         out = np.zeros((self.H, self.W, 3), dtype=np.uint8)
 
-        # ── 7 vertical strips — scale-to-fill + center crop, no distortion ─
-        if n > 0:
-            indices = [int(round(i * (len(frames) - 1) / max(n - 1, 1)))
-                       for i in range(n)]
-            strip_w = self.W // n
-            for i, idx in enumerate(indices):
-                x0 = i * strip_w
-                x1 = self.W if i == n - 1 else x0 + strip_w
-                sw  = x1 - x0
+        if n_frames == 0:
+            return out
 
-                src      = frames[idx]          # stored at W//2 × H//2
-                sh, sw_s = src.shape[:2]
+        # ── Work in stored-frame space (W//2 × H//2) ─────────────────────
+        sf_w = frames[0].shape[1]   # e.g. 640
+        sf_h = frames[0].shape[0]   # e.g. 360
+        col_w = sf_w // N_COLS      # column width in stored-frame space
 
-                # Scale so height fills vid_h, preserve aspect ratio
-                scale    = vid_h / sh
-                scaled_w = int(sw_s * scale)
-                scaled   = cv2.resize(src, (scaled_w, vid_h))
+        # Start with first frame as background
+        composite = frames[0].copy()
 
-                # Center-crop horizontally to the strip width
-                cx   = scaled_w // 2
-                left = max(cx - sw // 2, 0)
-                left = min(left, scaled_w - sw)
-                out[:vid_h, x0:x1] = scaled[:, left:left + sw]
+        r = self.result
+        if r and len(r.positions) >= 2:
+            # timestamps are in the same unit as records
+            t0    = r.timestamps[0]
+            t_rng = max(r.timestamps[-1] - t0, 1e-6)
+            n_rec = len(r.positions)
 
-                if i > 0:   # thin divider
-                    cv2.line(out, (x0, 0), (x0, vid_h), (60, 60, 60), 1)
+            for i in range(N_COLS):
+                # Column center in stored-frame space → original-frame space
+                cx_sf   = (i + 0.5) * sf_w / N_COLS
+                cx_orig = cx_sf * (self.W / sf_w)   # scale to original W
+
+                # Find the record whose x is closest to this column center
+                best_j = min(range(n_rec),
+                             key=lambda j: abs(r.positions[j][0] - cx_orig))
+
+                # Map record timestamp → rep_frame index (linear interpolation)
+                rel_t   = (r.timestamps[best_j] - t0) / t_rng
+                rep_idx = int(round(rel_t * (n_frames - 1)))
+                rep_idx = max(0, min(rep_idx, n_frames - 1))
+
+                x0 = i * col_w
+                x1 = sf_w if i == N_COLS - 1 else x0 + col_w
+                composite[:, x0:x1] = frames[rep_idx][:, x0:x1]
+        else:
+            # No tracking data: evenly-spaced frames, same column logic
+            for i in range(N_COLS):
+                idx = int(round(i * (n_frames - 1) / max(N_COLS - 1, 1)))
+                x0  = i * col_w
+                x1  = sf_w if i == N_COLS - 1 else x0 + col_w
+                composite[:, x0:x1] = frames[idx][:, x0:x1]
+
+        # Resize composite to display area (no distortion — same aspect ratio)
+        out[:vid_h] = cv2.resize(composite, (self.W, vid_h))
+
+        # Column dividers
+        col_w_disp = self.W // N_COLS
+        for i in range(1, N_COLS):
+            cv2.line(out, (i * col_w_disp, 0), (i * col_w_disp, vid_h),
+                     (60, 60, 60), 1)
 
         # thin separator line
         cv2.line(out, (0, vid_h), (self.W, vid_h), (60, 60, 60), 1)
