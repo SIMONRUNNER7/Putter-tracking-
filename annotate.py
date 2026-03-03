@@ -1,444 +1,329 @@
 #!/usr/bin/env python3
 """
-Outil d'annotation rapide — tête de putter vue de dessus.
-
+annotate.py – Outil d'annotation de têtes de putter (boîtes orientées)
+=======================================================================
 Usage:
-    python3 annotate.py test-putt.mov          # depuis une vidéo
-    python3 annotate.py real_frames/            # depuis un dossier d'images
+    python3 annotate.py <dossier_ou_image>
+
+    Exemple:
+        python3 annotate.py ~/Desktop/screenshots/
+        python3 annotate.py ma_photo.png
 
 Contrôles:
-    Clic + glisser   → dessiner la bounding box
-    Entrée / Espace  → valider et passer à la suivante
-    S                → skip (pas de putter visible)
-    Backspace        → effacer la box courante
-    ←                → image précédente
-    Q / Echap        → quitter et sauvegarder
+    Click-drag          → dessiner une boîte autour d'une tête
+    ← → flèches         → faire pivoter la boîte sélectionnée (±5°)
+    ↑ ↓ flèches         → changer de boîte sélectionnée
+    Clic droit          → supprimer la boîte la plus proche
+    Entrée / S          → sauvegarder et image suivante
+    Backspace           → supprimer la dernière boîte
+    N / →               → image suivante (sans sauvegarder)
+    P / ←               → image précédente
+    Q / Echap           → quitter
 
-Sortie (format YOLO):
-    annotation_output/images/   → frames JPG
-    annotation_output/labels/   → fichiers .txt YOLO
+Format de sortie : YOLO OBB  →  annotation_output/labels/*.txt
+                               annotation_output/images/*.jpg
 """
-import sys
-import os
+
 import cv2
+import numpy as np
+import os
+import sys
+import math
 import glob
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QLabel, QPushButton,
-    QHBoxLayout, QVBoxLayout, QProgressBar, QStatusBar, QSizePolicy
-)
-from PyQt6.QtCore import Qt, QRect, QPoint, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QKeySequence, QShortcut
+import shutil
+
+OUTPUT_DIR = "annotation_output"
+IMG_OUT    = os.path.join(OUTPUT_DIR, "images")
+LBL_OUT    = os.path.join(OUTPUT_DIR, "labels")
 
 
-OUTPUT_DIR   = "annotation_output"
-IMAGES_DIR   = os.path.join(OUTPUT_DIR, "images")
-LABELS_DIR   = os.path.join(OUTPUT_DIR, "labels")
-CLASS_ID     = 0   # putter_head
-FRAME_STEP   = 5   # extraire 1 frame sur N depuis la vidéo
+# ─────────────────────────────────────────────────────────────────────────────
+class Annotator:
 
+    def __init__(self, image_paths: list[str]):
+        self.paths    = image_paths
+        self.idx      = 0
 
-# ---------------------------------------------------------------------------
-# Canvas de dessin
-# ---------------------------------------------------------------------------
+        # Current state
+        self.boxes: list[list] = []    # each: [cx, cy, w, h, angle_deg]
+        self.sel     = -1              # selected box index
+        self.drag_s  = None            # drag start (x, y)
+        self.drag_e  = None            # drag end   (x, y)
+        self.drawing = False
 
-class AnnotationCanvas(QLabel):
-    box_drawn = pyqtSignal(QRect)   # émis quand l'utilisateur finit de dessiner
+        # Original image (for coordinate reference)
+        self.img_orig: np.ndarray | None = None
+        self.img_h = 0
+        self.img_w = 0
 
-    def __init__(self):
-        super().__init__()
-        self._pixmap_orig: QPixmap | None = None
-        self._box: QRect | None = None
-        self._start: QPoint | None = None
-        self._drawing = False
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setMinimumSize(640, 480)
-        self.setStyleSheet("background: #1a1a1a;")
+        os.makedirs(IMG_OUT, exist_ok=True)
+        os.makedirs(LBL_OUT, exist_ok=True)
 
-    def set_image(self, pixmap: QPixmap) -> None:
-        self._pixmap_orig = pixmap
-        self._box = None
-        self._redraw()
+        cv2.namedWindow("Annotate", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Annotate", 1200, 750)
+        cv2.setMouseCallback("Annotate", self._mouse)
 
-    def set_box(self, box: QRect | None) -> None:
-        self._box = box
-        self._redraw()
+    # ── Mouse ─────────────────────────────────────────────────────────────────
 
-    def get_box(self) -> QRect | None:
-        return self._box
+    def _mouse(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.drag_s  = (x, y)
+            self.drag_e  = (x, y)
+            self.drawing = True
 
-    # ---- Mouse events -------------------------------------------------------
+        elif event == cv2.EVENT_MOUSEMOVE and self.drawing:
+            self.drag_e = (x, y)
 
-    def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton and self._pixmap_orig:
-            self._start   = e.pos()
-            self._drawing = True
-            self._box     = None
+        elif event == cv2.EVENT_LBUTTONUP and self.drawing:
+            self.drag_e = (x, y)
+            self.drawing = False
+            if self.drag_s:
+                x0, y0 = self.drag_s
+                x1, y1 = self.drag_e
+                bw, bh  = abs(x1 - x0), abs(y1 - y0)
+                if bw > 6 and bh > 6:
+                    cx = (x0 + x1) // 2
+                    cy = (y0 + y1) // 2
+                    self.boxes.append([cx, cy, bw, bh, 0.0])
+                    self.sel = len(self.boxes) - 1
+            self.drag_s = None
+            self.drag_e = None
 
-    def mouseMoveEvent(self, e):
-        if self._drawing and self._start:
-            self._box = QRect(self._start, e.pos()).normalized()
-            self._redraw()
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            # Delete nearest box
+            if self.boxes:
+                dists   = [math.hypot(b[0] - x, b[1] - y) for b in self.boxes]
+                nearest = int(np.argmin(dists))
+                if dists[nearest] < 80:
+                    self.boxes.pop(nearest)
+                    self.sel = len(self.boxes) - 1
 
-    def mouseReleaseEvent(self, e):
-        if self._drawing:
-            self._drawing = False
-            if self._box and self._box.width() > 5 and self._box.height() > 5:
-                self.box_drawn.emit(self._box)
-            self._redraw()
+        elif event == cv2.EVENT_MOUSEWHEEL:
+            # Scroll to rotate selected box (cross-platform fallback)
+            if self.boxes and 0 <= self.sel < len(self.boxes):
+                delta = 5.0 if flags > 0 else -5.0
+                self.boxes[self.sel][4] = (self.boxes[self.sel][4] + delta) % 360
 
-    # ---- Drawing ------------------------------------------------------------
+    # ── Drawing ───────────────────────────────────────────────────────────────
 
-    def _redraw(self):
-        if self._pixmap_orig is None:
-            return
-        scaled = self._pixmap_orig.scaled(
-            self.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        # Compute offset (centered)
-        ox = (self.width()  - scaled.width())  // 2
-        oy = (self.height() - scaled.height()) // 2
+    def _render(self) -> np.ndarray:
+        if self.img_orig is None:
+            return np.zeros((600, 1000, 3), dtype=np.uint8)
 
-        result = QPixmap(self.size())
-        result.fill(QColor("#1a1a1a"))
-        painter = QPainter(result)
-        painter.drawPixmap(ox, oy, scaled)
+        disp = self.img_orig.copy()
 
-        if self._box:
-            pen = QPen(QColor("#00ff88"), 2)
-            painter.setPen(pen)
-            painter.drawRect(self._box)
-            # Small label
-            painter.setPen(QColor("#00ff88"))
-            painter.drawText(self._box.topLeft() + QPoint(4, -6), "putter_head")
+        # In-progress drag preview
+        if self.drawing and self.drag_s and self.drag_e:
+            cv2.rectangle(disp, self.drag_s, self.drag_e, (200, 100, 0), 2)
 
-        painter.end()
-        self.setPixmap(result)
+        # All annotated boxes
+        for i, box in enumerate(self.boxes):
+            cx, cy, bw, bh, angle = box
+            selected = (i == self.sel)
+            self._draw_box(disp, cx, cy, bw, bh, angle, selected)
 
-    def resizeEvent(self, e):
-        self._redraw()
+        # Arc through centers
+        if len(self.boxes) >= 2:
+            centers = np.array([(b[0], b[1]) for b in self.boxes], np.int32)
+            cv2.polylines(disp, [centers.reshape(-1, 1, 2)],
+                          False, (200, 100, 0), 3, cv2.LINE_AA)
+            cv2.polylines(disp, [centers.reshape(-1, 1, 2)],
+                          False, (255, 220, 80), 1, cv2.LINE_AA)
 
-    # ---- Convert box to image coordinates -----------------------------------
+        # HUD
+        fname = os.path.basename(self.paths[self.idx])
+        lbl_saved = os.path.isfile(
+            os.path.join(LBL_OUT,
+                         os.path.splitext(fname)[0] + ".txt"))
+        status_clr = (80, 200, 80) if lbl_saved else (180, 180, 180)
+        status_txt = "✓ sauvegardé" if lbl_saved else "non sauvegardé"
 
-    def box_in_image_coords(self) -> tuple[float, float, float, float] | None:
-        """Return (x_center, y_center, width, height) normalized [0-1]."""
-        if self._box is None or self._pixmap_orig is None:
-            return None
+        h, w = disp.shape[:2]
 
-        scaled = self._pixmap_orig.scaled(
-            self.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        ox = (self.width()  - scaled.width())  // 2
-        oy = (self.height() - scaled.height()) // 2
+        # Dark strip at bottom
+        cv2.rectangle(disp, (0, h - 55), (w, h), (20, 20, 20), -1)
 
-        sx = self._pixmap_orig.width()  / scaled.width()
-        sy = self._pixmap_orig.height() / scaled.height()
+        info = (f"{self.idx + 1}/{len(self.paths)}  {fname}  [{status_txt}]"
+                f"   |   {len(self.boxes)} boîte(s)")
+        cv2.putText(disp, info, (10, h - 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_clr, 1, cv2.LINE_AA)
 
-        bx = (self._box.x() - ox) * sx
-        by = (self._box.y() - oy) * sy
-        bw = self._box.width()  * sx
-        bh = self._box.height() * sy
+        hints = ("Click-drag: boîte   ←→: tourner   ↑↓: choisir   "
+                 "Clic-droit: effacer   Entrée/S: sauv+suiv   N/P: nav   Q: quitter")
+        cv2.putText(disp, hints, (10, h - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (130, 130, 130), 1, cv2.LINE_AA)
 
-        iw = self._pixmap_orig.width()
-        ih = self._pixmap_orig.height()
+        if self.boxes and 0 <= self.sel < len(self.boxes):
+            b = self.boxes[self.sel]
+            sel_info = (f"Boîte {self.sel + 1}:  centre=({b[0]},{b[1]})  "
+                        f"taille={b[2]}×{b[3]}  angle={b[4]:.1f}°")
+            cv2.putText(disp, sel_info, (10, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 220, 80), 1, cv2.LINE_AA)
 
-        cx = (bx + bw / 2) / iw
-        cy = (by + bh / 2) / ih
-        nw = bw / iw
-        nh = bh / ih
+        return disp
 
-        # Clamp
-        cx = max(0.0, min(1.0, cx))
-        cy = max(0.0, min(1.0, cy))
-        nw = max(0.0, min(1.0, nw))
-        nh = max(0.0, min(1.0, nh))
+    def _draw_box(self, frame, cx, cy, bw, bh, angle, selected=False):
+        rect  = ((float(cx), float(cy)), (float(bw), float(bh)), float(angle))
+        pts   = cv2.boxPoints(rect).astype(np.int32)
+        color = (255, 220, 80) if selected else (200, 100, 0)
+        cv2.drawContours(frame, [pts], 0, (0, 0, 0),     4, cv2.LINE_AA)
+        cv2.drawContours(frame, [pts], 0, color,          2, cv2.LINE_AA)
+        cv2.circle(frame, (cx, cy), 6, (0, 0, 0),    -1, cv2.LINE_AA)
+        cv2.circle(frame, (cx, cy), 4, (255, 255, 255), -1, cv2.LINE_AA)
 
-        return cx, cy, nw, nh
+    # ── Navigation & save ─────────────────────────────────────────────────────
 
-
-# ---------------------------------------------------------------------------
-# Fenêtre principale
-# ---------------------------------------------------------------------------
-
-class AnnotatorWindow(QMainWindow):
-    def __init__(self, frames: list[tuple[str, str]]):
-        """frames = list of (image_path, label_path)"""
-        super().__init__()
-        self.frames     = frames
-        self.idx        = 0
-        self.saved      = 0
-        self.skipped    = 0
-
-        os.makedirs(IMAGES_DIR, exist_ok=True)
-        os.makedirs(LABELS_DIR, exist_ok=True)
-
-        self._build_ui()
-        self._load_frame()
-
-    # ---- UI -----------------------------------------------------------------
-
-    def _build_ui(self):
-        self.setWindowTitle("Annotateur Putter — PutterTrack Pro")
-        self.resize(1000, 750)
-        self.setStyleSheet("background:#222; color:#eee; font-size:13px;")
-
-        central = QWidget()
-        self.setCentralWidget(central)
-        vbox = QVBoxLayout(central)
-        vbox.setContentsMargins(8, 8, 8, 8)
-        vbox.setSpacing(6)
-
-        # Canvas
-        self.canvas = AnnotationCanvas()
-        self.canvas.box_drawn.connect(self._on_box_drawn)
-        vbox.addWidget(self.canvas, stretch=1)
-
-        # Progress
-        self.progress = QProgressBar()
-        self.progress.setMaximum(len(self.frames))
-        self.progress.setTextVisible(True)
-        self.progress.setStyleSheet(
-            "QProgressBar{border:1px solid #555;border-radius:4px;height:18px;}"
-            "QProgressBar::chunk{background:#00cc66;}"
-        )
-        vbox.addWidget(self.progress)
-
-        # Buttons
-        btn_row = QHBoxLayout()
-        btn_style = (
-            "QPushButton{background:#333;border:1px solid #555;border-radius:6px;"
-            "padding:8px 20px;color:#eee;font-size:13px;}"
-            "QPushButton:hover{background:#444;}"
-            "QPushButton:pressed{background:#00cc66;color:#000;}"
-        )
-
-        self.btn_prev = QPushButton("← Précédent  [←]")
-        self.btn_skip = QPushButton("Skip — pas de putter  [S]")
-        self.btn_clear = QPushButton("Effacer box  [⌫]")
-        self.btn_save = QPushButton("✓ Valider  [Entrée]")
-        self.btn_save.setStyleSheet(btn_style +
-            "QPushButton#save{background:#005533;}"
-        )
-        self.btn_save.setObjectName("save")
-
-        for b in [self.btn_prev, self.btn_skip, self.btn_clear, self.btn_save]:
-            b.setStyleSheet(btn_style)
-            btn_row.addWidget(b)
-
-        self.btn_prev.clicked.connect(self._prev)
-        self.btn_skip.clicked.connect(self._skip)
-        self.btn_clear.clicked.connect(self._clear_box)
-        self.btn_save.clicked.connect(self._save_and_next)
-
-        vbox.addLayout(btn_row)
-
-        # Raccourcis clavier
-        QShortcut(QKeySequence(Qt.Key.Key_Return),    self, self._save_and_next)
-        QShortcut(QKeySequence(Qt.Key.Key_Space),     self, self._save_and_next)
-        QShortcut(QKeySequence(Qt.Key.Key_S),         self, self._skip)
-        QShortcut(QKeySequence(Qt.Key.Key_Backspace), self, self._clear_box)
-        QShortcut(QKeySequence(Qt.Key.Key_Left),      self, self._prev)
-        QShortcut(QKeySequence(Qt.Key.Key_Escape),    self, self.close)
-        QShortcut(QKeySequence(Qt.Key.Key_Q),         self, self.close)
-
-        # Status bar
-        self.status = QStatusBar()
-        self.setStatusBar(self.status)
-
-    # ---- Frame loading ------------------------------------------------------
-
-    def _load_frame(self):
-        if self.idx >= len(self.frames):
-            self._finish()
-            return
-
-        img_path, _ = self.frames[self.idx]
-        img = cv2.imread(img_path)
+    def _load(self):
+        """Load current image and any existing annotation."""
+        path = self.paths[self.idx]
+        img  = cv2.imread(path)
         if img is None:
-            self._next_idx()
+            print(f"[warn] impossible de lire {path}")
+            self.img_orig = np.zeros((600, 1000, 3), dtype=np.uint8)
+        else:
+            self.img_orig = img
+        self.img_h, self.img_w = self.img_orig.shape[:2]
+        self.boxes   = []
+        self.sel     = -1
+        self.drawing = False
+        self.drag_s  = None
+        self.drag_e  = None
+        self._load_existing_label(path)
+
+    def _load_existing_label(self, img_path: str):
+        """Reload YOLO OBB labels if they exist."""
+        fname    = os.path.splitext(os.path.basename(img_path))[0]
+        lbl_path = os.path.join(LBL_OUT, fname + ".txt")
+        if not os.path.isfile(lbl_path):
             return
+        W, H = self.img_w, self.img_h
+        with open(lbl_path) as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) == 9:   # YOLO OBB: class + 4 corners (x1y1…x4y4)
+                    pts = np.array([float(v) for v in parts[1:]]).reshape(4, 2)
+                    pts[:, 0] *= W
+                    pts[:, 1] *= H
+                    rect = cv2.minAreaRect(pts.astype(np.float32))
+                    cx, cy = int(rect[0][0]), int(rect[0][1])
+                    bw, bh = int(rect[1][0]), int(rect[1][1])
+                    angle  = float(rect[2])
+                    self.boxes.append([cx, cy, bw, bh, angle])
+        if self.boxes:
+            self.sel = len(self.boxes) - 1
 
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        h, w, ch = img_rgb.shape
-        qimg = QImage(img_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
-        self.canvas.set_image(QPixmap.fromImage(qimg))
+    def _save(self):
+        """Save YOLO OBB labels + copy image to output."""
+        path  = self.paths[self.idx]
+        fname = os.path.splitext(os.path.basename(path))[0]
 
-        # Reload existing annotation if any
-        _, lbl_path = self.frames[self.idx]
-        if os.path.isfile(lbl_path):
-            # Show existing box (approximate)
-            with open(lbl_path) as f:
-                line = f.read().strip()
-            if line:
-                parts = line.split()
-                if len(parts) == 5:
-                    cx, cy, nw, nh = map(float, parts[1:])
-                    # convert to canvas coords (rough)
-                    self.status.showMessage(f"Annotation existante chargée")
+        # Copy image
+        dest_img = os.path.join(IMG_OUT, os.path.basename(path))
+        if not os.path.isfile(dest_img):
+            shutil.copy2(path, dest_img)
 
-        self.progress.setValue(self.idx)
-        self._update_status()
-        self.btn_prev.setEnabled(self.idx > 0)
-
-    def _update_status(self):
-        _, lbl_path = self.frames[self.idx]
-        annotated = os.path.isfile(lbl_path)
-        self.setWindowTitle(
-            f"Annotateur — {self.idx + 1}/{len(self.frames)}  "
-            f"({self.saved} sauvegardés, {self.skipped} skippés)"
-        )
-        hint = "✓ déjà annoté" if annotated else "Dessine la box autour de la TÊTE du putter"
-        self.status.showMessage(
-            f"Frame {self.idx + 1}/{len(self.frames)}  |  {hint}"
-        )
-
-    # ---- Actions ------------------------------------------------------------
-
-    def _on_box_drawn(self, rect: QRect):
-        self.status.showMessage("Box dessinée — Entrée pour valider, S pour skipper")
-
-    def _save_and_next(self):
-        coords = self.canvas.box_in_image_coords()
-        if coords is None:
-            self.status.showMessage("⚠ Dessine une box d'abord (ou appuie sur S pour skipper)")
-            return
-
-        img_src, lbl_path = self.frames[self.idx]
-
-        # Copy image to output if not already there
-        out_img = os.path.join(IMAGES_DIR, os.path.basename(img_src))
-        if not os.path.isfile(out_img):
-            import shutil
-            shutil.copy2(img_src, out_img)
-
-        # Save YOLO label
-        cx, cy, nw, nh = coords
+        # Write labels
+        lbl_path = os.path.join(LBL_OUT, fname + ".txt")
+        W, H = self.img_w, self.img_h
         with open(lbl_path, "w") as f:
-            f.write(f"{CLASS_ID} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}\n")
+            for box in self.boxes:
+                cx, cy, bw, bh, angle = box
+                rect = ((float(cx), float(cy)), (float(bw), float(bh)), float(angle))
+                pts  = cv2.boxPoints(rect)
+                pts_n = (pts / [W, H]).flatten().tolist()
+                f.write("0 " + " ".join(f"{v:.6f}" for v in pts_n) + "\n")
 
-        self.saved += 1
-        self._next_idx()
+        n = len(self.boxes)
+        print(f"[saved] {lbl_path}  ({n} boîte{'s' if n != 1 else ''})")
 
-    def _skip(self):
-        """Mark frame as explicitly skipped (empty label = no object)."""
-        _, lbl_path = self.frames[self.idx]
-        open(lbl_path, "w").close()   # fichier vide = pas de détection
-        self.skipped += 1
-        self._next_idx()
-
-    def _clear_box(self):
-        self.canvas.set_box(None)
-        self.status.showMessage("Box effacée")
+    def _next(self):
+        if self.idx < len(self.paths) - 1:
+            self.idx += 1
+            self._load()
 
     def _prev(self):
         if self.idx > 0:
             self.idx -= 1
-            self._load_frame()
+            self._load()
 
-    def _next_idx(self):
-        self.idx += 1
-        if self.idx >= len(self.frames):
-            self._finish()
-        else:
-            self._load_frame()
+    # ── Main loop ─────────────────────────────────────────────────────────────
 
-    def _finish(self):
-        self.status.showMessage(
-            f"✓ Terminé ! {self.saved} annotées, {self.skipped} skippées. "
-            f"Dataset dans {OUTPUT_DIR}/"
-        )
-        self.setWindowTitle(f"Terminé — {self.saved} annotations sauvegardées")
-        from PyQt6.QtWidgets import QMessageBox
-        QMessageBox.information(
-            self, "Annotation terminée",
-            f"✓ {self.saved} images annotées\n"
-            f"  {self.skipped} skippées\n\n"
-            f"Dataset prêt dans : {os.path.abspath(OUTPUT_DIR)}/\n\n"
-            f"Lance l'entraînement avec :\n"
-            f"  python3 train_real.py"
-        )
+    def run(self):
+        self._load()
 
+        while True:
+            cv2.imshow("Annotate", self._render())
+            key = cv2.waitKey(30) & 0xFF
 
-# ---------------------------------------------------------------------------
-# Chargement des frames
-# ---------------------------------------------------------------------------
+            if key in (ord('q'), ord('Q'), 27):     # Q / Esc → quit
+                break
 
-def load_from_video(video_path: str) -> list[tuple[str, str]]:
-    """Extraire les frames de la vidéo dans un dossier temporaire."""
-    frames_dir = "annotation_frames"
-    os.makedirs(frames_dir, exist_ok=True)
+            elif key in (13, ord('s'), ord('S')):    # Entrée / S → save + next
+                self._save()
+                self._next()
 
-    cap = cv2.VideoCapture(video_path)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"[annotate] Vidéo : {total} frames — extraction 1/{FRAME_STEP}...")
+            elif key in (ord('n'), ord('N')):        # N → next
+                self._next()
 
-    i = 0
-    paths = []
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if i % FRAME_STEP == 0:
-            p = os.path.join(frames_dir, f"frame_{i:05d}.jpg")
-            if not os.path.isfile(p):
-                cv2.imwrite(p, frame)
-            lbl = os.path.join(LABELS_DIR, f"frame_{i:05d}.txt")
-            paths.append((p, lbl))
-        i += 1
+            elif key in (ord('p'), ord('P')):        # P → prev
+                self._prev()
 
-    cap.release()
-    print(f"[annotate] {len(paths)} frames prêtes")
-    return paths
+            elif key == 81:                          # ← flèche gauche
+                if self.boxes and 0 <= self.sel < len(self.boxes):
+                    self.boxes[self.sel][4] = (self.boxes[self.sel][4] - 5) % 360
+
+            elif key == 83:                          # → flèche droite
+                if self.boxes and 0 <= self.sel < len(self.boxes):
+                    self.boxes[self.sel][4] = (self.boxes[self.sel][4] + 5) % 360
+
+            elif key == 82:                          # ↑ flèche haut → boîte précédente
+                if self.boxes:
+                    self.sel = (self.sel - 1) % len(self.boxes)
+
+            elif key == 84:                          # ↓ flèche bas → boîte suivante
+                if self.boxes:
+                    self.sel = (self.sel + 1) % len(self.boxes)
+
+            elif key in (8, 127):                    # Backspace / Delete
+                if self.boxes:
+                    if 0 <= self.sel < len(self.boxes):
+                        self.boxes.pop(self.sel)
+                    self.sel = len(self.boxes) - 1
+
+        cv2.destroyAllWindows()
+        total_lbl = len(glob.glob(os.path.join(LBL_OUT, "*.txt")))
+        print(f"\nTerminé — {total_lbl} image(s) annotée(s) dans {OUTPUT_DIR}/")
+        if total_lbl >= 5:
+            print("Lance l'entraînement avec :  python3 train_annotated.py")
 
 
-def load_from_folder(folder: str) -> list[tuple[str, str]]:
-    exts = ["*.jpg", "*.jpeg", "*.png"]
-    imgs = []
-    for e in exts:
-        imgs.extend(glob.glob(os.path.join(folder, e)))
-    imgs = sorted(imgs)
-    os.makedirs(LABELS_DIR, exist_ok=True)
-    return [
-        (p, os.path.join(LABELS_DIR, os.path.splitext(os.path.basename(p))[0] + ".txt"))
-        for p in imgs
-    ]
+# ─────────────────────────────────────────────────────────────────────────────
 
+def collect_images(source: str) -> list[str]:
+    if os.path.isfile(source):
+        return [source]
+    if os.path.isdir(source):
+        paths = []
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp"):
+            paths.extend(glob.glob(os.path.join(source, ext)))
+            paths.extend(glob.glob(os.path.join(source, ext.upper())))
+        return sorted(set(paths))
+    return []
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 annotate.py <video.mov | dossier_images/>")
+        print(__doc__)
+        print("\nUsage: python3 annotate.py <dossier_screenshots/>")
         sys.exit(1)
 
-    source = sys.argv[1]
-    os.makedirs(LABELS_DIR, exist_ok=True)
-    os.makedirs(IMAGES_DIR, exist_ok=True)
-
-    if os.path.isfile(source):
-        frames = load_from_video(source)
-    elif os.path.isdir(source):
-        frames = load_from_folder(source)
-    else:
-        print(f"[ERROR] Fichier ou dossier introuvable : {source}")
+    paths = collect_images(sys.argv[1])
+    if not paths:
+        print(f"[erreur] Aucune image trouvée dans : {sys.argv[1]}")
         sys.exit(1)
 
-    if not frames:
-        print("[ERROR] Aucune image trouvée")
-        sys.exit(1)
-
-    app = QApplication(sys.argv)
-    app.setApplicationName("Annotateur Putter")
-
-    window = AnnotatorWindow(frames)
-    window.show()
-    sys.exit(app.exec())
+    print(f"[annotate] {len(paths)} image(s) chargée(s)")
+    Annotator(paths).run()
 
 
 if __name__ == "__main__":
