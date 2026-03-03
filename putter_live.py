@@ -871,9 +871,10 @@ class PutterLive:
                 continue
             confs  = obb.conf.tolist()
             best_i = int(max(range(len(confs)), key=lambda k: confs[k]))
-            bx1, by1, bx2, by2 = obb.xyxy[best_i].tolist()
-            print(f"[yolo] col {i}: detected conf={confs[best_i]:.2f}  box=({bx1:.0f},{by1:.0f},{bx2:.0f},{by2:.0f})")
-            result.append((bx1, by1, bx2, by2))
+            cx, cy, w, h, r = obb.xywhr[best_i].tolist()
+            angle_deg = math.degrees(r)
+            print(f"[yolo] col {i}: detected conf={confs[best_i]:.2f}  cx={cx:.0f} cy={cy:.0f} angle={angle_deg:.1f}°")
+            result.append((cx, cy, w, h, angle_deg))
         return result
 
     def _draw_strobe_composite(self) -> np.ndarray:
@@ -923,11 +924,11 @@ class PutterLive:
         for i, box in enumerate(self._strobe_det):
             if box is None:
                 continue
-            bx1, by1, bx2, by2 = box
-            dx1 = int(bx1 * scale_x); dy1 = int(by1 * scale_y)
-            dx2 = int(bx2 * scale_x); dy2 = int(by2 * scale_y)
-            dcx = (dx1 + dx2) // 2;   dcy = (dy1 + dy2) // 2
-            cv2.rectangle(out, (dx1, dy1), (dx2, dy2), (0, 255, 100), 2)
+            cx, cy, w, h, angle_deg = box
+            dcx = int(cx * scale_x);  dcy = int(cy * scale_y)
+            dw  = w * scale_x;        dh  = h * scale_y
+            pts = cv2.boxPoints(((float(dcx), float(dcy)), (dw, dh), angle_deg)).astype(np.int32)
+            cv2.drawContours(out, [pts], 0, (0, 255, 100), 2, cv2.LINE_AA)
             centers_disp[i] = (dcx, dcy)
 
         # Fallback: stored positions
@@ -947,6 +948,13 @@ class PutterLive:
                 in_col = [p for p in r_fb.positions if x0 <= p[0] < x1]
                 if in_col:
                     centers_disp[i] = in_col[len(in_col) // 2]
+
+        # Arc through strobe detection centers
+        arc_pts = [pt for pt in centers_disp if pt is not None]
+        if len(arc_pts) >= 2:
+            arc_arr = np.array(arc_pts, np.int32).reshape(-1, 1, 2)
+            cv2.polylines(out, [arc_arr], False, (0, 0, 0),   5, cv2.LINE_AA)
+            cv2.polylines(out, [arc_arr], False, (0, 220, 255), 2, cv2.LINE_AA)
 
         # Full recorded trajectory (red arc)
         r = self.result
