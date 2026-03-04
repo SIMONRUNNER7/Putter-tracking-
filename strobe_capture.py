@@ -238,7 +238,8 @@ def main():
     # Putter strobe
     kf_frames  = [None] * N_COLS
     kf_offs    = [float('inf')] * N_COLS
-    kf_address = None   # col 4 : frame calme balle+putter avant swing
+    kf_impact     = None           # col 4 : frame où putter est au plus proche de la balle
+    kf_impact_off = float('inf')  # offset putter↔balle en x (demi-res)
 
     # Balle
     ball_rest      = None
@@ -306,7 +307,8 @@ def main():
                 putter_anchor       = None
                 putter_stable_since = 0.0
                 ball_rest           = None
-                kf_address          = None
+                kf_impact           = None
+                kf_impact_off       = float('inf')
                 print("[calib] fond figé → ARMED")
 
         elif state == State.ARMED:
@@ -362,10 +364,9 @@ def main():
 
                         if (now - putter_stable_since >= PUTTER_STABLE_SEC
                                 and ball_rest is not None):
-                            is_ready     = True
-                            absorb_start = now
+                            is_ready        = True
+                            absorb_start    = now
                             armed_for_swing = False
-                            kf_address   = kf_rest
                             print("[armed] putter stable → absorption fond")
 
                     elif not armed_for_swing:
@@ -383,6 +384,8 @@ def main():
                             rec_start     = now
                             kf_frames     = [None] * N_COLS
                             kf_offs       = [float('inf')] * N_COLS
+                            kf_impact     = None
+                            kf_impact_off = float('inf')
                             ball_col_kfs  = [None] * len(BALL_COLS)
                             ball_col_poss = [None] * len(BALL_COLS)
                             ball_col_offs = [float('inf')] * len(BALL_COLS)
@@ -426,7 +429,14 @@ def main():
                             sw_done = True
                     sw_cx_prev = cx_h
 
-                    # Col 3 (index 3) = réservée à kf_address (frame adresse)
+                    # Col 4 (index 3) = frame d'impact : putter cx le plus proche de la balle
+                    if ball_rest is not None:
+                        impact_off = abs(cx_h - ball_rest[1][0])
+                        if impact_off < kf_impact_off:
+                            kf_impact_off = impact_off
+                            kf_impact     = half.copy()
+
+                    # Autres colonnes : frame quand putter est au centre de la col
                     if sw_peaked and not sw_done and col != 3:
                         if off < kf_offs[col]:
                             kf_offs[col]   = off
@@ -453,8 +463,8 @@ def main():
 
             # — Fin d'enregistrement ————————————————————————————————————————
             if now - rec_start >= RECORD_SECS:
-                # Col 4 = adresse (balle + putter calmes avant swing)
-                kf_frames[3] = kf_address
+                # Col 4 = impact (frame où cx putter est le plus proche de la balle)
+                kf_frames[3] = kf_impact
                 # Cols 1 et 7 : masquées si tête n'a pas atteint leur centre
                 if sw_cx_max < 6.5 * cw_h:
                     kf_frames[6] = None
@@ -482,7 +492,8 @@ def main():
                 putter_anchor       = None
                 putter_stable_since = 0.0
                 ball_rest           = None
-                kf_address          = None
+                kf_impact           = None
+                kf_impact_off       = float('inf')
 
         # ── Affichage ─────────────────────────────────────────────────────
         if state == State.PREVIEW and composite is not None:
@@ -584,9 +595,10 @@ def main():
             bg_model    = None
             state       = State.READY
             calib_start = now
-            ball_rest   = None
-            kf_address  = None
-            is_ready    = False
+            ball_rest     = None
+            kf_impact     = None
+            kf_impact_off = float('inf')
+            is_ready      = False
             putter_anchor       = None
             putter_stable_since = 0.0
             print("[bg] reset calibration")
