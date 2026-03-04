@@ -7,15 +7,18 @@ Contrôles:
 
 Flux automatique:
   READY (3s calibration fond vide)
-    → ARMED  : détecte balle + putter immobile 2s → affiche READY
-               déclenche sur mouvement DROITE du putter → RECORDING
+    → ARMED  : balle en col 4 D'ABORD (prérequis)
+               puis tête putter détectée (YOLO) et immobile 2s → READY
+               déclenche sur mouvement du putter → RECORDING
     → RECORDING (2.5s)
     → PREVIEW (3s)
     → ARMED  (retour, fond conservé)
 
-Strobe putter  : cols 5-7 (backswing), col 4 (adresse = frame calme),
-                 cols 2-3 (downswing), col 1 = balle seule post-impact.
-                 Cols 1 et 7 masquées si tête n'atteint pas leur centre.
+Strobe (7 cols) :
+  Cols 1-3, 5-7 : frame où la TÊTE du putter est au centre de la colonne.
+  Col 4 (impact) : frame où tête + balle sont visibles ensemble.
+  Overlay col 4  : balle initiale (position de repos) cropée en cercle.
+  Overlay col 1  : balle post-impact cropée en cercle.
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ from enum import Enum
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 TARGET_FPS       = 240
-CALIB_SECS       = 3.0    # durée calibration fond vide
+CALIB_SECS       = 3.0
 RECORD_SECS      = 2.5
 PREVIEW_SECS     = 3.0
 N_COLS           = 7
@@ -40,15 +43,16 @@ MOTION_AREA      = 80
 SWING_PEAK_DELTA = 5
 BALL_CROP_R      = 30
 
-# Auto-déclenchement
-PUTTER_STABLE_SEC  = 2.0   # secondes d'immobilité requises
-PUTTER_ABSORB_SEC  = 1.0   # secondes d'absorption du putter dans le fond
-PUTTER_STILL_PX    = 10    # pixels demi-res : seuil "immobile"
-PUTTER_SWING_PX    = 18    # pixels demi-res : déplacement DROITE = swing
-PUTTER_MIN_AREA    = 300   # aire min blob putter (demi-res px²)
-BALL_BLOB_PX       = 40    # nb pixels min pour confirmer la balle au bon endroit
+YOLO_MODEL_PATH  = "runs/detect/runs/putter/putter_detector/weights/best.pt"
+YOLO_CONF_MIN    = 0.35   # confiance min pour valider une détection tête
+YOLO_STILL_PX    = 12     # pixels demi-res : seuil "tête immobile"
 
-# Seule colonne où afficher la balle (col 1, index 0-based)
+# Auto-déclenchement
+PUTTER_STABLE_SEC  = 2.0
+PUTTER_ABSORB_SEC  = 1.0
+BALL_BLOB_PX       = 40
+
+# Colonne post-impact balle (col 1, index 0)
 BALL_COLS = (0,)
 
 # ── Palette ────────────────────────────────────────────────────────────────────
@@ -65,10 +69,40 @@ FONT       = cv2.FONT_HERSHEY_SIMPLEX
 
 
 class State(Enum):
-    READY     = "READY"      # calibration fond (3s)
-    ARMED     = "ARMED"      # attente balle + putter stable
+    READY     = "READY"
+    ARMED     = "ARMED"
     RECORDING = "RECORDING"
     PREVIEW   = "PREVIEW"
+
+
+# ── YOLO ──────────────────────────────────────────────────────────────────────
+def load_yolo():
+    try:
+        from ultralytics import YOLO
+        model = YOLO(YOLO_MODEL_PATH)
+        print(f"[yolo] modèle chargé : {YOLO_MODEL_PATH}")
+        return model
+    except Exception as e:
+        print(f"[yolo] ERREUR chargement : {e}  → fallback motion")
+        return None
+
+
+def yolo_detect_head(frame_bgr, model):
+    """Retourne (cx, cy, conf) de la tête de putter, ou None."""
+    if model is None:
+        return None
+    results = model(frame_bgr, verbose=False)[0]
+    if results.boxes is None or len(results.boxes) == 0:
+        return None
+    boxes = results.boxes
+    confs = boxes.conf.cpu().numpy()
+    best  = int(confs.argmax())
+    if confs[best] < YOLO_CONF_MIN:
+        return None
+    b  = boxes.xyxy[best].cpu().numpy()
+    cx = int((b[0] + b[2]) / 2)
+    cy = int((b[1] + b[3]) / 2)
+    return (cx, cy, float(confs[best]))
 
 
 # ── Caméra ────────────────────────────────────────────────────────────────────
@@ -114,26 +148,17 @@ def draw_column_grid(img, W, H):
         cv2.line(img, (i * cw, 0), (i * cw, H), GRID_COLOR, 1)
 
 
-def draw_guide_overlay(img, W, H, ball_pos_fullres=None):
-    """
-    Guidage permanent :
-      - ligne horizontale blanche
-      - cercle balle au BORD GAUCHE de col 4
-      - zone putter collée à droite de la balle
-    """
+def draw_guide_overlay(img, W, H, ball_pos_fullres=None, head_pos_fullres=None):
     cy  = H // 2
     cw  = W // N_COLS
 
-    # Ligne de repère
     cv2.line(img, (0, cy), (W, cy), WHITE, 1, cv2.LINE_AA)
 
-    # Cercle balle : centre à cw*3+18 → bord gauche collé au bord de col 4
     bx = ball_pos_fullres[0] if ball_pos_fullres else cw * 3 + 18
     by = ball_pos_fullres[1] if ball_pos_fullres else cy
     cv2.circle(img, (bx, by), 18, WHITE, 2, cv2.LINE_AA)
     put_text(img, "balle", (bx - 16, by + 32), scale=0.38, color=WHITE)
 
-    # Zone putter : collée à droite de la balle, jusqu'à col 5
     px0 = bx + 22
     px1 = cw * 5
     py0 = cy - 55
@@ -143,6 +168,11 @@ def draw_guide_overlay(img, W, H, ball_pos_fullres=None):
     cv2.addWeighted(ov, 0.12, img, 0.88, 0, img)
     cv2.rectangle(img, (px0, py0), (px1, py1), PUTTER_CLR, 1)
     put_text(img, "PUTTER", (px0 + 6, py0 - 8), scale=0.40, color=PUTTER_CLR)
+
+    # Croix cyan sur la tête YOLO
+    if head_pos_fullres is not None:
+        hx, hy = head_pos_fullres
+        cv2.drawMarker(img, (hx, hy), ACCENT, cv2.MARKER_CROSS, 20, 2, cv2.LINE_AA)
 
 
 # ── Composites ────────────────────────────────────────────────────────────────
@@ -174,11 +204,25 @@ def _paste_ball_circle(canvas, kf_halfres, pos_halfres, W, H):
     canvas[mask > 0] = frame[mask > 0]
 
 
-def make_training_frame(kf_frames, ball_col_kfs, ball_col_poss,
+def make_training_frame(kf_frames, ball_rest, ball_col_kfs, ball_col_poss,
                         W, H, bg_frame=None):
+    """
+    Composite final :
+    - Strobe 7 colonnes (tête au centre de chaque col ; col 4 = impact balle+tête)
+    - Overlay cercle balle initiale en col 4 (position de repos)
+    - Overlay cercle balle post-impact en col 1
+    """
     canvas = make_strobe(kf_frames, W, H, bg_frame=bg_frame)
+
+    # Balle initiale (col 4 : position de repos avant swing)
+    if ball_rest is not None:
+        kf_r, pos_r = ball_rest
+        _paste_ball_circle(canvas, kf_r, pos_r, W, H)
+
+    # Balle post-impact (col 1)
     for kf, pos in zip(ball_col_kfs or [], ball_col_poss or []):
         _paste_ball_circle(canvas, kf, pos, W, H)
+
     return canvas
 
 
@@ -225,6 +269,7 @@ def save_shot(kf_frames, composite, n,
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     cap, W, H, cam_fps = open_camera()
+    yolo = load_yolo()
 
     WIN = "Strobe Capture"
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
@@ -235,20 +280,20 @@ def main():
     bg_frame_color = None
     calib_start    = time.perf_counter()
 
-    # Putter strobe
-    kf_frames  = [None] * N_COLS
-    kf_offs    = [float('inf')] * N_COLS
-    kf_impact     = None           # col 4 : frame où putter est au plus proche de la balle
-    kf_impact_off = float('inf')  # offset putter↔balle en x (demi-res)
+    # Strobe : une frame par colonne (tête au centre)
+    kf_frames     = [None] * N_COLS
+    kf_offs       = [float('inf')] * N_COLS   # dist tête ↔ centre col
+    kf_impact     = None
+    kf_impact_off = float('inf')
 
     # Balle
-    ball_rest      = None
-    ball_col_kfs   = [None] * len(BALL_COLS)
-    ball_col_poss  = [None] * len(BALL_COLS)
-    ball_col_offs  = [float('inf')] * len(BALL_COLS)
-    kf_rest        = None
+    ball_rest     = None
+    ball_col_kfs  = [None] * len(BALL_COLS)
+    ball_col_poss = [None] * len(BALL_COLS)
+    ball_col_offs = [float('inf')] * len(BALL_COLS)
+    kf_rest       = None
 
-    # Suivi directionnel putter (RECORDING)
+    # Suivi directionnel (RECORDING)
     sw_cx_max  = -1
     sw_cx_min  = float('inf')
     sw_peaked  = False
@@ -256,11 +301,12 @@ def main():
     sw_cx_prev = -1
 
     # Auto-déclenchement (ARMED)
-    is_ready           = False   # balle + putter stables depuis PUTTER_STABLE_SEC
-    absorb_start       = 0.0     # quand l'absorption du fond a commencé
-    armed_for_swing    = False   # fond absorbé, prêt pour le swing
-    putter_anchor      = None    # (cx, cy) demi-res quand putter stable
+    is_ready            = False
+    absorb_start        = 0.0
+    armed_for_swing     = False
+    putter_anchor       = None
     putter_stable_since = 0.0
+    last_head_pos       = None   # (cx, cy) demi-res, dernière tête YOLO
 
     rec_start  = 0.0
     preview_t  = 0.0
@@ -281,27 +327,25 @@ def main():
         gray_h = cv2.GaussianBlur(
             cv2.cvtColor(half, cv2.COLOR_BGR2GRAY), (21, 21), 0)
 
-        # ── Fond : mis à jour uniquement pendant la calibration ─────────────
+        # ── Fond ─────────────────────────────────────────────────────────────
         if bg_model is None:
             bg_model = gray_h.astype(np.float32)
         if state == State.READY:
             cv2.accumulateWeighted(gray_h.astype(np.float32), bg_model, 0.04)
             bg_frame_color = raw.copy()
 
-        # ── Diff depuis le fond figé ────────────────────────────────────────
+        # ── Diff (pour fallback motion en RECORDING) ──────────────────────
         diff    = np.abs(gray_h.astype(np.float32) - bg_model)
         _, th_img = cv2.threshold(diff.astype(np.uint8),
                                   MOTION_THRESH, 255, cv2.THRESH_BINARY)
         th_img  = cv2.dilate(th_img, None, iterations=3)
         cnts, _ = cv2.findContours(th_img, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
-        motion  = any(cv2.contourArea(c) >= MOTION_AREA for c in cnts)
 
-        # ── Machine d'états ────────────────────────────────────────────────
+        # ── Machine d'états ──────────────────────────────────────────────────
         if state == State.READY:
-            # Calibration automatique 3s → ARMED
             if now - calib_start >= CALIB_SECS:
-                bg_model = gray_h.astype(np.float32)  # gèle le fond
+                bg_model = gray_h.astype(np.float32)
                 state    = State.ARMED
                 is_ready = False
                 putter_anchor       = None
@@ -309,6 +353,7 @@ def main():
                 ball_rest           = None
                 kf_impact           = None
                 kf_impact_off       = float('inf')
+                last_head_pos       = None
                 print("[calib] fond figé → ARMED")
 
         elif state == State.ARMED:
@@ -316,9 +361,9 @@ def main():
             cw_h    = half.shape[1] // N_COLS
             cy_h    = half.shape[0] // 2
 
-            # ── Étape 1 : Détection balle (prérequis absolu) ─────────────
-            # La balle doit être détectée dans col 4 AVANT tout le reste.
-            ball_x_exp = cw_h * 3 + 15   # centre, bord gauche flush col 4
+            # ── Étape 1 : Balle en col 4 (prérequis absolu) ──────────────
+            # Rien ne démarre tant que la balle n'est pas détectée ici.
+            ball_x_exp = cw_h * 3 + 15
             ball_y_exp = cy_h
             br = 22
             region = half[max(0, ball_y_exp - br):ball_y_exp + br,
@@ -329,118 +374,108 @@ def main():
                 ball_rest = (kf_rest, (ball_x_exp, ball_y_exp))
             else:
                 ball_rest = None
-                # Pas de balle → réinitialise le timer putter (pas de READY sans balle)
                 if not is_ready:
                     putter_anchor       = None
                     putter_stable_since = 0.0
 
-            # ── Étape 2 : Détection putter (seulement si la balle est confirmée) ──
-            # Le putter ne peut être cherché que si la balle est déjà en place.
+            # ── Étape 2 : Tête putter YOLO (seulement si balle confirmée) ─
             putter_found = False
             if ball_present:
-                pz_x0 = cw_h * 3 + 11
-                pz_x1 = min(cw_h * 6, half.shape[1])
-                pz_y0 = max(cy_h - 55, 0)
-                pz_y1 = min(cy_h + 55, half.shape[0])
+                head_det = yolo_detect_head(half, yolo)
+                if head_det is not None:
+                    pcx, pcy, conf = head_det
+                    putter_found  = True
+                    last_head_pos = (pcx, pcy)
 
-                diff_pz = diff[pz_y0:pz_y1, pz_x0:pz_x1].astype(np.uint8)
-                _, th_pz = cv2.threshold(diff_pz, MOTION_THRESH, 255,
-                                         cv2.THRESH_BINARY)
-                th_pz = cv2.dilate(th_pz, None, iterations=2)
-                pz_cnts, _ = cv2.findContours(th_pz, cv2.RETR_EXTERNAL,
-                                              cv2.CHAIN_APPROX_SIMPLE)
-                pz_big = [c for c in pz_cnts
-                          if cv2.contourArea(c) >= PUTTER_MIN_AREA]
+                    if not is_ready:
+                        # Stabilité de la tête YOLO
+                        if putter_anchor is None:
+                            putter_anchor       = (pcx, pcy)
+                            putter_stable_since = now
+                        elif abs(pcx - putter_anchor[0]) > YOLO_STILL_PX:
+                            putter_anchor       = (pcx, pcy)
+                            putter_stable_since = now
 
-                if pz_big:
-                    biggest = max(pz_big, key=cv2.contourArea)
-                    Mpz = cv2.moments(biggest)
-                    if Mpz["m00"] > 0:
-                        pcx = int(Mpz["m10"] / Mpz["m00"]) + pz_x0
-                        pcy = int(Mpz["m01"] / Mpz["m00"]) + pz_y0
-                        putter_found = True
+                        if now - putter_stable_since >= PUTTER_STABLE_SEC:
+                            is_ready        = True
+                            absorb_start    = now
+                            armed_for_swing = False
+                            print(f"[armed] balle ✓ + tête YOLO stable "
+                                  f"(conf={conf:.2f}) → absorption fond")
 
-                        if not is_ready:
-                            # ── Phase stabilisation du putter ────────────────
-                            if putter_anchor is None:
-                                putter_anchor       = (pcx, pcy)
-                                putter_stable_since = now
-                            elif abs(pcx - putter_anchor[0]) > PUTTER_STILL_PX:
-                                putter_anchor       = (pcx, pcy)
-                                putter_stable_since = now
-
-                            # READY : balle présente + putter stable 2s
-                            if now - putter_stable_since >= PUTTER_STABLE_SEC:
-                                is_ready        = True
-                                absorb_start    = now
-                                armed_for_swing = False
-                                print("[armed] balle ✓ + putter stable → absorption fond")
-
-                        elif not armed_for_swing:
-                            # ── Phase absorption : fond absorbe le putter ────
-                            cv2.accumulateWeighted(
-                                gray_h.astype(np.float32), bg_model, 0.25)
-                            if now - absorb_start >= PUTTER_ABSORB_SEC:
-                                armed_for_swing = True
-                                print("[armed] READY – swing !")
-                        else:
-                            # ── Phase swing : putter en mouvement, balle confirmée ──
-                            if pcx >= cw_h * 4 and ball_rest is not None:
-                                state         = State.RECORDING
-                                rec_start     = now
-                                kf_frames     = [None] * N_COLS
-                                kf_offs       = [float('inf')] * N_COLS
-                                kf_impact     = None
-                                kf_impact_off = float('inf')
-                                ball_col_kfs  = [None] * len(BALL_COLS)
-                                ball_col_poss = [None] * len(BALL_COLS)
-                                ball_col_offs = [float('inf')] * len(BALL_COLS)
-                                sw_cx_max     = -1
-                                sw_cx_min     = float('inf')
-                                sw_peaked     = False
-                                sw_done       = False
-                                sw_cx_prev    = -1
-                                is_ready      = False
-                                armed_for_swing = False
-                                putter_anchor = None
-                                print(f"[rec] auto-trigger #{shot_count+1}"
-                                      f"  balle={'oui' if ball_rest else 'non'}")
+                    elif not armed_for_swing:
+                        # Absorption du putter dans le fond
+                        cv2.accumulateWeighted(
+                            gray_h.astype(np.float32), bg_model, 0.25)
+                        if now - absorb_start >= PUTTER_ABSORB_SEC:
+                            armed_for_swing = True
+                            print("[armed] READY – swing !")
+                    else:
+                        # Déclenchement swing : tête en mouvement vers col ≥ 4
+                        if pcx >= cw_h * 4 and ball_rest is not None:
+                            state         = State.RECORDING
+                            rec_start     = now
+                            kf_frames     = [None] * N_COLS
+                            kf_offs       = [float('inf')] * N_COLS
+                            kf_impact     = None
+                            kf_impact_off = float('inf')
+                            ball_col_kfs  = [None] * len(BALL_COLS)
+                            ball_col_poss = [None] * len(BALL_COLS)
+                            ball_col_offs = [float('inf')] * len(BALL_COLS)
+                            sw_cx_max     = -1
+                            sw_cx_min     = float('inf')
+                            sw_peaked     = False
+                            sw_done       = False
+                            sw_cx_prev    = -1
+                            is_ready      = False
+                            armed_for_swing = False
+                            putter_anchor = None
+                            print(f"[rec] auto-trigger #{shot_count + 1}")
 
             if not putter_found and not is_ready:
                 putter_anchor       = None
                 putter_stable_since = 0.0
 
         elif state == State.RECORDING:
-            sig_cnts = [c for c in cnts if cv2.contourArea(c) >= MOTION_AREA]
-            cw_h     = half.shape[1] // N_COLS
+            cw_h = half.shape[1] // N_COLS
+            cy_h = half.shape[0] // 2
 
-            # — Putter : strobe colonne par colonne (downswing seul) ———————
-            if sig_cnts:
-                best = max(sig_cnts, key=cv2.contourArea)
-                M = cv2.moments(best)
-                if M["m00"] > 0:
-                    cx_h = int(M["m10"] / M["m00"])
-                    col  = min(cx_h // cw_h, N_COLS - 1)
-                    off  = abs(cx_h - (col + 0.5) * cw_h)
+            # ── Position tête : YOLO en priorité, motion en fallback ───────
+            head_det = yolo_detect_head(half, yolo)
+            if head_det is not None:
+                cx_h = head_det[0]
+            else:
+                # Fallback : centroïde du plus grand blob de mouvement
+                sig_cnts = [c for c in cnts if cv2.contourArea(c) >= MOTION_AREA]
+                cx_h = None
+                if sig_cnts:
+                    best_c = max(sig_cnts, key=cv2.contourArea)
+                    M = cv2.moments(best_c)
+                    if M["m00"] > 0:
+                        cx_h = int(M["m10"] / M["m00"])
 
-                    if cx_h > sw_cx_max:
-                        sw_cx_max = cx_h
-                    if not sw_peaked:
-                        if sw_cx_prev >= 0 and (sw_cx_max - cx_h) > SWING_PEAK_DELTA:
-                            sw_peaked = True
-                            print(f"[swing] pic cx={sw_cx_max}")
-                    elif not sw_done:
-                        sw_cx_min = min(sw_cx_min, cx_h)
-                        if sw_cx_prev >= 0 and (cx_h - sw_cx_prev) > SWING_PEAK_DELTA:
-                            sw_done = True
-                    sw_cx_prev = cx_h
+            if cx_h is not None:
+                col = min(cx_h // cw_h, N_COLS - 1)
 
-                    # Col 4 = impact : putter au plus proche de la balle
-                    # Capturé dès que le putter bouge (pas besoin de pic détecté)
-                    # pour ne jamais rater la frame où balle + putter sont ensemble.
+                # Suivi directionnel (pic backswing → downswing)
+                if cx_h > sw_cx_max:
+                    sw_cx_max = cx_h
+                if not sw_peaked:
+                    if sw_cx_prev >= 0 and (sw_cx_max - cx_h) > SWING_PEAK_DELTA:
+                        sw_peaked = True
+                        print(f"[swing] pic cx={sw_cx_max}")
+                elif not sw_done:
+                    sw_cx_min = min(sw_cx_min, cx_h)
+                    if sw_cx_prev >= 0 and (cx_h - sw_cx_prev) > SWING_PEAK_DELTA:
+                        sw_done = True
+                sw_cx_prev = cx_h
+
+                # ── Capture par colonne : tête la plus près du centre ─────
+                if col == 3:
+                    # Col 4 (impact) : tête la plus proche de la balle
+                    # ET balle encore visible dans le frame
                     if ball_rest is not None:
                         impact_off = abs(cx_h - ball_rest[1][0])
-                        # Vérifier que la balle est encore visible dans ce frame
                         bx_e = ball_rest[1][0]
                         by_e = ball_rest[1][1]
                         br_c = 18
@@ -448,26 +483,24 @@ def main():
                                         max(0, bx_e - br_c):bx_e + br_c]
                         ball_visible = (ball_rgn.size > 0 and
                                         int(np.sum(np.all(ball_rgn > 190, axis=2))) >= 15)
-                        # Préférer les frames où la balle est encore en place
+                        # Pénalité si balle déjà partie
                         adj_off = impact_off if ball_visible else impact_off + 500
                         if adj_off < kf_impact_off:
                             kf_impact_off = adj_off
                             kf_impact     = half.copy()
+                else:
+                    # Cols 1-3 et 5-7 : meilleure frame = tête au centre de la col
+                    col_center = (col + 0.5) * cw_h
+                    off = abs(cx_h - col_center)
+                    if off < kf_offs[col]:
+                        kf_offs[col]   = off
+                        kf_frames[col] = half.copy()
 
-                    # Autres colonnes : seulement pendant la descente confirmée
-                    if sw_peaked and not sw_done:
-                        if col != 3:
-                            if off < kf_offs[col]:
-                                kf_offs[col]   = off
-                                kf_frames[col] = half.copy()
-
-            # — Balle : scan luminosité dans col 1 après impact ———————————
-            # La balle (ronde et blanche) laisse un patch très lumineux.
+            # ── Balle post-impact : scan luminosité en col 1 ──────────────
             if sw_peaked and ball_rest is not None:
                 col0_y0 = max(0, cy_h - 30)
                 col0_y1 = min(half.shape[0], cy_h + 30)
-                col0_x1 = cw_h  # toute la largeur de col 1
-                roi = half[col0_y0:col0_y1, 0:col0_x1]
+                roi = half[col0_y0:col0_y1, 0:cw_h]
                 white_px = np.all(roi > 200, axis=2)
                 n_white  = int(np.sum(white_px))
                 if n_white >= 20:
@@ -480,11 +513,10 @@ def main():
                         ball_col_kfs[0]  = half.copy()
                         ball_col_poss[0] = (bx_b, by_b)
 
-            # — Fin d'enregistrement ————————————————————————————————————————
+            # ── Fin d'enregistrement ────────────────────────────────────────
             if now - rec_start >= RECORD_SECS:
-                # Col 4 = impact (frame où cx putter est le plus proche de la balle)
                 kf_frames[3] = kf_impact
-                # Cols 1 et 7 : masquées si tête n'a pas atteint leur centre
+                # Masquer cols 1 et 7 si la tête n'y est pas passée
                 if sw_cx_max < 6.5 * cw_h:
                     kf_frames[6] = None
                 if sw_cx_min > 0.5 * cw_h:
@@ -492,7 +524,7 @@ def main():
 
                 shot_count += 1
                 composite = make_training_frame(
-                    kf_frames, ball_col_kfs, ball_col_poss,
+                    kf_frames, ball_rest, ball_col_kfs, ball_col_poss,
                     W, H, bg_frame=bg_frame_color)
                 last_path = save_shot(
                     kf_frames, composite, shot_count,
@@ -504,7 +536,6 @@ def main():
 
         elif state == State.PREVIEW:
             if now - preview_t >= PREVIEW_SECS:
-                # Retour à ARMED (fond conservé, re-détecte balle + putter)
                 state               = State.ARMED
                 is_ready            = False
                 armed_for_swing     = False
@@ -514,7 +545,7 @@ def main():
                 kf_impact           = None
                 kf_impact_off       = float('inf')
 
-        # ── Affichage ─────────────────────────────────────────────────────
+        # ── Affichage ─────────────────────────────────────────────────────────
         if state == State.PREVIEW and composite is not None:
             top_panel = composite
         else:
@@ -525,22 +556,29 @@ def main():
 
             if state in (State.READY, State.ARMED):
                 ball_full = None
-                if state == State.ARMED and ball_rest is not None:
+                head_full = None
+                if state == State.ARMED:
                     sx_d = W / (W // 2)
                     sy_d = H / (H // 2)
-                    ball_full = (int(ball_rest[1][0] * sx_d),
-                                 int(ball_rest[1][1] * sy_d))
-                draw_guide_overlay(live, W, H, ball_pos_fullres=ball_full)
+                    if ball_rest is not None:
+                        ball_full = (int(ball_rest[1][0] * sx_d),
+                                     int(ball_rest[1][1] * sy_d))
+                    if last_head_pos is not None:
+                        head_full = (int(last_head_pos[0] * sx_d),
+                                     int(last_head_pos[1] * sy_d))
+                draw_guide_overlay(live, W, H,
+                                   ball_pos_fullres=ball_full,
+                                   head_pos_fullres=head_full)
 
-            # Cercle vert = balle confirmée
+            # Cercle balle confirmée
             if state == State.ARMED and ball_rest is not None:
                 sx_d = W / (W // 2);  sy_d = H / (H // 2)
                 pr   = (int(ball_rest[1][0] * sx_d),
                         int(ball_rest[1][1] * sy_d))
-                cv2.circle(live, pr, BALL_CROP_R + 4, (0, 0, 0),       3, cv2.LINE_AA)
-                cv2.circle(live, pr, BALL_CROP_R + 4, (255, 140, 0), 2, cv2.LINE_AA)  # bleu
+                cv2.circle(live, pr, BALL_CROP_R + 4, (0, 0, 0),    3, cv2.LINE_AA)
+                cv2.circle(live, pr, BALL_CROP_R + 4, (255, 140, 0), 2, cv2.LINE_AA)
 
-            # Visualisation zone putter (barre de stabilité)
+            # Barre stabilité tête putter
             if state == State.ARMED and putter_anchor is not None:
                 sx_d = W / (W // 2);  sy_d = H / (H // 2)
                 pax  = int(putter_anchor[0] * sx_d)
@@ -549,16 +587,13 @@ def main():
                 clr  = GREEN if is_ready else ORANGE
                 cv2.circle(live, (pax, pay), 14, (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.circle(live, (pax, pay), 14, clr,       2, cv2.LINE_AA)
-                # Petite barre de progression stabilité
-                bw = 60
-                bh = 6
+                bw = 60;  bh = 6
                 bx0 = pax - bw // 2;  by0 = pay + 20
                 cv2.rectangle(live, (bx0, by0), (bx0 + bw, by0 + bh),
                               (60, 60, 60), -1)
                 cv2.rectangle(live, (bx0, by0),
                               (bx0 + int(bw * stab), by0 + bh), clr, -1)
 
-            # READY petit, blanc, coin bas-droit
             if state == State.ARMED and is_ready:
                 put_text(live, "READY", (W - 88, H - 14),
                          scale=0.6, color=WHITE, bold=True)
@@ -578,13 +613,13 @@ def main():
                 stab_pct = int(min(1.0, (now - putter_stable_since)
                                    / PUTTER_STABLE_SEC) * 100)
                 bc = (80, 80, 0)
-                bt = f"  Posez le putter… stabilité {stab_pct}%  "
+                bt = f"  Balle ✓  Tête YOLO détectée – stabilité {stab_pct}%  "
             elif ball_rest:
                 bc = (80, 50, 0)
                 bt = "  Balle ✓  –  posez le putter dans la zone  "
             else:
                 bc = DIM_COLOR
-                bt = "  Posez la balle (bord gauche col 4) et le putter  "
+                bt = "  Posez la balle (bord gauche col 4) puis le putter  "
         elif state == State.RECORDING:
             rem  = max(0.0, RECORD_SECS - (now - rec_start))
             prog = 1.0 - rem / RECORD_SECS
@@ -611,15 +646,16 @@ def main():
         if key in (ord('q'), 27):
             break
         elif key == ord('r'):
-            bg_model    = None
-            state       = State.READY
-            calib_start = now
-            ball_rest     = None
-            kf_impact     = None
-            kf_impact_off = float('inf')
-            is_ready      = False
+            bg_model            = None
+            state               = State.READY
+            calib_start         = now
+            ball_rest           = None
+            kf_impact           = None
+            kf_impact_off       = float('inf')
+            is_ready            = False
             putter_anchor       = None
             putter_stable_since = 0.0
+            last_head_pos       = None
             print("[bg] reset calibration")
 
     cap.release()
