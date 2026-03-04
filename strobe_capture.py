@@ -42,8 +42,8 @@ MOTION_THRESH = 25
 MOTION_AREA   = 80
 SWING_PEAK_DELTA = 5
 BALL_CROP_R      = 30
-# Indices 0-based des colonnes où capturer la balle (cols 1, 2, 3 en 1-indexé)
-BALL_COLS = (2, 1, 0)   # col 3 → col 2 → col 1 (de droite à gauche)
+# Seule colonne où afficher la balle : col 1 (index 0 en 0-based)
+BALL_COLS = (0,)
 
 # ── Palette ────────────────────────────────────────────────────────────────────
 DIM_COLOR  = (40, 40, 40)
@@ -255,12 +255,13 @@ def main():
     # Putter : keyframes par colonne
     kf_frames  = [None] * N_COLS
     kf_offs    = [float('inf')] * N_COLS
+    kf_address = None   # frame calme (ARMED) : balle + putter à l'adresse → col 4
 
-    # Balle : position de repos (ref) + keyframes colonnes 3, 2, 1
-    ball_rest      = None               # (kf_halfres, (cx,cy)) depuis ARMED
-    ball_col_kfs   = [None] * 3        # [kf_col3, kf_col2, kf_col1]
-    ball_col_poss  = [None] * 3        # [(cx,cy), …] halfres
-    ball_col_offs  = [float('inf')] * 3
+    # Balle : position de repos (ref) + keyframe col 1 uniquement
+    ball_rest      = None                        # (kf_halfres, (cx,cy)) depuis ARMED
+    ball_col_kfs   = [None] * len(BALL_COLS)
+    ball_col_poss  = [None] * len(BALL_COLS)
+    ball_col_offs  = [float('inf')] * len(BALL_COLS)
 
     kf_rest    = None   # dernière frame demi-res calme (ARMED)
 
@@ -332,11 +333,12 @@ def main():
             if motion:
                 state         = State.RECORDING
                 rec_start     = now
+                kf_address    = kf_rest            # col 4 = adresse (avant swing)
                 kf_frames     = [None] * N_COLS
                 kf_offs       = [float('inf')] * N_COLS
-                ball_col_kfs  = [None] * 3
-                ball_col_poss = [None] * 3
-                ball_col_offs = [float('inf')] * 3
+                ball_col_kfs  = [None] * len(BALL_COLS)
+                ball_col_poss = [None] * len(BALL_COLS)
+                ball_col_offs = [float('inf')] * len(BALL_COLS)
                 sw_cx_max     = -1
                 sw_cx_min     = float('inf')
                 sw_peaked     = False
@@ -357,14 +359,9 @@ def main():
                     cx_h = int(M["m10"] / M["m00"])
                     col  = min(cx_h // cw_h, N_COLS - 1)
 
-                    # Col 4 (index 3) = impact : offset par rapport à la balle
-                    # Toutes les autres : offset par rapport au centre géométrique
-                    if col == 3:
-                        ball_rest_x = (ball_rest[1][0] if ball_rest
-                                       else half.shape[1] // 2)
-                        off = abs(cx_h - ball_rest_x)
-                    else:
-                        off = abs(cx_h - (col + 0.5) * cw_h)
+                    # Col 4 (index 3) est réservée à la frame d'adresse (kf_address).
+                    # On ne l'écrase jamais pendant le downswing.
+                    off = abs(cx_h - (col + 0.5) * cw_h)
 
                     # Suivi directionnel
                     if cx_h > sw_cx_max:
@@ -380,7 +377,7 @@ def main():
                             print(f"[swing] follow-through terminé, cx={cx_h}")
                     sw_cx_prev = cx_h
 
-                    if sw_peaked and not sw_done:
+                    if sw_peaked and not sw_done and col != 3:
                         if off < kf_offs[col]:
                             kf_offs[col]   = off
                             kf_frames[col] = half.copy()
@@ -414,6 +411,9 @@ def main():
 
             # — Fin d'enregistrement ————————————————————————————————————————
             if now - rec_start >= RECORD_SECS:
+                # Col 4 = frame d'adresse (balle + putter avant swing)
+                kf_frames[3] = kf_address
+
                 # Cols 1 et 7 masquées si tête n'a pas atteint le centre
                 if sw_cx_max < 6.5 * cw_h:
                     kf_frames[6] = None
@@ -516,9 +516,10 @@ def main():
             state         = State.COUNTDOWN
             cd_start      = now
             ball_rest     = None
-            ball_col_kfs  = [None] * 3
-            ball_col_poss = [None] * 3
-            ball_col_offs = [float('inf')] * 3
+            kf_address    = None
+            ball_col_kfs  = [None] * len(BALL_COLS)
+            ball_col_poss = [None] * len(BALL_COLS)
+            ball_col_offs = [float('inf')] * len(BALL_COLS)
             kf_rest       = None
         elif key == ord('r'):
             bg_model = None
