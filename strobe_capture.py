@@ -217,7 +217,7 @@ def save_shot(kf_frames, composite, n,
 
     print(f"[save] #{n:03d}  → {comp_path}  "
           f"({saved_raw} putter, "
-          f"{'impact+sortie' if kf_impact and kf_exit else 'balle partielle'})")
+          f"{'impact+sortie' if kf_impact is not None and kf_exit is not None else 'balle partielle'})")
     return comp_path
 
 
