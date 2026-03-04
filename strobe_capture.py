@@ -43,7 +43,8 @@ OUT_DIR       = "captures"
 RAW_DIR       = os.path.join(OUT_DIR, "raw")
 MOTION_THRESH = 25
 MOTION_AREA   = 80      # aire minimale pour détecter un mouvement
-BALL_MIN_AREA = 8       # aire min d'un contour considéré comme balle (demi-res)
+SWING_PEAK_DELTA = 5    # pixels demi-res pour confirmer le changement de direction
+BALL_CROP_PAD    = 50   # demi-côté du crop balle collé sur le strobe (pixels pleine-res)
 
 # ── Palette ────────────────────────────────────────────────────────────────────
 DIM_COLOR  = (40, 40, 40)
@@ -176,31 +177,36 @@ def make_ball_panel(kf_impact, kf_exit, pos_impact, pos_exit, W: int, H: int) ->
     return panel
 
 
-def make_training_frame(kf_frames, kf_impact, kf_exit, W: int, H: int,
-                        pos_rest=None, pos_impact=None, pos_exit=None) -> np.ndarray:
+def _paste_ball_crop(canvas, kf_halfres, pos_halfres, W, H):
+    """Colle un crop centré sur la balle (pos en demi-res) sur canvas pleine-res."""
+    if kf_halfres is None or pos_halfres is None:
+        return
+    frame = cv2.resize(kf_halfres, (W, H))
+    sx = W / (W // 2);  sy = H / (H // 2)
+    cx = int(pos_halfres[0] * sx);  cy = int(pos_halfres[1] * sy)
+    x0 = max(0, cx - BALL_CROP_PAD);  y0 = max(0, cy - BALL_CROP_PAD)
+    x1 = min(W, cx + BALL_CROP_PAD);  y1 = min(H, cy + BALL_CROP_PAD)
+    canvas[y0:y1, x0:x1] = frame[y0:y1, x0:x1]
+
+
+def make_training_frame(kf_frames, kf_rest, kf_exit, W: int, H: int,
+                        pos_rest=None, pos_exit=None) -> np.ndarray:
     """
-    Image d'entraînement unique (W×H) : strobe putter + balle blanche fusionnée.
-    Flèche depuis la position de repos de la balle (pos_rest > pos_impact > absent).
-    Positions en coordonnées demi-résolution.
+    Image d'entraînement W×H : strobe putter + crop balle au repos + crop balle sortie.
+    Flèche depuis pos_rest (balle immobile avant le coup) vers pos_exit.
+    Toutes les positions en coordonnées demi-résolution.
     """
     canvas = make_strobe(kf_frames, W, H)
 
-    for kf in [kf_impact, kf_exit]:
-        if kf is None:
-            continue
-        frame = cv2.resize(kf, (W, H))
-        hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask  = ((hsv[:, :, 1] < 50) & (hsv[:, :, 2] > 200)).astype(np.uint8) * 255
-        mask  = cv2.dilate(mask, None, iterations=1)
-        canvas[mask > 0] = frame[mask > 0]
+    # Colle les crops propres (aucun pixel parasite)
+    _paste_ball_crop(canvas, kf_rest, pos_rest, W, H)
+    _paste_ball_crop(canvas, kf_exit, pos_exit, W, H)
 
-    # Flèche trajectoire balle — demi-res → pleine res ×2
-    sx = W / (W // 2)
-    sy = H / (H // 2)
-    origin = pos_rest if pos_rest is not None else pos_impact
-    if origin and pos_exit:
-        p0 = (int(origin[0]   * sx), int(origin[1]   * sy))
-        p1 = (int(pos_exit[0] * sx), int(pos_exit[1] * sy))
+    # Flèche trajectoire
+    sx = W / (W // 2);  sy = H / (H // 2)
+    if pos_rest and pos_exit:
+        p0 = (int(pos_rest[0] * sx),  int(pos_rest[1] * sy))
+        p1 = (int(pos_exit[0] * sx),  int(pos_exit[1] * sy))
         cv2.circle(canvas, p0, 12, (0, 0, 0),  3, cv2.LINE_AA)
         cv2.circle(canvas, p0, 12, GREEN,       2, cv2.LINE_AA)
         cv2.arrowedLine(canvas, p0, p1, (0, 0, 0), 4, cv2.LINE_AA, tipLength=0.10)
@@ -221,13 +227,13 @@ def make_composite(kf_frames, W, H,
 
 # ── Sauvegarde ────────────────────────────────────────────────────────────────
 def save_shot(kf_frames, composite, n,
-              kf_impact=None, kf_exit=None, W=1280, H=720,
-              pos_rest=None, pos_impact=None, pos_exit=None) -> str:
+              kf_rest=None, kf_exit=None, W=1280, H=720,
+              pos_rest=None, pos_exit=None) -> str:
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(RAW_DIR, exist_ok=True)
     tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Composite complet (strobe + balle)
+    # Training image (déjà construite dans main)
     comp_path = os.path.join(OUT_DIR, f"strobe_{tag}.png")
     cv2.imwrite(comp_path, composite)
 
@@ -240,26 +246,24 @@ def save_shot(kf_frames, composite, n,
                     [cv2.IMWRITE_JPEG_QUALITY, 95])
         saved_raw += 1
 
-    # Frames balle (pleine résolution, non rognées)
-    if kf_impact is not None:
-        cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_impact.jpg"),
-                    cv2.resize(kf_impact, (W, H)),
+    # Frame balle au repos + sortie (pleine résolution)
+    if kf_rest is not None:
+        cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_rest.jpg"),
+                    cv2.resize(kf_rest, (W, H)),
                     [cv2.IMWRITE_JPEG_QUALITY, 95])
     if kf_exit is not None:
         cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_exit.jpg"),
                     cv2.resize(kf_exit, (W, H)),
                     [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-    # Image d'entraînement unifiée (strobe putter + balle fusionnée + flèche)
-    training = make_training_frame(kf_frames, kf_impact, kf_exit, W, H,
-                                   pos_rest=pos_rest, pos_impact=pos_impact,
-                                   pos_exit=pos_exit)
-    cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_training.jpg"), training,
+    # Copie training dans raw/
+    cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_training.jpg"), composite,
                 [cv2.IMWRITE_JPEG_QUALITY, 95])
 
     print(f"[save] #{n:03d}  → {comp_path}  "
-          f"({saved_raw} putter, "
-          f"{'impact+sortie' if kf_impact is not None and kf_exit is not None else 'balle partielle'})")
+          f"({saved_raw} cols putter, "
+          f"repos={'oui' if kf_rest is not None else 'non'}, "
+          f"sortie={'oui' if kf_exit is not None else 'non'})")
     return comp_path
 
 
@@ -277,12 +281,16 @@ def main():
     kf_frames  = [None] * N_COLS
     kf_offs    = [float('inf')] * N_COLS
     # Balle : 2 keyframes
-    kf_impact  = None   # frame demi-res à l'impact
+    kf_rest    = None   # dernière frame calme (balle au repos, ARMED)
     kf_exit    = None   # frame demi-res à la sortie
-    pos_rest   = None   # (cx, cy) demi-res balle au repos (ARMED)
-    pos_impact = None   # (cx, cy) demi-res à l'impact
-    pos_exit   = None   # (cx, cy) demi-res à la sortie
-    max_ball_d = 0.0    # distance maximale balle vue depuis impact
+    pos_rest   = None   # (cx, cy) demi-res balle au repos
+    pos_exit   = None   # (cx, cy) demi-res balle à la sortie
+    max_ball_d = 0.0    # distance maximale balle vue depuis pos_rest
+    # Suivi directionnel du putter (downswing droite→gauche uniquement)
+    sw_cx_max  = -1     # cx le plus à droite vu en demi-res
+    sw_peaked  = False  # True une fois passé le pic backswing
+    sw_done    = False  # True une fois reparti à droite (follow-through fini)
+    sw_cx_prev = -1     # cx précédent putter
 
     cd_start   = 0.0
     rec_start  = 0.0
@@ -326,16 +334,18 @@ def main():
                 state    = State.ARMED
 
         elif state == State.ARMED:
-            # Détecte la balle blanche au repos (blob blanc sur fond sombre)
+            # Mémorise la dernière frame calme (balle au repos)
+            kf_rest = half.copy()
+            # Détecte la position de la balle blanche (blob clair sur fond vert)
             hsv_h   = cv2.cvtColor(half, cv2.COLOR_BGR2HSV)
             bmask   = ((hsv_h[:, :, 1] < 50) &
                        (hsv_h[:, :, 2] > 200)).astype(np.uint8) * 255
             bcnts, _ = cv2.findContours(bmask, cv2.RETR_EXTERNAL,
                                         cv2.CHAIN_APPROX_SIMPLE)
-            bcnts   = [c for c in bcnts if 5 <= cv2.contourArea(c) <= 800]
+            bcnts = [c for c in bcnts if 5 <= cv2.contourArea(c) <= 800]
             if bcnts:
-                bc  = max(bcnts, key=cv2.contourArea)
-                Mb  = cv2.moments(bc)
+                bc = max(bcnts, key=cv2.contourArea)
+                Mb = cv2.moments(bc)
                 if Mb["m00"] > 0:
                     pos_rest = (int(Mb["m10"] / Mb["m00"]),
                                 int(Mb["m01"] / Mb["m00"]))
@@ -345,18 +355,20 @@ def main():
                 rec_start  = now
                 kf_frames  = [None] * N_COLS
                 kf_offs    = [float('inf')] * N_COLS
-                kf_impact  = None
                 kf_exit    = None
-                pos_impact = None
                 pos_exit   = None
                 max_ball_d = 0.0
+                sw_cx_max  = -1
+                sw_peaked  = False
+                sw_done    = False
+                sw_cx_prev = -1
                 print(f"[rec] coup #{shot_count + 1} déclenché"
                       f"  repos balle={'oui' if pos_rest else 'non détecté'}")
 
         elif state == State.RECORDING:
             sig_cnts = [c for c in cnts if cv2.contourArea(c) >= MOTION_AREA]
 
-            # — Strobe putter : keyframe par colonne —
+            # — Strobe putter : keyframe par colonne (downswing droite→gauche seul) —
             if sig_cnts:
                 best = max(sig_cnts, key=cv2.contourArea)
                 M = cv2.moments(best)
@@ -365,26 +377,37 @@ def main():
                     cw_h = half.shape[1] // N_COLS
                     col  = min(cx_h // cw_h, N_COLS - 1)
                     off  = abs(cx_h - (col + 0.5) * cw_h)
-                    if off < kf_offs[col]:
-                        kf_offs[col]   = off
-                        kf_frames[col] = half.copy()
 
-            # — Balle : plus petit contour significatif (séparation putter/balle) —
-            if sig_cnts:
-                ball_c = min(sig_cnts, key=cv2.contourArea)
-                Mb = cv2.moments(ball_c)
-                if Mb["m00"] > 0:
-                    bx = int(Mb["m10"] / Mb["m00"])
-                    by = int(Mb["m01"] / Mb["m00"])
+                    # Suivi directionnel
+                    if cx_h > sw_cx_max:
+                        sw_cx_max = cx_h
+                    if not sw_peaked:
+                        # Pic détecté quand on revient de SWING_PEAK_DELTA px
+                        if sw_cx_prev >= 0 and (sw_cx_max - cx_h) > SWING_PEAK_DELTA:
+                            sw_peaked = True
+                            print(f"[swing] pic à cx={sw_cx_max}, downswing")
+                    elif not sw_done:
+                        # Fin du downswing : repart à droite
+                        if sw_cx_prev >= 0 and (cx_h - sw_cx_prev) > SWING_PEAK_DELTA:
+                            sw_done = True
+                            print(f"[swing] follow-through terminé, cx={cx_h}")
+                    sw_cx_prev = cx_h
 
-                    if kf_impact is None:
-                        # Première frame avec mouvement = impact
-                        kf_impact  = half.copy()
-                        pos_impact = (bx, by)
-                    else:
-                        # Mise à jour de la sortie si la balle est plus loin
-                        dist = ((bx - pos_impact[0]) ** 2 +
-                                (by - pos_impact[1]) ** 2) ** 0.5
+                    # N'enregistre que pendant le downswing
+                    if sw_peaked and not sw_done:
+                        if off < kf_offs[col]:
+                            kf_offs[col]   = off
+                            kf_frames[col] = half.copy()
+
+            # — Balle : contour le plus éloigné de pos_rest (balle qui roule) —
+            if sig_cnts and pos_rest is not None:
+                for c in sig_cnts:
+                    Mb = cv2.moments(c)
+                    if Mb["m00"] > 0:
+                        bx = int(Mb["m10"] / Mb["m00"])
+                        by = int(Mb["m01"] / Mb["m00"])
+                        dist = ((bx - pos_rest[0]) ** 2 +
+                                (by - pos_rest[1]) ** 2) ** 0.5
                         if dist > max_ball_d:
                             max_ball_d = dist
                             kf_exit    = half.copy()
@@ -393,11 +416,11 @@ def main():
             # — Fin d'enregistrement —
             if now - rec_start >= RECORD_SECS:
                 shot_count += 1
-                composite  = make_training_frame(kf_frames, kf_impact, kf_exit,
-                                                 W, H, pos_rest, pos_impact, pos_exit)
+                composite  = make_training_frame(kf_frames, kf_rest, kf_exit,
+                                                 W, H, pos_rest, pos_exit)
                 last_path  = save_shot(kf_frames, composite, shot_count,
-                                       kf_impact, kf_exit, W, H,
-                                       pos_rest, pos_impact, pos_exit)
+                                       kf_rest, kf_exit, W, H,
+                                       pos_rest, pos_exit)
                 state      = State.PREVIEW
                 preview_t  = now
 
