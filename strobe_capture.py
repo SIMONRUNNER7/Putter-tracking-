@@ -378,10 +378,32 @@ def main():
                     putter_anchor       = None
                     putter_stable_since = 0.0
 
-            # ── Étape 2 : Tête putter YOLO (seulement si balle confirmée) ─
+            # ── Étape 2 : Tête putter (seulement si balle confirmée) ─────
+            # YOLO en priorité ; si échec → blob de mouvement dans la zone putter.
             putter_found = False
             if ball_present:
                 head_det = yolo_detect_head(half, yolo)
+                if head_det is None:
+                    # Fallback : plus grand blob dans la zone putter (cols 4-6)
+                    pz_x0 = cw_h * 3 + 11
+                    pz_x1 = min(cw_h * 6, half.shape[1])
+                    pz_y0 = max(cy_h - 55, 0)
+                    pz_y1 = min(cy_h + 55, half.shape[0])
+                    diff_pz = diff[pz_y0:pz_y1, pz_x0:pz_x1].astype(np.uint8)
+                    _, th_pz = cv2.threshold(diff_pz, MOTION_THRESH, 255,
+                                             cv2.THRESH_BINARY)
+                    th_pz = cv2.dilate(th_pz, None, iterations=2)
+                    pz_cnts, _ = cv2.findContours(th_pz, cv2.RETR_EXTERNAL,
+                                                  cv2.CHAIN_APPROX_SIMPLE)
+                    pz_big = [c for c in pz_cnts if cv2.contourArea(c) >= 300]
+                    if pz_big:
+                        biggest = max(pz_big, key=cv2.contourArea)
+                        Mpz = cv2.moments(biggest)
+                        if Mpz["m00"] > 0:
+                            fx = int(Mpz["m10"] / Mpz["m00"]) + pz_x0
+                            fy = int(Mpz["m01"] / Mpz["m00"]) + pz_y0
+                            head_det = (fx, fy, 0.0)   # conf 0 = fallback motion
+
                 if head_det is not None:
                     pcx, pcy, conf = head_det
                     putter_found  = True
