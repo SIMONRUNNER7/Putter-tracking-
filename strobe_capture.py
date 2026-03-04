@@ -176,6 +176,28 @@ def make_ball_panel(kf_impact, kf_exit, pos_impact, pos_exit, W: int, H: int) ->
     return panel
 
 
+def make_training_frame(kf_frames, kf_impact, kf_exit, W: int, H: int) -> np.ndarray:
+    """
+    Image d'entraînement unique (W×H) : strobe putter + balle blanche fusionnée.
+    Extrait les pixels blancs/brillants des frames balle (balle de golf blanche)
+    et les pose par-dessus le strobe putter.
+    Sauvegardée en _training.jpg — annotable avec annotate_unified.py.
+    """
+    canvas = make_strobe(kf_frames, W, H)
+
+    for kf in [kf_impact, kf_exit]:
+        if kf is None:
+            continue
+        frame = cv2.resize(kf, (W, H))
+        hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        # Pixels blancs : faible saturation + forte luminosité
+        mask  = ((hsv[:, :, 1] < 50) & (hsv[:, :, 2] > 200)).astype(np.uint8) * 255
+        mask  = cv2.dilate(mask, None, iterations=1)
+        canvas[mask > 0] = frame[mask > 0]
+
+    return canvas
+
+
 def make_composite(kf_frames, W, H,
                    kf_impact=None, kf_exit=None,
                    pos_impact=None, pos_exit=None) -> np.ndarray:
@@ -214,6 +236,11 @@ def save_shot(kf_frames, composite, n,
         cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_exit.jpg"),
                     cv2.resize(kf_exit, (W, H)),
                     [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+    # Image d'entraînement unifiée (putter strobe + balle fusionnée)
+    training = make_training_frame(kf_frames, kf_impact, kf_exit, W, H)
+    cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_training.jpg"), training,
+                [cv2.IMWRITE_JPEG_QUALITY, 95])
 
     print(f"[save] #{n:03d}  → {comp_path}  "
           f"({saved_raw} putter, "
