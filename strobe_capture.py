@@ -176,12 +176,12 @@ def make_ball_panel(kf_impact, kf_exit, pos_impact, pos_exit, W: int, H: int) ->
     return panel
 
 
-def make_training_frame(kf_frames, kf_impact, kf_exit, W: int, H: int) -> np.ndarray:
+def make_training_frame(kf_frames, kf_impact, kf_exit, W: int, H: int,
+                        pos_rest=None, pos_impact=None, pos_exit=None) -> np.ndarray:
     """
     Image d'entraînement unique (W×H) : strobe putter + balle blanche fusionnée.
-    Extrait les pixels blancs/brillants des frames balle (balle de golf blanche)
-    et les pose par-dessus le strobe putter.
-    Sauvegardée en _training.jpg — annotable avec annotate_unified.py.
+    Flèche depuis la position de repos de la balle (pos_rest > pos_impact > absent).
+    Positions en coordonnées demi-résolution.
     """
     canvas = make_strobe(kf_frames, W, H)
 
@@ -190,10 +190,22 @@ def make_training_frame(kf_frames, kf_impact, kf_exit, W: int, H: int) -> np.nda
             continue
         frame = cv2.resize(kf, (W, H))
         hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        # Pixels blancs : faible saturation + forte luminosité
         mask  = ((hsv[:, :, 1] < 50) & (hsv[:, :, 2] > 200)).astype(np.uint8) * 255
         mask  = cv2.dilate(mask, None, iterations=1)
         canvas[mask > 0] = frame[mask > 0]
+
+    # Flèche trajectoire balle — demi-res → pleine res ×2
+    sx = W / (W // 2)
+    sy = H / (H // 2)
+    origin = pos_rest if pos_rest is not None else pos_impact
+    if origin and pos_exit:
+        p0 = (int(origin[0]   * sx), int(origin[1]   * sy))
+        p1 = (int(pos_exit[0] * sx), int(pos_exit[1] * sy))
+        cv2.circle(canvas, p0, 12, (0, 0, 0),  3, cv2.LINE_AA)
+        cv2.circle(canvas, p0, 12, GREEN,       2, cv2.LINE_AA)
+        cv2.arrowedLine(canvas, p0, p1, (0, 0, 0), 4, cv2.LINE_AA, tipLength=0.10)
+        cv2.arrowedLine(canvas, p0, p1, ACCENT,    2, cv2.LINE_AA, tipLength=0.10)
+        cv2.circle(canvas, p1, 8, ORANGE, 2, cv2.LINE_AA)
 
     return canvas
 
@@ -209,7 +221,8 @@ def make_composite(kf_frames, W, H,
 
 # ── Sauvegarde ────────────────────────────────────────────────────────────────
 def save_shot(kf_frames, composite, n,
-              kf_impact=None, kf_exit=None, W=1280, H=720) -> str:
+              kf_impact=None, kf_exit=None, W=1280, H=720,
+              pos_rest=None, pos_impact=None, pos_exit=None) -> str:
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(RAW_DIR, exist_ok=True)
     tag = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -237,8 +250,10 @@ def save_shot(kf_frames, composite, n,
                     cv2.resize(kf_exit, (W, H)),
                     [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-    # Image d'entraînement unifiée (putter strobe + balle fusionnée)
-    training = make_training_frame(kf_frames, kf_impact, kf_exit, W, H)
+    # Image d'entraînement unifiée (strobe putter + balle fusionnée + flèche)
+    training = make_training_frame(kf_frames, kf_impact, kf_exit, W, H,
+                                   pos_rest=pos_rest, pos_impact=pos_impact,
+                                   pos_exit=pos_exit)
     cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_training.jpg"), training,
                 [cv2.IMWRITE_JPEG_QUALITY, 95])
 
@@ -252,13 +267,9 @@ def save_shot(kf_frames, composite, n,
 def main():
     cap, W, H, cam_fps = open_camera()
 
-    # Hauteur totale : strobe (H) + panneau balle (H)
-    BALL_H = H
-    WIN_H  = H + BALL_H
-
     WIN = "Strobe Capture"
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WIN, W, WIN_H)
+    cv2.resizeWindow(WIN, W, H)
 
     state      = State.READY
     bg_model   = None
@@ -268,6 +279,7 @@ def main():
     # Balle : 2 keyframes
     kf_impact  = None   # frame demi-res à l'impact
     kf_exit    = None   # frame demi-res à la sortie
+    pos_rest   = None   # (cx, cy) demi-res balle au repos (ARMED)
     pos_impact = None   # (cx, cy) demi-res à l'impact
     pos_exit   = None   # (cx, cy) demi-res à la sortie
     max_ball_d = 0.0    # distance maximale balle vue depuis impact
@@ -314,6 +326,20 @@ def main():
                 state    = State.ARMED
 
         elif state == State.ARMED:
+            # Détecte la balle blanche au repos (blob blanc sur fond sombre)
+            hsv_h   = cv2.cvtColor(half, cv2.COLOR_BGR2HSV)
+            bmask   = ((hsv_h[:, :, 1] < 50) &
+                       (hsv_h[:, :, 2] > 200)).astype(np.uint8) * 255
+            bcnts, _ = cv2.findContours(bmask, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+            bcnts   = [c for c in bcnts if 5 <= cv2.contourArea(c) <= 800]
+            if bcnts:
+                bc  = max(bcnts, key=cv2.contourArea)
+                Mb  = cv2.moments(bc)
+                if Mb["m00"] > 0:
+                    pos_rest = (int(Mb["m10"] / Mb["m00"]),
+                                int(Mb["m01"] / Mb["m00"]))
+
             if motion:
                 state      = State.RECORDING
                 rec_start  = now
@@ -324,7 +350,8 @@ def main():
                 pos_impact = None
                 pos_exit   = None
                 max_ball_d = 0.0
-                print(f"[rec] coup #{shot_count + 1} déclenché")
+                print(f"[rec] coup #{shot_count + 1} déclenché"
+                      f"  repos balle={'oui' if pos_rest else 'non détecté'}")
 
         elif state == State.RECORDING:
             sig_cnts = [c for c in cnts if cv2.contourArea(c) >= MOTION_AREA]
@@ -366,11 +393,11 @@ def main():
             # — Fin d'enregistrement —
             if now - rec_start >= RECORD_SECS:
                 shot_count += 1
-                composite  = make_composite(kf_frames, W, H,
-                                            kf_impact, kf_exit,
-                                            pos_impact, pos_exit)
+                composite  = make_training_frame(kf_frames, kf_impact, kf_exit,
+                                                 W, H, pos_rest, pos_impact, pos_exit)
                 last_path  = save_shot(kf_frames, composite, shot_count,
-                                       kf_impact, kf_exit, W, H)
+                                       kf_impact, kf_exit, W, H,
+                                       pos_rest, pos_impact, pos_exit)
                 state      = State.PREVIEW
                 preview_t  = now
 
@@ -379,18 +406,23 @@ def main():
                 state    = State.READY
                 bg_model = gray_h.astype(np.float32)
 
-        # ── Affichage ──────────────────────────────────────────────────────
+        # ── Affichage (W×H unique — strobe + balle fusionnés) ─────────────
         if state == State.PREVIEW and composite is not None:
-            top_panel  = composite[:H]
-            ball_panel = composite[H:]
+            top_panel = composite
         else:
             live = cv2.resize(raw, (W, H))
             if state in (State.READY, State.COUNTDOWN, State.ARMED):
                 live = (live.astype(np.float32) * 0.75).astype(np.uint8)
             draw_column_grid(live, W, H)
-            top_panel  = live
-            ball_panel = make_ball_panel(kf_impact, kf_exit,
-                                         pos_impact, pos_exit, W, H)
+            # Pendant ARMED : affiche un marqueur sur la balle détectée
+            if state == State.ARMED and pos_rest is not None:
+                sx = W / (W // 2);  sy = H / (H // 2)
+                pr = (int(pos_rest[0] * sx), int(pos_rest[1] * sy))
+                cv2.circle(live, pr, 14, (0, 0, 0),  3, cv2.LINE_AA)
+                cv2.circle(live, pr, 14, GREEN,       2, cv2.LINE_AA)
+                put_text(live, "balle", (pr[0]+18, pr[1]+5),
+                         scale=0.45, color=GREEN)
+            top_panel = live
 
         # Bandeau d'état
         if state == State.READY:
@@ -432,8 +464,7 @@ def main():
             put_text(top_panel, os.path.basename(last_path),
                      (8, H - 10), scale=0.40, color=DIM_TEXT)
 
-        canvas = np.vstack([top_panel, ball_panel])
-        cv2.imshow(WIN, canvas)
+        cv2.imshow(WIN, top_panel)
 
         key = cv2.waitKey(1) & 0xFF
         if key in (ord('q'), 27):
@@ -441,6 +472,7 @@ def main():
         elif key == ord(' ') and state == State.READY:
             state    = State.COUNTDOWN
             cd_start = now
+            pos_rest = None
         elif key == ord('r'):
             bg_model = None
             state    = State.READY
