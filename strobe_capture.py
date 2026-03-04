@@ -316,7 +316,8 @@ def main():
             cw_h    = half.shape[1] // N_COLS
             cy_h    = half.shape[0] // 2
 
-            # ── Détection balle : luminosité (balle = rond blanc, canaux > 200) ─
+            # ── Étape 1 : Détection balle (prérequis absolu) ─────────────
+            # La balle doit être détectée dans col 4 AVANT tout le reste.
             ball_x_exp = cw_h * 3 + 15   # centre, bord gauche flush col 4
             ball_y_exp = cy_h
             br = 22
@@ -328,77 +329,82 @@ def main():
                 ball_rest = (kf_rest, (ball_x_exp, ball_y_exp))
             else:
                 ball_rest = None
+                # Pas de balle → réinitialise le timer putter (pas de READY sans balle)
+                if not is_ready:
+                    putter_anchor       = None
+                    putter_stable_since = 0.0
 
-            # ── Détection putter dans sa zone ────────────────────────────
-            pz_x0 = cw_h * 3 + 11
-            pz_x1 = min(cw_h * 6, half.shape[1])  # étendu à col 6 pour capturer le passage col4→5
-            pz_y0 = max(cy_h - 55, 0)
-            pz_y1 = min(cy_h + 55, half.shape[0])
-
-            diff_pz = diff[pz_y0:pz_y1, pz_x0:pz_x1].astype(np.uint8)
-            _, th_pz = cv2.threshold(diff_pz, MOTION_THRESH, 255,
-                                     cv2.THRESH_BINARY)
-            th_pz = cv2.dilate(th_pz, None, iterations=2)
-            pz_cnts, _ = cv2.findContours(th_pz, cv2.RETR_EXTERNAL,
-                                          cv2.CHAIN_APPROX_SIMPLE)
-            pz_big = [c for c in pz_cnts
-                      if cv2.contourArea(c) >= PUTTER_MIN_AREA]
-
+            # ── Étape 2 : Détection putter (seulement si la balle est confirmée) ──
+            # Le putter ne peut être cherché que si la balle est déjà en place.
             putter_found = False
-            if pz_big:
-                biggest = max(pz_big, key=cv2.contourArea)
-                Mpz = cv2.moments(biggest)
-                if Mpz["m00"] > 0:
-                    pcx = int(Mpz["m10"] / Mpz["m00"]) + pz_x0
-                    pcy = int(Mpz["m01"] / Mpz["m00"]) + pz_y0
-                    putter_found = True
+            if ball_present:
+                pz_x0 = cw_h * 3 + 11
+                pz_x1 = min(cw_h * 6, half.shape[1])
+                pz_y0 = max(cy_h - 55, 0)
+                pz_y1 = min(cy_h + 55, half.shape[0])
 
-                    if not is_ready:
-                        # ── Phase stabilisation du putter ────────────────
-                        if putter_anchor is None:
-                            putter_anchor       = (pcx, pcy)
-                            putter_stable_since = now
-                        elif abs(pcx - putter_anchor[0]) > PUTTER_STILL_PX:
-                            putter_anchor       = (pcx, pcy)
-                            putter_stable_since = now
+                diff_pz = diff[pz_y0:pz_y1, pz_x0:pz_x1].astype(np.uint8)
+                _, th_pz = cv2.threshold(diff_pz, MOTION_THRESH, 255,
+                                         cv2.THRESH_BINARY)
+                th_pz = cv2.dilate(th_pz, None, iterations=2)
+                pz_cnts, _ = cv2.findContours(th_pz, cv2.RETR_EXTERNAL,
+                                              cv2.CHAIN_APPROX_SIMPLE)
+                pz_big = [c for c in pz_cnts
+                          if cv2.contourArea(c) >= PUTTER_MIN_AREA]
 
-                        if (now - putter_stable_since >= PUTTER_STABLE_SEC
-                                and ball_rest is not None):
-                            is_ready        = True
-                            absorb_start    = now
-                            armed_for_swing = False
-                            print("[armed] putter stable → absorption fond")
+                if pz_big:
+                    biggest = max(pz_big, key=cv2.contourArea)
+                    Mpz = cv2.moments(biggest)
+                    if Mpz["m00"] > 0:
+                        pcx = int(Mpz["m10"] / Mpz["m00"]) + pz_x0
+                        pcy = int(Mpz["m01"] / Mpz["m00"]) + pz_y0
+                        putter_found = True
 
-                    elif not armed_for_swing:
-                        # ── Phase absorption : fond absorbe le putter ────
-                        # (alpha élevé = absorption rapide)
-                        cv2.accumulateWeighted(
-                            gray_h.astype(np.float32), bg_model, 0.25)
-                        if now - absorb_start >= PUTTER_ABSORB_SEC:
-                            armed_for_swing = True
-                            print("[armed] READY – swing !")
-                    else:
-                        # ── Phase swing : putter franchit col4→col5, balle confirmée ──
-                        if pcx >= cw_h * 4 and ball_rest is not None:
-                            state         = State.RECORDING
-                            rec_start     = now
-                            kf_frames     = [None] * N_COLS
-                            kf_offs       = [float('inf')] * N_COLS
-                            kf_impact     = None
-                            kf_impact_off = float('inf')
-                            ball_col_kfs  = [None] * len(BALL_COLS)
-                            ball_col_poss = [None] * len(BALL_COLS)
-                            ball_col_offs = [float('inf')] * len(BALL_COLS)
-                            sw_cx_max     = -1
-                            sw_cx_min     = float('inf')
-                            sw_peaked     = False
-                            sw_done       = False
-                            sw_cx_prev    = -1
-                            is_ready      = False
-                            armed_for_swing = False
-                            putter_anchor = None
-                            print(f"[rec] auto-trigger #{shot_count+1}"
-                                  f"  balle={'oui' if ball_rest else 'non'}")
+                        if not is_ready:
+                            # ── Phase stabilisation du putter ────────────────
+                            if putter_anchor is None:
+                                putter_anchor       = (pcx, pcy)
+                                putter_stable_since = now
+                            elif abs(pcx - putter_anchor[0]) > PUTTER_STILL_PX:
+                                putter_anchor       = (pcx, pcy)
+                                putter_stable_since = now
+
+                            # READY : balle présente + putter stable 2s
+                            if now - putter_stable_since >= PUTTER_STABLE_SEC:
+                                is_ready        = True
+                                absorb_start    = now
+                                armed_for_swing = False
+                                print("[armed] balle ✓ + putter stable → absorption fond")
+
+                        elif not armed_for_swing:
+                            # ── Phase absorption : fond absorbe le putter ────
+                            cv2.accumulateWeighted(
+                                gray_h.astype(np.float32), bg_model, 0.25)
+                            if now - absorb_start >= PUTTER_ABSORB_SEC:
+                                armed_for_swing = True
+                                print("[armed] READY – swing !")
+                        else:
+                            # ── Phase swing : putter en mouvement, balle confirmée ──
+                            if pcx >= cw_h * 4 and ball_rest is not None:
+                                state         = State.RECORDING
+                                rec_start     = now
+                                kf_frames     = [None] * N_COLS
+                                kf_offs       = [float('inf')] * N_COLS
+                                kf_impact     = None
+                                kf_impact_off = float('inf')
+                                ball_col_kfs  = [None] * len(BALL_COLS)
+                                ball_col_poss = [None] * len(BALL_COLS)
+                                ball_col_offs = [float('inf')] * len(BALL_COLS)
+                                sw_cx_max     = -1
+                                sw_cx_min     = float('inf')
+                                sw_peaked     = False
+                                sw_done       = False
+                                sw_cx_prev    = -1
+                                is_ready      = False
+                                armed_for_swing = False
+                                putter_anchor = None
+                                print(f"[rec] auto-trigger #{shot_count+1}"
+                                      f"  balle={'oui' if ball_rest else 'non'}")
 
             if not putter_found and not is_ready:
                 putter_anchor       = None
@@ -429,15 +435,27 @@ def main():
                             sw_done = True
                     sw_cx_prev = cx_h
 
-                    # Capture des colonnes pendant la descente uniquement
+                    # Col 4 = impact : putter au plus proche de la balle
+                    # Capturé dès que le putter bouge (pas besoin de pic détecté)
+                    # pour ne jamais rater la frame où balle + putter sont ensemble.
+                    if ball_rest is not None:
+                        impact_off = abs(cx_h - ball_rest[1][0])
+                        # Vérifier que la balle est encore visible dans ce frame
+                        bx_e = ball_rest[1][0]
+                        by_e = ball_rest[1][1]
+                        br_c = 18
+                        ball_rgn = half[max(0, by_e - br_c):by_e + br_c,
+                                        max(0, bx_e - br_c):bx_e + br_c]
+                        ball_visible = (ball_rgn.size > 0 and
+                                        int(np.sum(np.all(ball_rgn > 190, axis=2))) >= 15)
+                        # Préférer les frames où la balle est encore en place
+                        adj_off = impact_off if ball_visible else impact_off + 500
+                        if adj_off < kf_impact_off:
+                            kf_impact_off = adj_off
+                            kf_impact     = half.copy()
+
+                    # Autres colonnes : seulement pendant la descente confirmée
                     if sw_peaked and not sw_done:
-                        # Col 4 (index 3) = impact : putter cx le plus proche du x balle
-                        if ball_rest is not None:
-                            impact_off = abs(cx_h - ball_rest[1][0])
-                            if impact_off < kf_impact_off:
-                                kf_impact_off = impact_off
-                                kf_impact     = half.copy()
-                        # Autres colonnes
                         if col != 3:
                             if off < kf_offs[col]:
                                 kf_offs[col]   = off
