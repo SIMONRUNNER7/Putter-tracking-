@@ -380,15 +380,14 @@ def main():
                             kf_offs[col]   = off
                             kf_frames[col] = half.copy()
 
-            # — Balle : snaps d'exit (blobs < 350 px², distances croissantes) —
+            # — Balle : snaps d'exit dans le cône gauche —
+            # La balle part toujours vers la GAUCHE (sens du coup).
+            # Le putter fait son follow-through côté droit → on filtre.
             if sw_peaked and sig_cnts and len(ball_snaps) < 3:
-                pos_ref = ball_snaps[0][1] if ball_snaps else None
-                snap_i  = len(ball_snaps)
-                # snap 0 (repos manquant) : premier petit blob après le pic
-                # snap 1 & 2 : distances BALL_SNAP_DISTS[0] et [1]
+                pos_ref  = ball_snaps[0][1] if ball_snaps else None
+                snap_i   = len(ball_snaps)
                 target_d = (BALL_SNAP_DISTS[snap_i - 1]
                             if snap_i > 0 and pos_ref else 0)
-                # Petits contours en priorité (balle << tête de putter)
                 small = [c for c in sig_cnts if cv2.contourArea(c) < 350]
                 cands = small if small else sig_cnts
                 for c in sorted(cands, key=cv2.contourArea):
@@ -396,9 +395,15 @@ def main():
                     if M["m00"] > 0:
                         bx = int(M["m10"] / M["m00"])
                         by = int(M["m01"] / M["m00"])
-                        dist = (((bx - pos_ref[0]) ** 2 +
-                                 (by - pos_ref[1]) ** 2) ** 0.5
-                                if pos_ref else 0)
+                        if pos_ref is not None:
+                            dx = pos_ref[0] - bx      # >0 = blob est à gauche
+                            dy = abs(by - pos_ref[1])
+                            # Filtre cône : doit être À GAUCHE et dans ~30°
+                            if dx < 5 or dy > dx * 0.65 + 12:
+                                continue
+                            dist = (dx ** 2 + dy ** 2) ** 0.5
+                        else:
+                            dist = 0
                         if dist >= target_d:
                             ball_snaps.append((half.copy(), (bx, by)))
                             if pos_ref is None:
