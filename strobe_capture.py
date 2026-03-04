@@ -8,20 +8,17 @@ Contrôles:
 
 Flux: READY → COUNTDOWN (4s) → ARMED (attend mouvement) → RECORDING → PREVIEW → READY
 
-Composite sauvegardé (W × 2H):
-  ┌─────────────────────────────┐
-  │  Strobe 7 colonnes (putter) │  ← H px
-  ├─────────────────────────────┤
-  │  Overlay balle (alpha 50%)  │  ← H px (pleine hauteur)
-  │  impact──────────►sortie    │
-  └─────────────────────────────┘
+Strobe putter  : 7 colonnes, chaque colonne = frame où la tête est au centre
+                 de la colonne (col 4 = tête sur la balle = impact exact).
+Strobe balle   : colonnes 1, 2, 3 (gauche) — même logique centre de colonne.
+                 La balle au repos (col 4) n'est PAS affichée (col 4 = impact pur).
 
 Fichiers générés:
-  captures/strobe_YYYYMMDD_HHMMSS.png   – composite complet
-  captures/ball_YYYYMMDD_HHMMSS.png     – overlay balle seul (pleine résolution)
-  captures/raw/…_col{0-6}.jpg           – keyframes individuels putter
-  captures/raw/…_impact.jpg             – frame à l'impact
-  captures/raw/…_exit.jpg               – frame à la sortie (balle)
+  captures/strobe_YYYYMMDD_HHMMSS.png
+  captures/raw/…_col{0-6}.jpg      – keyframes putter
+  captures/raw/…_ball_col{1-3}.jpg – keyframes balle
+  captures/raw/…_rest.jpg          – balle au repos (référence)
+  captures/raw/…_training.jpg      – composite complet
 """
 
 from __future__ import annotations
@@ -42,12 +39,11 @@ N_COLS        = 7
 OUT_DIR       = "captures"
 RAW_DIR       = os.path.join(OUT_DIR, "raw")
 MOTION_THRESH = 25
-MOTION_AREA   = 80      # aire minimale pour détecter un mouvement
-SWING_PEAK_DELTA = 5    # pixels demi-res pour confirmer le changement de direction
-BALL_CROP_R      = 30   # rayon du crop circulaire balle (pixels pleine-res)
-# Distances demi-res depuis pos_rest pour les 2 snaps d'exit
-# (valeurs élevées = balles le plus à gauche possible, quasi hors cadre)
-BALL_SNAP_DISTS  = (90, 200)
+MOTION_AREA   = 80
+SWING_PEAK_DELTA = 5
+BALL_CROP_R      = 30
+# Indices 0-based des colonnes où capturer la balle (cols 1, 2, 3 en 1-indexé)
+BALL_COLS = (2, 1, 0)   # col 3 → col 2 → col 1 (de droite à gauche)
 
 # ── Palette ────────────────────────────────────────────────────────────────────
 DIM_COLOR  = (40, 40, 40)
@@ -117,22 +113,22 @@ def draw_guide_overlay(img, W, H, ball_pos_fullres=None):
     """
     Éléments de guidage permanents sur la vue de base :
       - ligne horizontale blanche (repère de hauteur)
-      - cercle blanc pour poser la balle
-      - zone putter (côté droit) pour le poser avant de commencer
+      - cercle blanc pour poser la balle (col 4 centre)
+      - zone putter (cols 5-7, côté droit)
     """
     cy = H // 2
     cw = W // N_COLS
 
-    # ── Ligne de repère horizontale ──────────────────────────────────────────
+    # Ligne de repère horizontale
     cv2.line(img, (0, cy), (W, cy), WHITE, 1, cv2.LINE_AA)
 
-    # ── Cercle blanc : position de la balle (col 4 centre = W/2) ─────────────
+    # Cercle blanc : position de la balle
     bx = ball_pos_fullres[0] if ball_pos_fullres else cw * 3 + cw // 2
     by = ball_pos_fullres[1] if ball_pos_fullres else cy
     cv2.circle(img, (bx, by), 18, WHITE, 2, cv2.LINE_AA)
     put_text(img, "balle", (bx + 22, by + 5), scale=0.38, color=WHITE)
 
-    # ── Zone putter (cols 5-7, côté droit) ───────────────────────────────────
+    # Zone putter (cols 5-7, côté droit)
     px0 = cw * 4
     px1 = W - 2
     py0 = cy - 55
@@ -148,8 +144,8 @@ def draw_guide_overlay(img, W, H, ball_pos_fullres=None):
 def make_strobe(kf_frames: list, W: int, H: int, bg_frame=None) -> np.ndarray:
     """
     Panneau strobe 7 colonnes (putter).
-    bg_frame : frame couleur pleine-res à utiliser pour les colonnes sans keyframe
-               (jamais de colonne noire — on affiche toujours le background).
+    bg_frame : frame couleur pleine-res pour les colonnes sans keyframe
+               (jamais de colonne noire).
     """
     canvas = np.zeros((H, W, 3), dtype=np.uint8)
     col_w  = W // N_COLS
@@ -158,7 +154,6 @@ def make_strobe(kf_frames: list, W: int, H: int, bg_frame=None) -> np.ndarray:
         x0 = i * col_w
         x1 = W if i == N_COLS - 1 else x0 + col_w
         if kf is None:
-            # Toujours afficher le background, jamais une colonne noire
             if bg_full is not None:
                 canvas[:, x0:x1] = bg_full[:, x0:x1]
             else:
@@ -172,57 +167,8 @@ def make_strobe(kf_frames: list, W: int, H: int, bg_frame=None) -> np.ndarray:
     return canvas
 
 
-def make_ball_panel(kf_impact, kf_exit, pos_impact, pos_exit, W: int, H: int) -> np.ndarray:
-    """
-    Panneau balle : superposition alpha 50% de la frame impact + frame sortie.
-    Dessine l'impact (cercle vert), la sortie (cercle orange) et une flèche.
-
-    kf_impact / kf_exit : frames en demi-résolution (W//2 × H//2)
-    pos_impact / pos_exit : (cx, cy) en coordonnées demi-résolution
-    Le panneau fait W × (H//2).
-    """
-    panel_h = H
-    # Facteurs de mise à l'échelle demi-res → panneau
-    sx = W / (W // 2)          # = 2.0
-    sy = panel_h / (H // 2)   # = 2.0
-
-    if kf_impact is None:
-        panel = np.zeros((panel_h, W, 3), dtype=np.uint8)
-        put_text(panel, "balle : en attente de données…",
-                 (12, panel_h // 2 + 6), scale=0.5, color=DIM_TEXT)
-        return panel
-
-    fi   = cv2.resize(kf_impact, (W, panel_h))
-    fe   = cv2.resize(kf_exit   if kf_exit is not None else kf_impact, (W, panel_h))
-    panel = cv2.addWeighted(fi, 0.5, fe, 0.5, 0)
-
-    def to_panel(pos):
-        return (int(pos[0] * sx), int(pos[1] * sy))
-
-    pa = to_panel(pos_impact) if pos_impact else None
-    pb = to_panel(pos_exit)   if pos_exit   else None
-
-    if pa:
-        cv2.circle(panel, pa, 10, GREEN, 2, cv2.LINE_AA)
-        put_text(panel, "impact",
-                 (pa[0] + 13, pa[1] + 5), scale=0.45, color=GREEN)
-
-    if pb and pa:
-        cv2.circle(panel, pb, 10, ORANGE, 2, cv2.LINE_AA)
-        put_text(panel, "sortie",
-                 (pb[0] + 13, pb[1] + 5), scale=0.45, color=ORANGE)
-        cv2.arrowedLine(panel, pa, pb, ACCENT, 2, cv2.LINE_AA, tipLength=0.08)
-
-    # Séparateur en haut du panneau
-    cv2.line(panel, (0, 0), (W, 0), GRID_COLOR, 1)
-    put_text(panel, "TRAJECTOIRE BALLE",
-             (8, 16), scale=0.45, color=DIM_TEXT)
-
-    return panel
-
-
 def _paste_ball_circle(canvas, kf_halfres, pos_halfres, W, H):
-    """Colle un crop CIRCULAIRE serré centré sur la balle (pos en demi-res)."""
+    """Colle un crop circulaire centré sur la balle (pos en demi-res)."""
     if kf_halfres is None or pos_halfres is None:
         return
     frame = cv2.resize(kf_halfres, (W, H))
@@ -233,41 +179,27 @@ def _paste_ball_circle(canvas, kf_halfres, pos_halfres, W, H):
     canvas[mask > 0] = frame[mask > 0]
 
 
-def make_training_frame(kf_frames, ball_snaps, W: int, H: int,
-                        bg_frame=None) -> np.ndarray:
+def make_training_frame(kf_frames, ball_col_kfs, ball_col_poss,
+                        W: int, H: int, bg_frame=None) -> np.ndarray:
     """
-    Image d'entraînement W×H : strobe putter + 3 crops circulaires de la balle.
-    ball_snaps : liste de (kf_halfres, pos_halfres) – [repos, mid, exit]
-    Flèche depuis le premier snap (repos) vers le dernier (exit).
+    Image d'entraînement W×H :
+      - strobe putter (7 cols, col 4 = impact pur sans balle)
+      - crops circulaires balle dans cols 1, 2, 3 uniquement
+    Pas de flèche.
+
+    ball_col_kfs  : [kf_col3, kf_col2, kf_col1]  (halfres, ou None)
+    ball_col_poss : [(cx,cy)×3]  (halfres)
     """
     canvas = make_strobe(kf_frames, W, H, bg_frame=bg_frame)
-
-    sx = W / (W // 2);  sy = H / (H // 2)
-    for kf, pos in (ball_snaps or []):
+    for kf, pos in zip(ball_col_kfs or [], ball_col_poss or []):
         _paste_ball_circle(canvas, kf, pos, W, H)
-
-    if ball_snaps and len(ball_snaps) >= 2:
-        p0 = (int(ball_snaps[0][1][0] * sx), int(ball_snaps[0][1][1] * sy))
-        p1 = (int(ball_snaps[-1][1][0] * sx), int(ball_snaps[-1][1][1] * sy))
-        cv2.arrowedLine(canvas, p0, p1, (0, 0, 0), 4, cv2.LINE_AA, tipLength=0.10)
-        cv2.arrowedLine(canvas, p0, p1, ACCENT,    2, cv2.LINE_AA, tipLength=0.10)
-
     return canvas
-
-
-def make_composite(kf_frames, W, H,
-                   kf_impact=None, kf_exit=None,
-                   pos_impact=None, pos_exit=None,
-                   bg_frame=None) -> np.ndarray:
-    """Composite complet : strobe putter (H) + overlay balle (H//2)."""
-    strobe = make_strobe(kf_frames, W, H, bg_frame=bg_frame)
-    ball   = make_ball_panel(kf_impact, kf_exit, pos_impact, pos_exit, W, H)
-    return np.vstack([strobe, ball])
 
 
 # ── Sauvegarde ────────────────────────────────────────────────────────────────
 def save_shot(kf_frames, composite, n,
-              ball_snaps=None, W=1280, H=720) -> str:
+              ball_rest=None, ball_col_kfs=None, ball_col_poss=None,
+              W=1280, H=720) -> str:
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(RAW_DIR, exist_ok=True)
     tag = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -283,17 +215,28 @@ def save_shot(kf_frames, composite, n,
                     [cv2.IMWRITE_JPEG_QUALITY, 95])
         saved_raw += 1
 
-    for i, (kf, _) in enumerate(ball_snaps or []):
-        names = ["rest", "mid", "exit"]
-        label = names[i] if i < len(names) else f"ball{i}"
-        cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_{label}.jpg"),
+    # Balle au repos (référence, non affichée sur le strobe)
+    if ball_rest is not None:
+        kf_r, _ = ball_rest
+        cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_rest.jpg"),
+                    cv2.resize(kf_r, (W, H)), [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+    # Snaps balle dans cols 3, 2, 1
+    labels = ["ball_col3", "ball_col2", "ball_col1"]
+    n_snaps = 0
+    for i, kf in enumerate(ball_col_kfs or []):
+        if kf is None:
+            continue
+        lbl = labels[i] if i < len(labels) else f"ball_{i}"
+        cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_{lbl}.jpg"),
                     cv2.resize(kf, (W, H)), [cv2.IMWRITE_JPEG_QUALITY, 95])
+        n_snaps += 1
 
     cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_training.jpg"), composite,
                 [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-    n_snaps = len(ball_snaps) if ball_snaps else 0
-    print(f"[save] #{n:03d}  → {comp_path}  ({saved_raw} cols putter, {n_snaps} snaps balle)")
+    print(f"[save] #{n:03d}  → {comp_path}  "
+          f"({saved_raw} cols putter, {n_snaps} snaps balle)")
     return comp_path
 
 
@@ -305,21 +248,28 @@ def main():
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WIN, W, H)
 
-    state      = State.READY
-    bg_model   = None
+    state          = State.READY
+    bg_model       = None
     bg_frame_color = None   # dernière frame couleur pleine-res (fond propre)
+
     # Putter : keyframes par colonne
     kf_frames  = [None] * N_COLS
     kf_offs    = [float('inf')] * N_COLS
-    # Balle : snaps [repos, mid, exit]
-    ball_snaps = []     # [(kf_halfres, (cx,cy)), …]
+
+    # Balle : position de repos (ref) + keyframes colonnes 3, 2, 1
+    ball_rest      = None               # (kf_halfres, (cx,cy)) depuis ARMED
+    ball_col_kfs   = [None] * 3        # [kf_col3, kf_col2, kf_col1]
+    ball_col_poss  = [None] * 3        # [(cx,cy), …] halfres
+    ball_col_offs  = [float('inf')] * 3
+
     kf_rest    = None   # dernière frame demi-res calme (ARMED)
-    # Suivi directionnel du putter (downswing droite→gauche uniquement)
-    sw_cx_max  = -1     # cx le plus à droite vu en demi-res (backswing peak)
-    sw_cx_min  = float('inf')  # cx le plus à gauche vu pendant le downswing
-    sw_peaked  = False  # True une fois passé le pic backswing
-    sw_done    = False  # True une fois reparti à droite (follow-through fini)
-    sw_cx_prev = -1     # cx précédent putter
+
+    # Suivi directionnel du putter
+    sw_cx_max  = -1
+    sw_cx_min  = float('inf')
+    sw_peaked  = False
+    sw_done    = False
+    sw_cx_prev = -1
 
     cd_start   = 0.0
     rec_start  = 0.0
@@ -341,12 +291,12 @@ def main():
         gray_h = cv2.GaussianBlur(
             cv2.cvtColor(half, cv2.COLOR_BGR2GRAY), (21, 21), 0)
 
-        # ── Fond : mise à jour uniquement hors enregistrement ──────────────
+        # ── Fond ───────────────────────────────────────────────────────────
         if bg_model is None:
             bg_model = gray_h.astype(np.float32)
         elif state in (State.READY, State.COUNTDOWN):
             cv2.accumulateWeighted(gray_h.astype(np.float32), bg_model, 0.04)
-            bg_frame_color = raw.copy()   # mémorise le fond couleur propre
+            bg_frame_color = raw.copy()
 
         # ── Détection de mouvement ──────────────────────────────────────────
         diff = np.abs(gray_h.astype(np.float32) - bg_model)
@@ -360,14 +310,12 @@ def main():
         # ── Machine d'états ────────────────────────────────────────────────
         if state == State.COUNTDOWN:
             if now - cd_start >= PREP_SECS:
-                bg_model = gray_h.astype(np.float32)  # fige le fond
+                bg_model = gray_h.astype(np.float32)
                 state    = State.ARMED
 
         elif state == State.ARMED:
-            # Mémorise la dernière frame calme (balle immobile)
             kf_rest = half.copy()
 
-            # Hough circles : détecte la balle ronde sur le fond sombre
             gray_a  = cv2.cvtColor(half, cv2.COLOR_BGR2GRAY)
             blur_a  = cv2.GaussianBlur(gray_a, (5, 5), 0)
             circles = cv2.HoughCircles(blur_a, cv2.HOUGH_GRADIENT, dp=1,
@@ -376,30 +324,32 @@ def main():
             if circles is not None:
                 circles = np.round(circles[0]).astype(int)
                 Hh, Wh  = half.shape[:2]
-                # Balle blanche = centre de cercle le plus brillant
                 best = max(circles,
                            key=lambda c: int(gray_a[min(c[1], Hh-1),
                                                      min(c[0], Wh-1)]))
-                ball_snaps = [(kf_rest, (int(best[0]), int(best[1])))]
+                ball_rest = (kf_rest, (int(best[0]), int(best[1])))
 
             if motion:
-                state      = State.RECORDING
-                rec_start  = now
-                kf_frames  = [None] * N_COLS
-                kf_offs    = [float('inf')] * N_COLS
-                sw_cx_max  = -1
-                sw_cx_min  = float('inf')
-                sw_peaked  = False
-                sw_done    = False
-                sw_cx_prev = -1
+                state         = State.RECORDING
+                rec_start     = now
+                kf_frames     = [None] * N_COLS
+                kf_offs       = [float('inf')] * N_COLS
+                ball_col_kfs  = [None] * 3
+                ball_col_poss = [None] * 3
+                ball_col_offs = [float('inf')] * 3
+                sw_cx_max     = -1
+                sw_cx_min     = float('inf')
+                sw_peaked     = False
+                sw_done       = False
+                sw_cx_prev    = -1
                 print(f"[rec] coup #{shot_count + 1} déclenché"
-                      f"  balle={'oui' if ball_snaps else 'non détectée'}")
+                      f"  balle={'oui' if ball_rest else 'non détectée'}")
 
         elif state == State.RECORDING:
             sig_cnts = [c for c in cnts if cv2.contourArea(c) >= MOTION_AREA]
             cw_h     = half.shape[1] // N_COLS
 
-            # — Strobe putter : keyframe par colonne (downswing droite→gauche) —
+            # — Putter : strobe colonne par colonne (downswing seul) ———————
             if sig_cnts:
                 best = max(sig_cnts, key=cv2.contourArea)
                 M = cv2.moments(best)
@@ -407,14 +357,12 @@ def main():
                     cx_h = int(M["m10"] / M["m00"])
                     col  = min(cx_h // cw_h, N_COLS - 1)
 
-                    # ── Offset selon la colonne ───────────────────────────
-                    # Col 4 (index 3) = IMPACT : offset mesuré par rapport
-                    # à la balle au repos (pas au centre géométrique).
-                    # Autres cols : centre géométrique de la colonne.
+                    # Col 4 (index 3) = impact : offset par rapport à la balle
+                    # Toutes les autres : offset par rapport au centre géométrique
                     if col == 3:
-                        ball_rest_x_h = (ball_snaps[0][1][0] if ball_snaps
-                                         else half.shape[1] // 2)
-                        off = abs(cx_h - ball_rest_x_h)
+                        ball_rest_x = (ball_rest[1][0] if ball_rest
+                                       else half.shape[1] // 2)
+                        off = abs(cx_h - ball_rest_x)
                     else:
                         off = abs(cx_h - (col + 0.5) * cw_h)
 
@@ -432,57 +380,60 @@ def main():
                             print(f"[swing] follow-through terminé, cx={cx_h}")
                     sw_cx_prev = cx_h
 
-                    # N'enregistre que pendant le downswing
                     if sw_peaked and not sw_done:
                         if off < kf_offs[col]:
                             kf_offs[col]   = off
                             kf_frames[col] = half.copy()
 
-            # — Balle : snaps dans le cône gauche depuis pos_rest —
-            # La balle part toujours vers la GAUCHE (sens du coup).
-            # Le putter fait son follow-through côté droit → on filtre.
-            if sw_peaked and sig_cnts and len(ball_snaps) < 3:
-                pos_ref = ball_snaps[0][1] if ball_snaps else None
-                if pos_ref is not None:
-                    snap_i   = len(ball_snaps)
-                    target_d = (BALL_SNAP_DISTS[snap_i - 1]
-                                if snap_i > 0 else 0)
-                    small = [c for c in sig_cnts if cv2.contourArea(c) < 350]
-                    cands = small if small else sig_cnts
-                    for c in sorted(cands, key=cv2.contourArea):
-                        M = cv2.moments(c)
-                        if M["m00"] > 0:
-                            bx = int(M["m10"] / M["m00"])
-                            by = int(M["m01"] / M["m00"])
-                            dx = pos_ref[0] - bx      # >0 = blob à GAUCHE
-                            dy = abs(by - pos_ref[1])
-                            # Filtre cône ~30° : doit être à gauche
-                            if dx < 5 or dy > dx * 0.65 + 12:
-                                continue
-                            dist = (dx ** 2 + dy ** 2) ** 0.5
-                            if dist >= target_d:
-                                ball_snaps.append((half.copy(), (bx, by)))
+            # — Balle : même logique centre de colonne, cols 3→2→1 ————————
+            # Filtre cône : blob doit être à GAUCHE de la balle au repos (~30°)
+            if sw_peaked and sig_cnts and ball_rest is not None:
+                rest_x, rest_y = ball_rest[1]
+                small = [c for c in sig_cnts if cv2.contourArea(c) < 350]
+                cands = small if small else sig_cnts
+                for c in sorted(cands, key=cv2.contourArea):
+                    M = cv2.moments(c)
+                    if M["m00"] > 0:
+                        bx = int(M["m10"] / M["m00"])
+                        by = int(M["m01"] / M["m00"])
+                        dx = rest_x - bx       # >0 = à gauche du repos
+                        dy = abs(by - rest_y)
+                        if dx < 5 or dy > dx * 0.65 + 12:
+                            continue
+                        # Affectation à la colonne balle correspondante
+                        bcol = min(bx // cw_h, N_COLS - 1)
+                        for bi, ci in enumerate(BALL_COLS):
+                            if bcol == ci:
+                                target_bx = (ci + 0.5) * cw_h
+                                boff = abs(bx - target_bx)
+                                if boff < ball_col_offs[bi]:
+                                    ball_col_offs[bi]  = boff
+                                    ball_col_kfs[bi]   = half.copy()
+                                    ball_col_poss[bi]  = (bx, by)
                                 break
 
-            # — Fin d'enregistrement —
+            # — Fin d'enregistrement ————————————————————————————————————————
             if now - rec_start >= RECORD_SECS:
-                # ── Cols 1 et 7 : masquer si tête n'a pas atteint le centre ──
-                # Col 7 (index 6) : putter doit avoir atteint cx >= 6.5 * cw_h
+                # Cols 1 et 7 masquées si tête n'a pas atteint le centre
                 if sw_cx_max < 6.5 * cw_h:
                     kf_frames[6] = None
-                    print(f"[swing] col 7 masquée (sw_cx_max={sw_cx_max:.0f} < {6.5*cw_h:.0f})")
-                # Col 1 (index 0) : putter doit avoir atteint cx <= 0.5 * cw_h
+                    print(f"[swing] col 7 masquée (peak={sw_cx_max:.0f})")
                 if sw_cx_min > 0.5 * cw_h:
                     kf_frames[0] = None
-                    print(f"[swing] col 1 masquée (sw_cx_min={sw_cx_min:.0f} > {0.5*cw_h:.0f})")
+                    print(f"[swing] col 1 masquée (min={sw_cx_min:.0f})")
 
                 shot_count += 1
-                composite  = make_training_frame(kf_frames, ball_snaps, W, H,
-                                                 bg_frame=bg_frame_color)
-                last_path  = save_shot(kf_frames, composite, shot_count,
-                                       ball_snaps, W, H)
-                state      = State.PREVIEW
-                preview_t  = now
+                composite = make_training_frame(
+                    kf_frames, ball_col_kfs, ball_col_poss,
+                    W, H, bg_frame=bg_frame_color)
+                last_path = save_shot(
+                    kf_frames, composite, shot_count,
+                    ball_rest=ball_rest,
+                    ball_col_kfs=ball_col_kfs,
+                    ball_col_poss=ball_col_poss,
+                    W=W, H=H)
+                state     = State.PREVIEW
+                preview_t = now
 
         elif state == State.PREVIEW:
             if now - preview_t >= PREVIEW_SECS:
@@ -498,20 +449,20 @@ def main():
                 live = (live.astype(np.float32) * 0.75).astype(np.uint8)
             draw_column_grid(live, W, H)
 
-            # ── Guide overlay permanent (ligne + cercle balle + zone putter) ──
+            # Guide overlay : ligne + cercle balle + zone putter
             if state in (State.READY, State.COUNTDOWN, State.ARMED):
                 ball_full = None
-                if state == State.ARMED and ball_snaps:
+                if state == State.ARMED and ball_rest is not None:
                     sx_d = W / (W // 2);  sy_d = H / (H // 2)
-                    ball_full = (int(ball_snaps[0][1][0] * sx_d),
-                                 int(ball_snaps[0][1][1] * sy_d))
+                    ball_full = (int(ball_rest[1][0] * sx_d),
+                                 int(ball_rest[1][1] * sy_d))
                 draw_guide_overlay(live, W, H, ball_pos_fullres=ball_full)
 
-            # Pendant ARMED : cercle vert de confirmation sur la balle détectée
-            if state == State.ARMED and ball_snaps:
+            # ARMED : cercle vert de confirmation sur la balle détectée
+            if state == State.ARMED and ball_rest is not None:
                 sx_d = W / (W // 2);  sy_d = H / (H // 2)
-                pr   = (int(ball_snaps[0][1][0] * sx_d),
-                        int(ball_snaps[0][1][1] * sy_d))
+                pr   = (int(ball_rest[1][0] * sx_d),
+                        int(ball_rest[1][1] * sy_d))
                 cv2.circle(live, pr, BALL_CROP_R + 4, (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.circle(live, pr, BALL_CROP_R + 4, GREEN,      2, cv2.LINE_AA)
 
@@ -550,7 +501,6 @@ def main():
 
         draw_pill(top_panel, 0, 0, W, 32, bc, alpha=0.7)
         put_text(top_panel, bt, (8, 22), scale=0.55, color=WHITE, bold=True)
-
         put_text(top_panel, f"#{shot_count:03d}", (W - 72, 22), scale=0.55, color=ACCENT)
         put_text(top_panel, f"{fps:.0f}fps",      (W - 72, 46), scale=0.45, color=DIM_TEXT)
         if last_path:
@@ -563,10 +513,13 @@ def main():
         if key in (ord('q'), 27):
             break
         elif key == ord(' ') and state == State.READY:
-            state      = State.COUNTDOWN
-            cd_start   = now
-            ball_snaps = []
-            kf_rest    = None
+            state         = State.COUNTDOWN
+            cd_start      = now
+            ball_rest     = None
+            ball_col_kfs  = [None] * 3
+            ball_col_poss = [None] * 3
+            ball_col_offs = [float('inf')] * 3
+            kf_rest       = None
         elif key == ord('r'):
             bg_model = None
             state    = State.READY
