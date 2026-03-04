@@ -8,11 +8,11 @@ Contrôles:
 
 Flux: READY → COUNTDOWN (4s) → ARMED (attend mouvement) → RECORDING → PREVIEW → READY
 
-Composite sauvegardé (W × 3H/2):
+Composite sauvegardé (W × 2H):
   ┌─────────────────────────────┐
   │  Strobe 7 colonnes (putter) │  ← H px
   ├─────────────────────────────┤
-  │  Overlay balle (alpha 50%)  │  ← H/2 px
+  │  Overlay balle (alpha 50%)  │  ← H px (pleine hauteur)
   │  impact──────────►sortie    │
   └─────────────────────────────┘
 
@@ -136,10 +136,10 @@ def make_ball_panel(kf_impact, kf_exit, pos_impact, pos_exit, W: int, H: int) ->
     pos_impact / pos_exit : (cx, cy) en coordonnées demi-résolution
     Le panneau fait W × (H//2).
     """
-    panel_h = H // 2
+    panel_h = H
     # Facteurs de mise à l'échelle demi-res → panneau
     sx = W / (W // 2)          # = 2.0
-    sy = panel_h / (H // 2)   # = 1.0
+    sy = panel_h / (H // 2)   # = 2.0
 
     if kf_impact is None:
         panel = np.zeros((panel_h, W, 3), dtype=np.uint8)
@@ -225,8 +225,8 @@ def save_shot(kf_frames, composite, n,
 def main():
     cap, W, H, cam_fps = open_camera()
 
-    # Hauteur totale : strobe (H) + panneau balle (H//2)
-    BALL_H = H // 2
+    # Hauteur totale : strobe (H) + panneau balle (H)
+    BALL_H = H
     WIN_H  = H + BALL_H
 
     WIN = "Strobe Capture"
