@@ -127,8 +127,8 @@ def draw_guide_overlay(img, W, H, ball_pos_fullres=None):
     # Ligne de repère
     cv2.line(img, (0, cy), (W, cy), WHITE, 1, cv2.LINE_AA)
 
-    # Cercle balle : bord gauche de col 4  (cw * 3)
-    bx = ball_pos_fullres[0] if ball_pos_fullres else cw * 3
+    # Cercle balle : centre à cw*3+18 → bord gauche collé au bord de col 4
+    bx = ball_pos_fullres[0] if ball_pos_fullres else cw * 3 + 18
     by = ball_pos_fullres[1] if ball_pos_fullres else cy
     cv2.circle(img, (bx, by), 18, WHITE, 2, cv2.LINE_AA)
     put_text(img, "balle", (bx - 16, by + 32), scale=0.38, color=WHITE)
@@ -314,11 +314,11 @@ def main():
             cw_h    = half.shape[1] // N_COLS
             cy_h    = half.shape[0] // 2
 
-            # ── Détection balle : position FIXE (bord gauche col 4) ─────
-            # On vérifie juste la présence d'un blob lumineux à cet endroit.
-            ball_x_exp = cw_h * 3
+            # ── Détection balle : bord GAUCHE de la balle au bord gauche col 4
+            # Centre = cw_h*3 + BALL_CROP_R//2  (rayon ≈ 15 demi-res)
+            ball_x_exp = cw_h * 3 + 15
             ball_y_exp = cy_h
-            br = 20   # rayon de recherche (demi-res)
+            br = 22   # rayon de recherche (demi-res)
             region = diff[max(0, ball_y_exp - br):ball_y_exp + br,
                           max(0, ball_x_exp - br):ball_x_exp + br]
             ball_present = int(np.sum(region > MOTION_THRESH)) >= BALL_BLOB_PX
@@ -329,7 +329,7 @@ def main():
 
             # ── Détection putter dans sa zone ────────────────────────────
             pz_x0 = cw_h * 3 + 11
-            pz_x1 = min(cw_h * 5, half.shape[1])
+            pz_x1 = min(cw_h * 6, half.shape[1])  # étendu à col 6 pour capturer le passage col4→5
             pz_y0 = max(cy_h - 55, 0)
             pz_y1 = min(cy_h + 55, half.shape[0])
 
@@ -377,8 +377,8 @@ def main():
                             armed_for_swing = True
                             print("[armed] READY – swing !")
                     else:
-                        # ── Phase swing : putter se déplace à DROITE ─────
-                        if pcx - putter_anchor[0] > PUTTER_SWING_PX:
+                        # ── Phase swing : putter franchit la frontière col4→col5 ──
+                        if pcx >= cw_h * 4:
                             state         = State.RECORDING
                             rec_start     = now
                             kf_frames     = [None] * N_COLS
@@ -534,16 +534,10 @@ def main():
                 cv2.rectangle(live, (bx0, by0),
                               (bx0 + int(bw * stab), by0 + bh), clr, -1)
 
-            # READY en grand si is_ready
+            # READY petit, blanc, coin bas-droit
             if state == State.ARMED and is_ready:
-                txt = "READY"
-                (tw, th_), _ = cv2.getTextSize(txt, FONT, 4.0, 6)
-                cv2.putText(live, txt,
-                            ((W - tw) // 2, (H + th_) // 2),
-                            FONT, 4.0, (0, 0, 0), 10, cv2.LINE_AA)
-                cv2.putText(live, txt,
-                            ((W - tw) // 2, (H + th_) // 2),
-                            FONT, 4.0, GREEN, 6, cv2.LINE_AA)
+                put_text(live, "READY", (W - 88, H - 14),
+                         scale=0.6, color=WHITE, bold=True)
 
             top_panel = live
 
