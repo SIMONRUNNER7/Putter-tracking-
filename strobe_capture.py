@@ -429,18 +429,19 @@ def main():
                             sw_done = True
                     sw_cx_prev = cx_h
 
-                    # Col 4 (index 3) = frame d'impact : putter cx le plus proche de la balle
-                    if ball_rest is not None:
-                        impact_off = abs(cx_h - ball_rest[1][0])
-                        if impact_off < kf_impact_off:
-                            kf_impact_off = impact_off
-                            kf_impact     = half.copy()
-
-                    # Autres colonnes : frame quand putter est au centre de la col
-                    if sw_peaked and not sw_done and col != 3:
-                        if off < kf_offs[col]:
-                            kf_offs[col]   = off
-                            kf_frames[col] = half.copy()
+                    # Capture des colonnes pendant la descente uniquement
+                    if sw_peaked and not sw_done:
+                        # Col 4 (index 3) = impact : putter cx le plus proche du x balle
+                        if ball_rest is not None:
+                            impact_off = abs(cx_h - ball_rest[1][0])
+                            if impact_off < kf_impact_off:
+                                kf_impact_off = impact_off
+                                kf_impact     = half.copy()
+                        # Autres colonnes
+                        if col != 3:
+                            if off < kf_offs[col]:
+                                kf_offs[col]   = off
+                                kf_frames[col] = half.copy()
 
             # — Balle : scan luminosité dans col 1 après impact ———————————
             # La balle (ronde et blanche) laisse un patch très lumineux.
