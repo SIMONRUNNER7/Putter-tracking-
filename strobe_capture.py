@@ -42,10 +42,11 @@ BALL_CROP_R      = 30
 
 # Auto-déclenchement
 PUTTER_STABLE_SEC  = 2.0   # secondes d'immobilité requises
+PUTTER_ABSORB_SEC  = 1.0   # secondes d'absorption du putter dans le fond
 PUTTER_STILL_PX    = 10    # pixels demi-res : seuil "immobile"
 PUTTER_SWING_PX    = 18    # pixels demi-res : déplacement DROITE = swing
 PUTTER_MIN_AREA    = 300   # aire min blob putter (demi-res px²)
-BALL_ZONE_TOL      = 50    # pixels demi-res : tolérance détection balle
+BALL_BLOB_PX       = 40    # nb pixels min pour confirmer la balle au bon endroit
 
 # Seule colonne où afficher la balle (col 1, index 0-based)
 BALL_COLS = (0,)
@@ -255,6 +256,8 @@ def main():
 
     # Auto-déclenchement (ARMED)
     is_ready           = False   # balle + putter stables depuis PUTTER_STABLE_SEC
+    absorb_start       = 0.0     # quand l'absorption du fond a commencé
+    armed_for_swing    = False   # fond absorbé, prêt pour le swing
     putter_anchor      = None    # (cx, cy) demi-res quand putter stable
     putter_stable_since = 0.0
 
@@ -311,28 +314,20 @@ def main():
             cw_h    = half.shape[1] // N_COLS
             cy_h    = half.shape[0] // 2
 
-            # ── Détection balle (Hough) ──────────────────────────────────
-            gray_a = cv2.cvtColor(half, cv2.COLOR_BGR2GRAY)
-            blur_a = cv2.GaussianBlur(gray_a, (5, 5), 0)
-            circles = cv2.HoughCircles(blur_a, cv2.HOUGH_GRADIENT, dp=1,
-                                       minDist=30, param1=50, param2=12,
-                                       minRadius=3, maxRadius=18)
-            if circles is not None:
-                circles = np.round(circles[0]).astype(int)
-                # Accepte uniquement les cercles proches du bord gauche de col 4
-                x_exp = cw_h * 3
-                valid = [c for c in circles
-                         if abs(c[0] - x_exp) < BALL_ZONE_TOL
-                         and abs(c[1] - cy_h) < BALL_ZONE_TOL]
-                if valid:
-                    best = max(valid,
-                               key=lambda c: int(gray_a[
-                                   min(c[1], half.shape[0]-1),
-                                   min(c[0], half.shape[1]-1)]))
-                    ball_rest = (kf_rest, (int(best[0]), int(best[1])))
+            # ── Détection balle : position FIXE (bord gauche col 4) ─────
+            # On vérifie juste la présence d'un blob lumineux à cet endroit.
+            ball_x_exp = cw_h * 3
+            ball_y_exp = cy_h
+            br = 20   # rayon de recherche (demi-res)
+            region = diff[max(0, ball_y_exp - br):ball_y_exp + br,
+                          max(0, ball_x_exp - br):ball_x_exp + br]
+            ball_present = int(np.sum(region > MOTION_THRESH)) >= BALL_BLOB_PX
+            if ball_present:
+                ball_rest = (kf_rest, (ball_x_exp, ball_y_exp))
+            else:
+                ball_rest = None
 
             # ── Détection putter dans sa zone ────────────────────────────
-            # Zone putter demi-res : juste à droite de la balle, ~2 cols
             pz_x0 = cw_h * 3 + 11
             pz_x1 = min(cw_h * 5, half.shape[1])
             pz_y0 = max(cy_h - 55, 0)
@@ -357,25 +352,33 @@ def main():
                     putter_found = True
 
                     if not is_ready:
-                        # Phase stabilisation
+                        # ── Phase stabilisation du putter ────────────────
                         if putter_anchor is None:
                             putter_anchor       = (pcx, pcy)
                             putter_stable_since = now
                         elif abs(pcx - putter_anchor[0]) > PUTTER_STILL_PX:
-                            # A bougé → reset
                             putter_anchor       = (pcx, pcy)
                             putter_stable_since = now
-                        # Sinon : stable, le chrono continue
 
-                        putter_stable = now - putter_stable_since >= PUTTER_STABLE_SEC
-                        if putter_stable and ball_rest is not None:
-                            is_ready   = True
-                            kf_address = kf_rest  # snapshot avant swing
-                            print("[armed] READY – attend le coup")
+                        if (now - putter_stable_since >= PUTTER_STABLE_SEC
+                                and ball_rest is not None):
+                            is_ready     = True
+                            absorb_start = now
+                            armed_for_swing = False
+                            kf_address   = kf_rest
+                            print("[armed] putter stable → absorption fond")
+
+                    elif not armed_for_swing:
+                        # ── Phase absorption : fond absorbe le putter ────
+                        # (alpha élevé = absorption rapide)
+                        cv2.accumulateWeighted(
+                            gray_h.astype(np.float32), bg_model, 0.25)
+                        if now - absorb_start >= PUTTER_ABSORB_SEC:
+                            armed_for_swing = True
+                            print("[armed] READY – swing !")
                     else:
-                        # Phase déclenchement : surveille mouvement DROITE
+                        # ── Phase swing : putter se déplace à DROITE ─────
                         if pcx - putter_anchor[0] > PUTTER_SWING_PX:
-                            # ── SWING DÉTECTÉ → RECORDING ──────────────
                             state         = State.RECORDING
                             rec_start     = now
                             kf_frames     = [None] * N_COLS
@@ -389,6 +392,7 @@ def main():
                             sw_done       = False
                             sw_cx_prev    = -1
                             is_ready      = False
+                            armed_for_swing = False
                             putter_anchor = None
                             print(f"[rec] auto-trigger #{shot_count+1}"
                                   f"  balle={'oui' if ball_rest else 'non'}")
@@ -480,6 +484,7 @@ def main():
                 # Retour à ARMED (fond conservé, re-détecte balle + putter)
                 state               = State.ARMED
                 is_ready            = False
+                armed_for_swing     = False
                 putter_anchor       = None
                 putter_stable_since = 0.0
                 ball_rest           = None
@@ -508,8 +513,8 @@ def main():
                 sx_d = W / (W // 2);  sy_d = H / (H // 2)
                 pr   = (int(ball_rest[1][0] * sx_d),
                         int(ball_rest[1][1] * sy_d))
-                cv2.circle(live, pr, BALL_CROP_R + 4, (0, 0, 0), 3, cv2.LINE_AA)
-                cv2.circle(live, pr, BALL_CROP_R + 4, GREEN,      2, cv2.LINE_AA)
+                cv2.circle(live, pr, BALL_CROP_R + 4, (0, 0, 0),       3, cv2.LINE_AA)
+                cv2.circle(live, pr, BALL_CROP_R + 4, (255, 140, 0), 2, cv2.LINE_AA)  # bleu
 
             # Visualisation zone putter (barre de stabilité)
             if state == State.ARMED and putter_anchor is not None:
