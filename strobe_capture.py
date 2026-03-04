@@ -44,7 +44,8 @@ RAW_DIR       = os.path.join(OUT_DIR, "raw")
 MOTION_THRESH = 25
 MOTION_AREA   = 80      # aire minimale pour détecter un mouvement
 SWING_PEAK_DELTA = 5    # pixels demi-res pour confirmer le changement de direction
-BALL_CROP_PAD    = 50   # demi-côté du crop balle collé sur le strobe (pixels pleine-res)
+BALL_CROP_R      = 30   # rayon du crop circulaire balle (pixels pleine-res)
+BALL_SNAP_DISTS  = (28, 62)  # demi-res : distances pour les 2 snaps d'exit après repos
 
 # ── Palette ────────────────────────────────────────────────────────────────────
 DIM_COLOR  = (40, 40, 40)
@@ -177,41 +178,35 @@ def make_ball_panel(kf_impact, kf_exit, pos_impact, pos_exit, W: int, H: int) ->
     return panel
 
 
-def _paste_ball_crop(canvas, kf_halfres, pos_halfres, W, H):
-    """Colle un crop centré sur la balle (pos en demi-res) sur canvas pleine-res."""
+def _paste_ball_circle(canvas, kf_halfres, pos_halfres, W, H):
+    """Colle un crop CIRCULAIRE serré centré sur la balle (pos en demi-res)."""
     if kf_halfres is None or pos_halfres is None:
         return
     frame = cv2.resize(kf_halfres, (W, H))
     sx = W / (W // 2);  sy = H / (H // 2)
     cx = int(pos_halfres[0] * sx);  cy = int(pos_halfres[1] * sy)
-    x0 = max(0, cx - BALL_CROP_PAD);  y0 = max(0, cy - BALL_CROP_PAD)
-    x1 = min(W, cx + BALL_CROP_PAD);  y1 = min(H, cy + BALL_CROP_PAD)
-    canvas[y0:y1, x0:x1] = frame[y0:y1, x0:x1]
+    mask = np.zeros((H, W), dtype=np.uint8)
+    cv2.circle(mask, (cx, cy), BALL_CROP_R, 255, -1)
+    canvas[mask > 0] = frame[mask > 0]
 
 
-def make_training_frame(kf_frames, kf_rest, kf_exit, W: int, H: int,
-                        pos_rest=None, pos_exit=None) -> np.ndarray:
+def make_training_frame(kf_frames, ball_snaps, W: int, H: int) -> np.ndarray:
     """
-    Image d'entraînement W×H : strobe putter + crop balle au repos + crop balle sortie.
-    Flèche depuis pos_rest (balle immobile avant le coup) vers pos_exit.
-    Toutes les positions en coordonnées demi-résolution.
+    Image d'entraînement W×H : strobe putter + 3 crops circulaires de la balle.
+    ball_snaps : liste de (kf_halfres, pos_halfres) – [repos, mid, exit]
+    Flèche depuis le premier snap (repos) vers le dernier (exit).
     """
     canvas = make_strobe(kf_frames, W, H)
 
-    # Colle les crops propres (aucun pixel parasite)
-    _paste_ball_crop(canvas, kf_rest, pos_rest, W, H)
-    _paste_ball_crop(canvas, kf_exit, pos_exit, W, H)
-
-    # Flèche trajectoire
     sx = W / (W // 2);  sy = H / (H // 2)
-    if pos_rest and pos_exit:
-        p0 = (int(pos_rest[0] * sx),  int(pos_rest[1] * sy))
-        p1 = (int(pos_exit[0] * sx),  int(pos_exit[1] * sy))
-        cv2.circle(canvas, p0, 12, (0, 0, 0),  3, cv2.LINE_AA)
-        cv2.circle(canvas, p0, 12, GREEN,       2, cv2.LINE_AA)
+    for kf, pos in (ball_snaps or []):
+        _paste_ball_circle(canvas, kf, pos, W, H)
+
+    if ball_snaps and len(ball_snaps) >= 2:
+        p0 = (int(ball_snaps[0][1][0] * sx), int(ball_snaps[0][1][1] * sy))
+        p1 = (int(ball_snaps[-1][1][0] * sx), int(ball_snaps[-1][1][1] * sy))
         cv2.arrowedLine(canvas, p0, p1, (0, 0, 0), 4, cv2.LINE_AA, tipLength=0.10)
         cv2.arrowedLine(canvas, p0, p1, ACCENT,    2, cv2.LINE_AA, tipLength=0.10)
-        cv2.circle(canvas, p1, 8, ORANGE, 2, cv2.LINE_AA)
 
     return canvas
 
@@ -227,17 +222,14 @@ def make_composite(kf_frames, W, H,
 
 # ── Sauvegarde ────────────────────────────────────────────────────────────────
 def save_shot(kf_frames, composite, n,
-              kf_rest=None, kf_exit=None, W=1280, H=720,
-              pos_rest=None, pos_exit=None) -> str:
+              ball_snaps=None, W=1280, H=720) -> str:
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(RAW_DIR, exist_ok=True)
     tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Training image (déjà construite dans main)
     comp_path = os.path.join(OUT_DIR, f"strobe_{tag}.png")
     cv2.imwrite(comp_path, composite)
 
-    # Frames putter individuelles
     saved_raw = 0
     for i, kf in enumerate(kf_frames):
         if kf is None:
@@ -246,24 +238,17 @@ def save_shot(kf_frames, composite, n,
                     [cv2.IMWRITE_JPEG_QUALITY, 95])
         saved_raw += 1
 
-    # Frame balle au repos + sortie (pleine résolution)
-    if kf_rest is not None:
-        cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_rest.jpg"),
-                    cv2.resize(kf_rest, (W, H)),
-                    [cv2.IMWRITE_JPEG_QUALITY, 95])
-    if kf_exit is not None:
-        cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_exit.jpg"),
-                    cv2.resize(kf_exit, (W, H)),
-                    [cv2.IMWRITE_JPEG_QUALITY, 95])
+    for i, (kf, _) in enumerate(ball_snaps or []):
+        names = ["rest", "mid", "exit"]
+        label = names[i] if i < len(names) else f"ball{i}"
+        cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_{label}.jpg"),
+                    cv2.resize(kf, (W, H)), [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-    # Copie training dans raw/
     cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_training.jpg"), composite,
                 [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-    print(f"[save] #{n:03d}  → {comp_path}  "
-          f"({saved_raw} cols putter, "
-          f"repos={'oui' if kf_rest is not None else 'non'}, "
-          f"sortie={'oui' if kf_exit is not None else 'non'})")
+    n_snaps = len(ball_snaps) if ball_snaps else 0
+    print(f"[save] #{n:03d}  → {comp_path}  ({saved_raw} cols putter, {n_snaps} snaps balle)")
     return comp_path
 
 
@@ -281,11 +266,8 @@ def main():
     kf_frames  = [None] * N_COLS
     kf_offs    = [float('inf')] * N_COLS
     # Balle : 2 keyframes
-    kf_rest    = None   # dernière frame calme (balle au repos, ARMED)
-    kf_exit    = None   # frame demi-res à la sortie
-    pos_rest   = None   # (cx, cy) demi-res balle au repos
-    pos_exit   = None   # (cx, cy) demi-res balle à la sortie
-    max_ball_d = 0.0    # distance maximale balle vue depuis pos_rest
+    ball_snaps = []     # [(kf_halfres, (cx,cy)), …]  repos / mid / exit
+    bg_clean   = None   # snapshot gris mat propre (capturé au SPACE)
     # Suivi directionnel du putter (downswing droite→gauche uniquement)
     sw_cx_max  = -1     # cx le plus à droite vu en demi-res
     sw_peaked  = False  # True une fois passé le pic backswing
@@ -334,36 +316,42 @@ def main():
                 state    = State.ARMED
 
         elif state == State.ARMED:
-            # Mémorise la dernière frame calme (balle au repos)
-            kf_rest = half.copy()
-            # Détecte la position de la balle blanche (blob clair sur fond vert)
-            hsv_h   = cv2.cvtColor(half, cv2.COLOR_BGR2HSV)
-            bmask   = ((hsv_h[:, :, 1] < 50) &
-                       (hsv_h[:, :, 2] > 200)).astype(np.uint8) * 255
-            bcnts, _ = cv2.findContours(bmask, cv2.RETR_EXTERNAL,
-                                        cv2.CHAIN_APPROX_SIMPLE)
-            bcnts = [c for c in bcnts if 5 <= cv2.contourArea(c) <= 800]
-            if bcnts:
-                bc = max(bcnts, key=cv2.contourArea)
-                Mb = cv2.moments(bc)
-                if Mb["m00"] > 0:
-                    pos_rest = (int(Mb["m10"] / Mb["m00"]),
-                                int(Mb["m01"] / Mb["m00"]))
+            # Détecte la balle par diff avec le mat propre (bg_clean)
+            if bg_clean is not None:
+                gray_cur = cv2.cvtColor(half, cv2.COLOR_BGR2GRAY)
+                diff_bg  = np.abs(gray_cur.astype(np.float32) -
+                                  bg_clean.astype(np.float32))
+                _, diff_th = cv2.threshold(diff_bg.astype(np.uint8),
+                                           25, 255, cv2.THRESH_BINARY)
+                bcnts, _ = cv2.findContours(diff_th, cv2.RETR_EXTERNAL,
+                                            cv2.CHAIN_APPROX_SIMPLE)
+                best_pos  = None;  best_circ = 0.0
+                for c in bcnts:
+                    area = cv2.contourArea(c)
+                    if not (8 <= area <= 500):
+                        continue
+                    peri = cv2.arcLength(c, True)
+                    circ = 4 * np.pi * area / (peri * peri) if peri > 0 else 0
+                    if circ > best_circ:
+                        M = cv2.moments(c)
+                        if M["m00"] > 0:
+                            best_circ = circ
+                            best_pos  = (int(M["m10"] / M["m00"]),
+                                         int(M["m01"] / M["m00"]))
+                if best_pos and best_circ > 0.35:
+                    ball_snaps = [(half.copy(), best_pos)]
 
             if motion:
                 state      = State.RECORDING
                 rec_start  = now
                 kf_frames  = [None] * N_COLS
                 kf_offs    = [float('inf')] * N_COLS
-                kf_exit    = None
-                pos_exit   = None
-                max_ball_d = 0.0
                 sw_cx_max  = -1
                 sw_peaked  = False
                 sw_done    = False
                 sw_cx_prev = -1
                 print(f"[rec] coup #{shot_count + 1} déclenché"
-                      f"  repos balle={'oui' if pos_rest else 'non détecté'}")
+                      f"  balle={'oui' if ball_snaps else 'non détectée'}")
 
         elif state == State.RECORDING:
             sig_cnts = [c for c in cnts if cv2.contourArea(c) >= MOTION_AREA]
@@ -399,28 +387,27 @@ def main():
                             kf_offs[col]   = off
                             kf_frames[col] = half.copy()
 
-            # — Balle : contour le plus éloigné de pos_rest (balle qui roule) —
-            if sig_cnts and pos_rest is not None:
-                for c in sig_cnts:
-                    Mb = cv2.moments(c)
-                    if Mb["m00"] > 0:
-                        bx = int(Mb["m10"] / Mb["m00"])
-                        by = int(Mb["m01"] / Mb["m00"])
-                        dist = ((bx - pos_rest[0]) ** 2 +
-                                (by - pos_rest[1]) ** 2) ** 0.5
-                        if dist > max_ball_d:
-                            max_ball_d = dist
-                            kf_exit    = half.copy()
-                            pos_exit   = (bx, by)
+            # — Balle : 2 snaps d'exit (distances croissantes depuis la position de repos) —
+            if sw_peaked and ball_snaps and len(ball_snaps) < 3 and sig_cnts:
+                pos_ref  = ball_snaps[0][1]
+                target_d = BALL_SNAP_DISTS[len(ball_snaps) - 1]
+                for c in sorted(sig_cnts, key=cv2.contourArea):
+                    M = cv2.moments(c)
+                    if M["m00"] > 0:
+                        bx   = int(M["m10"] / M["m00"])
+                        by   = int(M["m01"] / M["m00"])
+                        dist = ((bx - pos_ref[0]) ** 2 +
+                                (by - pos_ref[1]) ** 2) ** 0.5
+                        if dist >= target_d:
+                            ball_snaps.append((half.copy(), (bx, by)))
+                            break
 
             # — Fin d'enregistrement —
             if now - rec_start >= RECORD_SECS:
                 shot_count += 1
-                composite  = make_training_frame(kf_frames, kf_rest, kf_exit,
-                                                 W, H, pos_rest, pos_exit)
+                composite  = make_training_frame(kf_frames, ball_snaps, W, H)
                 last_path  = save_shot(kf_frames, composite, shot_count,
-                                       kf_rest, kf_exit, W, H,
-                                       pos_rest, pos_exit)
+                                       ball_snaps, W, H)
                 state      = State.PREVIEW
                 preview_t  = now
 
@@ -437,13 +424,14 @@ def main():
             if state in (State.READY, State.COUNTDOWN, State.ARMED):
                 live = (live.astype(np.float32) * 0.75).astype(np.uint8)
             draw_column_grid(live, W, H)
-            # Pendant ARMED : affiche un marqueur sur la balle détectée
-            if state == State.ARMED and pos_rest is not None:
-                sx = W / (W // 2);  sy = H / (H // 2)
-                pr = (int(pos_rest[0] * sx), int(pos_rest[1] * sy))
-                cv2.circle(live, pr, 14, (0, 0, 0),  3, cv2.LINE_AA)
-                cv2.circle(live, pr, 14, GREEN,       2, cv2.LINE_AA)
-                put_text(live, "balle", (pr[0]+18, pr[1]+5),
+            # Pendant ARMED : affiche le crop circulaire sur la balle détectée
+            if state == State.ARMED and ball_snaps:
+                sx_d = W / (W // 2);  sy_d = H / (H // 2)
+                pr   = (int(ball_snaps[0][1][0] * sx_d),
+                        int(ball_snaps[0][1][1] * sy_d))
+                cv2.circle(live, pr, BALL_CROP_R + 4, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.circle(live, pr, BALL_CROP_R + 4, GREEN,      2, cv2.LINE_AA)
+                put_text(live, "balle", (pr[0] + BALL_CROP_R + 8, pr[1] + 5),
                          scale=0.45, color=GREEN)
             top_panel = live
 
@@ -493,9 +481,11 @@ def main():
         if key in (ord('q'), 27):
             break
         elif key == ord(' ') and state == State.READY:
-            state    = State.COUNTDOWN
-            cd_start = now
-            pos_rest = None
+            state      = State.COUNTDOWN
+            cd_start   = now
+            ball_snaps = []
+            # Capture le mat propre (avant que l'utilisateur pose la balle)
+            bg_clean   = cv2.cvtColor(half, cv2.COLOR_BGR2GRAY)
         elif key == ord('r'):
             bg_model = None
             state    = State.READY
