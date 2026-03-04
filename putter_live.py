@@ -40,6 +40,7 @@ _MODEL_PATH = os.path.join(
     "runs", "obb", "runs", "obb", "putter_obb", "weights", "best.pt"
 )
 from collections import deque
+from scipy.interpolate import CubicSpline
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -51,8 +52,7 @@ RECORD_SECS        = 2.5    # stroke capture window (seconds)
 COUNTDOWN_SECS     = 3      # countdown duration
 SMOOTH_WIN         = 5      # moving-average window (frames)
 REPLAY_FPS         = 12     # slow-motion replay speed
-REPLAY_SUB         = 2      # store every Nth frame for replay (memory saving)
-TARGET_FPS         = 60
+TARGET_FPS         = 240    # ask camera for max fps (will cap at what it supports)
 PANEL_H            = 130    # height of metrics panel below video (px)
 ARUCO_DICT_ID      = cv2.aruco.DICT_4X4_50 if hasattr(cv2, "aruco") else None
 
@@ -171,6 +171,7 @@ def _save_markers(aruco_dict, out_dir: str = "markers"):
 class PutterLive:
 
     def __init__(self):
+        self._replay_sub = 2   # overwritten by _open_camera based on actual fps
         self.cap = self._open_camera()
         self.W   = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.H   = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -286,8 +287,11 @@ class PutterLive:
                 cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
                 cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
                 cap.set(cv2.CAP_PROP_EXPOSURE, -7)
-                actual = cap.get(cv2.CAP_PROP_EXPOSURE)
-                print(f"[cam] exposure={actual}  (increase toward 0 if too dark)")
+                actual_exp = cap.get(cv2.CAP_PROP_EXPOSURE)
+                actual_fps = cap.get(cv2.CAP_PROP_FPS)
+                # store every Nth frame so we keep ~60 fps of content
+                self._replay_sub = max(1, round(actual_fps / 60))
+                print(f"[cam] fps={actual_fps:.0f}  replay_sub={self._replay_sub}  exposure={actual_exp}")
                 return cap
 
         raise RuntimeError(
@@ -921,6 +925,7 @@ class PutterLive:
         scale_y = vid_h   / sf_h
         centers_disp: list = [None] * N_COLS
 
+        overlay = out.copy()
         for i, box in enumerate(self._strobe_det):
             if box is None:
                 continue
@@ -928,8 +933,17 @@ class PutterLive:
             dcx = int(cx * scale_x);  dcy = int(cy * scale_y)
             dw  = w * scale_x;        dh  = h * scale_y
             pts = cv2.boxPoints(((float(dcx), float(dcy)), (dw, dh), angle_deg)).astype(np.int32)
-            cv2.drawContours(out, [pts], 0, (0, 255, 100), 2, cv2.LINE_AA)
+            cv2.drawContours(overlay, [pts], 0, (255, 255, 255), -1)
             centers_disp[i] = (dcx, dcy)
+        cv2.addWeighted(overlay, 0.5, out, 0.5, 0, out)
+        for i, box in enumerate(self._strobe_det):
+            if box is None:
+                continue
+            cx, cy, w, h, angle_deg = box
+            dcx = int(cx * scale_x);  dcy = int(cy * scale_y)
+            dw  = w * scale_x;        dh  = h * scale_y
+            pts = cv2.boxPoints(((float(dcx), float(dcy)), (dw, dh), angle_deg)).astype(np.int32)
+            cv2.drawContours(out, [pts], 0, (255, 255, 255), 1, cv2.LINE_AA)
 
         # Fallback: stored positions
         r_fb = self.result
@@ -949,12 +963,19 @@ class PutterLive:
                 if in_col:
                     centers_disp[i] = in_col[len(in_col) // 2]
 
-        # Arc through strobe detection centers
+        # Arc lissé (spline cubique) à travers les centres détectés
         arc_pts = [pt for pt in centers_disp if pt is not None]
         if len(arc_pts) >= 2:
-            arc_arr = np.array(arc_pts, np.int32).reshape(-1, 1, 2)
-            cv2.polylines(out, [arc_arr], False, (0, 0, 0),   5, cv2.LINE_AA)
-            cv2.polylines(out, [arc_arr], False, (0, 220, 255), 2, cv2.LINE_AA)
+            arc_pts_s = sorted(arc_pts, key=lambda p: p[0])
+            t_knots = np.linspace(0.0, 1.0, len(arc_pts_s))
+            xs = np.array([p[0] for p in arc_pts_s], dtype=float)
+            ys = np.array([p[1] for p in arc_pts_s], dtype=float)
+            cs_x = CubicSpline(t_knots, xs)
+            cs_y = CubicSpline(t_knots, ys)
+            t_fine = np.linspace(0.0, 1.0, 300)
+            smooth = np.stack([cs_x(t_fine), cs_y(t_fine)], axis=1).astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(out, [smooth], False, (0, 0, 0),   5, cv2.LINE_AA)
+            cv2.polylines(out, [smooth], False, (0, 0, 220), 2, cv2.LINE_AA)
 
         # Full recorded trajectory (red arc)
         r = self.result
@@ -965,13 +986,13 @@ class PutterLive:
             cv2.polylines(out, [traj], False, ( 50,  50, 255), 4, cv2.LINE_AA)
             cv2.polylines(out, [traj], False, (180, 180, 255), 2, cv2.LINE_AA)
 
-        # Head markers
+        # Head markers (taille réduite à 1/3)
         for pt in centers_disp:
             if pt is None:
                 continue
-            cv2.circle(out, pt, 16, (  0,   0,   0), -1, cv2.LINE_AA)
-            cv2.circle(out, pt, 13, ( 50,  50, 255), -1, cv2.LINE_AA)
-            cv2.circle(out, pt, 16, (255, 255, 255),  2, cv2.LINE_AA)
+            cv2.circle(out, pt,  5, (  0,   0,   0), -1, cv2.LINE_AA)
+            cv2.circle(out, pt,  4, ( 50,  50, 255), -1, cv2.LINE_AA)
+            cv2.circle(out, pt,  5, (255, 255, 255),  1, cv2.LINE_AA)
 
         # Column dividers
         for i in range(1, N_COLS):
@@ -1188,7 +1209,7 @@ class PutterLive:
                             self._kf_col_offs[3]   = 0.0
 
                 self._rep_ctr += 1
-                if self._rep_ctr % REPLAY_SUB == 0:
+                if self._rep_ctr % self._replay_sub == 0:
                     self._rep_frames.append(_half.copy())
                     self._rep_positions.append(track_pos)
 
@@ -1218,10 +1239,8 @@ class PutterLive:
                     self._last_path = list(self.result.positions)
                 self._kf_init    = False
                 self._strobe_det = None
-                self._rep_idx   = 0
-                self._rep_loops = 0
-                self._rep_last  = now
-                self.state      = AppState.REPLAY
+                self._kf_done   = False
+                self.state      = AppState.KEYFRAMES
 
             # ── REPLAY ────────────────────────────────────────────────────
             elif self.state == AppState.REPLAY:
