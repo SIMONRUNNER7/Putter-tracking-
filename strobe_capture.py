@@ -267,7 +267,7 @@ def main():
     kf_offs    = [float('inf')] * N_COLS
     # Balle : 2 keyframes
     ball_snaps = []     # [(kf_halfres, (cx,cy)), …]  repos / mid / exit
-    bg_clean   = None   # snapshot gris mat propre (capturé au SPACE)
+    kf_rest    = None   # dernière frame demi-res calme (ARMED)
     # Suivi directionnel du putter (downswing droite→gauche uniquement)
     sw_cx_max  = -1     # cx le plus à droite vu en demi-res
     sw_peaked  = False  # True une fois passé le pic backswing
@@ -316,30 +316,23 @@ def main():
                 state    = State.ARMED
 
         elif state == State.ARMED:
-            # Détecte la balle par diff avec le mat propre (bg_clean)
-            if bg_clean is not None:
-                gray_cur = cv2.cvtColor(half, cv2.COLOR_BGR2GRAY)
-                diff_bg  = np.abs(gray_cur.astype(np.float32) -
-                                  bg_clean.astype(np.float32))
-                _, diff_th = cv2.threshold(diff_bg.astype(np.uint8),
-                                           25, 255, cv2.THRESH_BINARY)
-                bcnts, _ = cv2.findContours(diff_th, cv2.RETR_EXTERNAL,
-                                            cv2.CHAIN_APPROX_SIMPLE)
-                best_pos  = None;  best_circ = 0.0
-                for c in bcnts:
-                    area = cv2.contourArea(c)
-                    if not (8 <= area <= 500):
-                        continue
-                    peri = cv2.arcLength(c, True)
-                    circ = 4 * np.pi * area / (peri * peri) if peri > 0 else 0
-                    if circ > best_circ:
-                        M = cv2.moments(c)
-                        if M["m00"] > 0:
-                            best_circ = circ
-                            best_pos  = (int(M["m10"] / M["m00"]),
-                                         int(M["m01"] / M["m00"]))
-                if best_pos and best_circ > 0.35:
-                    ball_snaps = [(half.copy(), best_pos)]
+            # Mémorise la dernière frame calme (balle immobile)
+            kf_rest = half.copy()
+
+            # Hough circles : détecte la balle ronde sur le fond sombre
+            gray_a  = cv2.cvtColor(half, cv2.COLOR_BGR2GRAY)
+            blur_a  = cv2.GaussianBlur(gray_a, (5, 5), 0)
+            circles = cv2.HoughCircles(blur_a, cv2.HOUGH_GRADIENT, dp=1,
+                                       minDist=30, param1=50, param2=12,
+                                       minRadius=3, maxRadius=18)
+            if circles is not None:
+                circles = np.round(circles[0]).astype(int)
+                Hh, Wh  = half.shape[:2]
+                # Balle blanche = centre de cercle le plus brillant
+                best = max(circles,
+                           key=lambda c: int(gray_a[min(c[1], Hh-1),
+                                                     min(c[0], Wh-1)]))
+                ball_snaps = [(kf_rest, (int(best[0]), int(best[1])))]
 
             if motion:
                 state      = State.RECORDING
@@ -387,19 +380,29 @@ def main():
                             kf_offs[col]   = off
                             kf_frames[col] = half.copy()
 
-            # — Balle : 2 snaps d'exit (distances croissantes depuis la position de repos) —
-            if sw_peaked and ball_snaps and len(ball_snaps) < 3 and sig_cnts:
-                pos_ref  = ball_snaps[0][1]
-                target_d = BALL_SNAP_DISTS[len(ball_snaps) - 1]
-                for c in sorted(sig_cnts, key=cv2.contourArea):
+            # — Balle : snaps d'exit (blobs < 350 px², distances croissantes) —
+            if sw_peaked and sig_cnts and len(ball_snaps) < 3:
+                pos_ref = ball_snaps[0][1] if ball_snaps else None
+                snap_i  = len(ball_snaps)
+                # snap 0 (repos manquant) : premier petit blob après le pic
+                # snap 1 & 2 : distances BALL_SNAP_DISTS[0] et [1]
+                target_d = (BALL_SNAP_DISTS[snap_i - 1]
+                            if snap_i > 0 and pos_ref else 0)
+                # Petits contours en priorité (balle << tête de putter)
+                small = [c for c in sig_cnts if cv2.contourArea(c) < 350]
+                cands = small if small else sig_cnts
+                for c in sorted(cands, key=cv2.contourArea):
                     M = cv2.moments(c)
                     if M["m00"] > 0:
-                        bx   = int(M["m10"] / M["m00"])
-                        by   = int(M["m01"] / M["m00"])
-                        dist = ((bx - pos_ref[0]) ** 2 +
-                                (by - pos_ref[1]) ** 2) ** 0.5
+                        bx = int(M["m10"] / M["m00"])
+                        by = int(M["m01"] / M["m00"])
+                        dist = (((bx - pos_ref[0]) ** 2 +
+                                 (by - pos_ref[1]) ** 2) ** 0.5
+                                if pos_ref else 0)
                         if dist >= target_d:
                             ball_snaps.append((half.copy(), (bx, by)))
+                            if pos_ref is None:
+                                pos_ref = (bx, by)
                             break
 
             # — Fin d'enregistrement —
@@ -484,8 +487,7 @@ def main():
             state      = State.COUNTDOWN
             cd_start   = now
             ball_snaps = []
-            # Capture le mat propre (avant que l'utilisateur pose la balle)
-            bg_clean   = cv2.cvtColor(half, cv2.COLOR_BGR2GRAY)
+            kf_rest    = None
         elif key == ord('r'):
             bg_model = None
             state    = State.READY
