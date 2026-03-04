@@ -314,14 +314,14 @@ def main():
             cw_h    = half.shape[1] // N_COLS
             cy_h    = half.shape[0] // 2
 
-            # ── Détection balle : bord GAUCHE de la balle au bord gauche col 4
-            # Centre = cw_h*3 + BALL_CROP_R//2  (rayon ≈ 15 demi-res)
-            ball_x_exp = cw_h * 3 + 15
+            # ── Détection balle : luminosité (balle = rond blanc, canaux > 200) ─
+            ball_x_exp = cw_h * 3 + 15   # centre, bord gauche flush col 4
             ball_y_exp = cy_h
-            br = 22   # rayon de recherche (demi-res)
-            region = diff[max(0, ball_y_exp - br):ball_y_exp + br,
+            br = 22
+            region = half[max(0, ball_y_exp - br):ball_y_exp + br,
                           max(0, ball_x_exp - br):ball_x_exp + br]
-            ball_present = int(np.sum(region > MOTION_THRESH)) >= BALL_BLOB_PX
+            white_mask   = np.all(region > 200, axis=2)
+            ball_present = int(np.sum(white_mask)) >= BALL_BLOB_PX
             if ball_present:
                 ball_rest = (kf_rest, (ball_x_exp, ball_y_exp))
             else:
@@ -377,8 +377,8 @@ def main():
                             armed_for_swing = True
                             print("[armed] READY – swing !")
                     else:
-                        # ── Phase swing : putter franchit la frontière col4→col5 ──
-                        if pcx >= cw_h * 4:
+                        # ── Phase swing : putter franchit col4→col5, balle confirmée ──
+                        if pcx >= cw_h * 4 and ball_rest is not None:
                             state         = State.RECORDING
                             rec_start     = now
                             kf_frames     = [None] * N_COLS
@@ -432,30 +432,24 @@ def main():
                             kf_offs[col]   = off
                             kf_frames[col] = half.copy()
 
-            # — Balle : col 1 seule (même logique centre de colonne) ———————
-            if sw_peaked and sig_cnts and ball_rest is not None:
-                rest_x, rest_y = ball_rest[1]
-                small = [c for c in sig_cnts if cv2.contourArea(c) < 350]
-                cands = small if small else sig_cnts
-                for c in sorted(cands, key=cv2.contourArea):
-                    M = cv2.moments(c)
-                    if M["m00"] > 0:
-                        bx = int(M["m10"] / M["m00"])
-                        by = int(M["m01"] / M["m00"])
-                        dx = rest_x - bx
-                        dy = abs(by - rest_y)
-                        if dx < 5 or dy > dx * 0.65 + 12:
-                            continue
-                        bcol = min(bx // cw_h, N_COLS - 1)
-                        for bi, ci in enumerate(BALL_COLS):
-                            if bcol == ci:
-                                target_bx = (ci + 0.5) * cw_h
-                                boff = abs(bx - target_bx)
-                                if boff < ball_col_offs[bi]:
-                                    ball_col_offs[bi] = boff
-                                    ball_col_kfs[bi]  = half.copy()
-                                    ball_col_poss[bi] = (bx, by)
-                                break
+            # — Balle : scan luminosité dans col 1 après impact ———————————
+            # La balle (ronde et blanche) laisse un patch très lumineux.
+            if sw_peaked and ball_rest is not None:
+                col0_y0 = max(0, cy_h - 30)
+                col0_y1 = min(half.shape[0], cy_h + 30)
+                col0_x1 = cw_h  # toute la largeur de col 1
+                roi = half[col0_y0:col0_y1, 0:col0_x1]
+                white_px = np.all(roi > 200, axis=2)
+                n_white  = int(np.sum(white_px))
+                if n_white >= 20:
+                    ys, xs = np.where(white_px)
+                    bx_b   = int(np.median(xs))
+                    by_b   = int(np.median(ys)) + col0_y0
+                    boff   = abs(bx_b - 0.5 * cw_h)
+                    if boff < ball_col_offs[0]:
+                        ball_col_offs[0] = boff
+                        ball_col_kfs[0]  = half.copy()
+                        ball_col_poss[0] = (bx_b, by_b)
 
             # — Fin d'enregistrement ————————————————————————————————————————
             if now - rec_start >= RECORD_SECS:
