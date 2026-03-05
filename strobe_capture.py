@@ -246,7 +246,8 @@ def make_training_frame(kf_frames, ball_rest, ball_col_kfs, ball_col_poss,
 # ── Sauvegarde ────────────────────────────────────────────────────────────────
 def save_shot(kf_frames, composite, n,
               ball_rest=None, ball_col_kfs=None, ball_col_poss=None,
-              W=1280, H=720, col_candidates=None, ball_col1_cands=None):
+              W=1280, H=720, col_candidates=None, ball_col1_cands=None,
+              all_rec_frames=None, kf_best_all_idx=None):
     import json
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(RAW_DIR, exist_ok=True)
@@ -262,9 +263,8 @@ def save_shot(kf_frames, composite, n,
     cv2.imwrite(os.path.join(shot_dir, "composite.jpg"), composite,
                 [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-    # Sauvegarder candidats par colonne
+    # Sauvegarder candidats par colonne (format hérité, conservé pour compat)
     n_cands = {}
-    selected_default = {}
     if col_candidates:
         for col_idx, frames in enumerate(col_candidates):
             col_dir = os.path.join(shot_dir, f"col{col_idx + 1}")
@@ -273,8 +273,31 @@ def save_shot(kf_frames, composite, n,
                 cv2.imwrite(os.path.join(col_dir, f"frame_{fi:03d}.jpg"),
                             frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
             n_cands[col_idx] = len(frames)
-            # La sélection par défaut = frame la plus proche de la
-            # sélection automatique (kf_frames[col_idx])
+
+    # Nouveau format : toutes les frames du record → all_frames/
+    # selected_default = index dans all_frames le plus proche de la meilleure
+    # frame détectée automatiquement par colonne.
+    selected_default = {}
+    if all_rec_frames:
+        af_dir = os.path.join(shot_dir, "all_frames")
+        os.makedirs(af_dir, exist_ok=True)
+        step       = max(1, len(all_rec_frames) // 150)
+        saved_orig = list(range(0, len(all_rec_frames), step))[:150]
+        for fi, orig_idx in enumerate(saved_orig):
+            cv2.imwrite(os.path.join(af_dir, f"frame_{fi:03d}.jpg"),
+                        all_rec_frames[orig_idx], [cv2.IMWRITE_JPEG_QUALITY, 85])
+        # Mapper best_idx par colonne → index dans saved_orig
+        for col_idx in range(N_COLS):
+            orig = (kf_best_all_idx or [None] * N_COLS)[col_idx]
+            if orig is not None and saved_orig:
+                closest = min(range(len(saved_orig)),
+                              key=lambda i: abs(saved_orig[i] - orig))
+                selected_default[col_idx] = closest
+            else:
+                selected_default[col_idx] = 0
+    else:
+        # Fallback ancienne logique (pas de all_rec_frames)
+        for col_idx, frames in enumerate(col_candidates or []):
             selected_default[col_idx] = max(0, len(frames) - 3) if col_idx == 3 else 0
 
     # Balle au repos
@@ -559,6 +582,8 @@ def main():
                             col_candidates  = [[] for _ in range(N_COLS)]
                             col4_entered    = False
                             ball_col1_cands = []   # candidats balle post-impact col1
+                            all_rec_frames  = []   # toutes les frames du record
+                            kf_best_all_idx = [None] * N_COLS  # idx best frame/col dans all_rec_frames
                             print(f"[rec] auto-trigger #{shot_count + 1}")
 
             if not putter_found and not is_ready:
@@ -572,6 +597,8 @@ def main():
             cw_h = half.shape[1] // N_COLS
             cy_h = half.shape[0] // 2
             half_buf.append(half.copy())   # buffer glissant (pre_rec_buf + frames rec)
+            if len(all_rec_frames) < 300:
+                all_rec_frames.append(half.copy())
 
             # ── Position tête : YOLO en priorité, motion en fallback ───────
             head_det = yolo_detect_head(half, yolo)
@@ -639,8 +666,9 @@ def main():
                     col_center = (col + 0.5) * cw_h
                     off = abs(cx_h - col_center)
                     if off < kf_offs[col]:
-                        kf_offs[col]   = off
-                        kf_frames[col] = half.copy()
+                        kf_offs[col]          = off
+                        kf_frames[col]        = half.copy()
+                        kf_best_all_idx[col]  = len(all_rec_frames) - 1
 
             # ── Balle post-impact : scan luminosité en col 1 ──────────────
             # sw_done = putter en follow-through (repart vers droite) = col 1 libre
@@ -682,7 +710,9 @@ def main():
                     ball_col_kfs=ball_col_kfs,
                     ball_col_poss=ball_col_poss, W=W, H=H,
                     col_candidates=col_candidates,
-                    ball_col1_cands=ball_col1_cands)
+                    ball_col1_cands=ball_col1_cands,
+                    all_rec_frames=all_rec_frames,
+                    kf_best_all_idx=kf_best_all_idx)
                 state     = State.PREVIEW
                 preview_t = now
 
