@@ -405,11 +405,13 @@ def main():
             if ball_present:
                 head_det = yolo_detect_head(half, yolo)
                 if head_det is None:
-                    # Fallback 1 : diff vs fond dans la zone putter (cols 3-6)
+                    # Fallback diff vs fond dans la zone putter (cols 3-6)
+                    # Fonctionne quand le putter est posé APRÈS la calibration
+                    # (fond = mat vide → putter = nouvel objet visible dans diff).
                     pz_x0 = cw_h * 3
                     pz_x1 = min(cw_h * 6, half.shape[1])
-                    pz_y0 = max(cy_h - 60, 0)
-                    pz_y1 = min(cy_h + 60, half.shape[0])
+                    pz_y0 = max(cy_h - 45, 0)
+                    pz_y1 = min(cy_h + 45, half.shape[0])
                     diff_pz = diff[pz_y0:pz_y1, pz_x0:pz_x1].astype(np.uint8)
                     _, th_pz = cv2.threshold(diff_pz, MOTION_THRESH, 255,
                                              cv2.THRESH_BINARY)
@@ -423,35 +425,9 @@ def main():
                         if Mpz["m00"] > 0:
                             fx = int(Mpz["m10"] / Mpz["m00"]) + pz_x0
                             fy = int(Mpz["m01"] / Mpz["m00"]) + pz_y0
-                            head_det = (fx, fy, 0.0)   # conf 0 = fallback motion
-
-                if head_det is None:
-                    # Fallback 2 : détection directe par brillance (tête métal.
-                    # blanc/argent très visible sur le mat sombre)
-                    pz_x0b = cw_h * 3
-                    pz_x1b = min(cw_h * 7, half.shape[1])
-                    pz_y0b = max(cy_h - 60, 0)
-                    pz_y1b = min(cy_h + 60, half.shape[0])
-                    zone = half[pz_y0b:pz_y1b, pz_x0b:pz_x1b]
-                    bright_mask = np.all(zone > 175, axis=2).astype(np.uint8) * 255
-                    bright_mask = cv2.dilate(bright_mask, None, iterations=1)
-                    b_cnts, _ = cv2.findContours(bright_mask, cv2.RETR_EXTERNAL,
-                                                 cv2.CHAIN_APPROX_SIMPLE)
-                    ball_x_local = ball_x_exp - pz_x0b
-                    b_candidates = []
-                    for c in b_cnts:
-                        if cv2.contourArea(c) < 60:
-                            continue
-                        Mb = cv2.moments(c)
-                        if Mb["m00"] > 0:
-                            bfx = int(Mb["m10"] / Mb["m00"])
-                            if abs(bfx - ball_x_local) > 25:
-                                b_candidates.append(
-                                    (c, bfx + pz_x0b, int(Mb["m01"] / Mb["m00"]) + pz_y0b)
-                                )
-                    if b_candidates:
-                        best_b = max(b_candidates, key=lambda t: cv2.contourArea(t[0]))
-                        head_det = (best_b[1], best_b[2], 0.0)  # conf 0 = fallback brillance
+                            # Filtre Y : doit être dans la zone mat seulement
+                            if pz_y0 <= fy <= pz_y1:
+                                head_det = (fx, fy, 0.0)
 
                 if head_det is not None:
                     pcx, pcy, conf = head_det
@@ -489,7 +465,7 @@ def main():
                             kf_frames     = [None] * N_COLS
                             kf_offs       = [float('inf')] * N_COLS
                             kf_impact     = None
-                            kf_impact_off = float('inf')
+                            kf_impact_off = 0.0   # on MAXIMISE le diff balle
                             ball_col_kfs  = [None] * len(BALL_COLS)
                             ball_col_poss = [None] * len(BALL_COLS)
                             ball_col_offs = [float('inf')] * len(BALL_COLS)
@@ -543,21 +519,23 @@ def main():
 
                 # ── Capture par colonne : tête la plus près du centre ─────
                 if col == 3:
-                    # Col 4 (impact) : DERNIÈRE frame où la balle est encore
-                    # visible à sa position de repos pendant que le putter est
-                    # dans la col 4 → c'est le moment exact du contact face/balle.
+                    # Col 4 (impact) : frame où le DIFF dans la zone balle est
+                    # MAXIMUM → c'est quand la face du putter arrive sur la balle
+                    # (putter + balle = diff maximal au même endroit).
+                    # Physiquement : avant impact = seule balle dans diff ;
+                    # à l'impact = putter occupe la zone balle → pic de diff ;
+                    # après = balle partie + putter passé → diff redescend.
                     if ball_rest is not None:
                         bx_e = ball_rest[1][0]
                         by_e = ball_rest[1][1]
-                        br_c = 20
-                        ball_rgn = half[max(0, by_e - br_c):by_e + br_c,
-                                        max(0, bx_e - br_c):bx_e + br_c]
-                        ball_visible = (ball_rgn.size > 0 and
-                                        int(np.sum(np.all(ball_rgn > 185, axis=2))) >= 12)
-                        if ball_visible:
-                            # Mise à jour continue → la DERNIÈRE frame valide = impact
-                            kf_impact     = half.copy()
-                            kf_impact_off = 0.0
+                        margin = 22
+                        ball_diff_rgn = diff[max(0, by_e - margin):by_e + margin,
+                                             max(0, bx_e - margin):bx_e + margin + 12]
+                        if ball_diff_rgn.size > 0:
+                            diff_score = float(np.mean(ball_diff_rgn))
+                            if diff_score > kf_impact_off:
+                                kf_impact_off = diff_score
+                                kf_impact     = half.copy()
                 else:
                     # Cols 1-3 et 5-7 : meilleure frame = tête au centre de la col
                     col_center = (col + 0.5) * cw_h
