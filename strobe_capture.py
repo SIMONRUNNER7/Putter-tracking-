@@ -27,6 +27,7 @@ import numpy as np
 import os
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from enum import Enum
 
@@ -231,9 +232,13 @@ def make_training_frame(kf_frames, ball_rest, ball_col_kfs, ball_col_poss,
         kf_r, pos_r = ball_rest
         _paste_ball_circle(canvas, kf_r, pos_r, W, H)
 
-    # Balle post-impact (col 1)
-    for kf, pos in zip(ball_col_kfs or [], ball_col_poss or []):
-        _paste_ball_circle(canvas, kf, pos, W, H)
+    # Balle post-impact (col 1) — seulement si le putter a atteint col 1.
+    # Si col 1 est vide (putter n'y est pas allé), on n'affiche PAS la balle
+    # seule : le fond complet de col 1 est déjà présent via make_strobe,
+    # ce qui rend le strobe homogène visuellement.
+    if kf_frames[0] is not None:
+        for kf, pos in zip(ball_col_kfs or [], ball_col_poss or []):
+            _paste_ball_circle(canvas, kf, pos, W, H)
 
     return canvas
 
@@ -477,7 +482,12 @@ def main():
                             kf_offs       = [float('inf')] * N_COLS
                             kf_impact      = None
                             kf_impact_off  = 0.0   # on MAXIMISE le diff balle
-                            half_prev      = None  # frame N-1 (pour col 4 -1 frame)
+                            half_buf       = deque(maxlen=4)  # buffer adaptatif col 4
+                            impact_offset  = 2     # défaut 2 frames avant le pic
+                            col6_enter_fi  = -1    # frame d'entrée en col 6
+                            col5_enter_fi  = -1    # frame d'entrée en col 5
+                            rec_frame_count = 0    # compteur frames recording
+                            col_prev       = -1    # colonne précédente
                             ball_col_kfs  = [None] * len(BALL_COLS)
                             ball_col_poss = [None] * len(BALL_COLS)
                             ball_col_offs = [float('inf')] * len(BALL_COLS)
@@ -498,6 +508,8 @@ def main():
         elif state == State.RECORDING:
             cw_h = half.shape[1] // N_COLS
             cy_h = half.shape[0] // 2
+            rec_frame_count += 1
+            half_buf.append(half.copy())   # buffer glissant pour offset adaptatif
 
             # ── Position tête : YOLO en priorité, motion en fallback ───────
             head_det = yolo_detect_head(half, yolo)
@@ -516,6 +528,24 @@ def main():
             if cx_h is not None:
                 col = min(cx_h // cw_h, N_COLS - 1)
 
+                # ── Mesure vitesse col 6→5 pour offset adaptatif col 4 ────────
+                # (putter vient de droite→gauche : col 6=index5, col5=index4)
+                if col == 5 and col_prev != 5 and col6_enter_fi < 0:
+                    col6_enter_fi = rec_frame_count
+                if col == 4 and col_prev == 5 and col6_enter_fi >= 0 \
+                        and col5_enter_fi < 0:
+                    col5_enter_fi = rec_frame_count
+                    transit_65    = col5_enter_fi - col6_enter_fi  # frames en col 6
+                    if transit_65 <= 1:
+                        impact_offset = 3   # très rapide
+                    elif transit_65 <= 3:
+                        impact_offset = 2   # rapide
+                    else:
+                        impact_offset = 1   # lent
+                    print(f"[speed] transit col6→5 = {transit_65} frames → "
+                          f"impact_offset = {impact_offset}")
+                col_prev = col
+
                 # Suivi directionnel (pic backswing → downswing)
                 if cx_h > sw_cx_max:
                     sw_cx_max = cx_h
@@ -531,12 +561,9 @@ def main():
 
                 # ── Capture par colonne : tête la plus près du centre ─────
                 if col == 3:
-                    # Col 4 (impact) : frame où le DIFF dans la zone balle est
-                    # MAXIMUM → c'est quand la face du putter arrive sur la balle
-                    # (putter + balle = diff maximal au même endroit).
-                    # Physiquement : avant impact = seule balle dans diff ;
-                    # à l'impact = putter occupe la zone balle → pic de diff ;
-                    # après = balle partie + putter passé → diff redescend.
+                    # Col 4 (impact) : pic diff dans zone balle = arrivée du putter.
+                    # On prend impact_offset frames AVANT le pic dans le buffer
+                    # (calibré dynamiquement sur la vitesse col 6→5).
                     if ball_rest is not None:
                         bx_e = ball_rest[1][0]
                         by_e = ball_rest[1][1]
@@ -547,11 +574,10 @@ def main():
                             diff_score = float(np.mean(ball_diff_rgn))
                             if diff_score > kf_impact_off:
                                 kf_impact_off = diff_score
-                                # Prendre la frame PRÉCÉDENTE : le pic diff se
-                                # produit quand le putter est SUR la balle ; la
-                                # frame d'avant montre la face juste au contact.
-                                kf_impact = (half_prev if half_prev is not None
-                                             else half).copy()
+                                # Chercher impact_offset frames en arrière dans le buffer
+                                buf = list(half_buf)
+                                pick_idx = max(0, len(buf) - 1 - impact_offset)
+                                kf_impact = buf[pick_idx].copy()
                 else:
                     # Cols 1-3 et 5-7 : meilleure frame = tête au centre de la col
                     col_center = (col + 0.5) * cw_h
@@ -576,9 +602,6 @@ def main():
                         ball_col_offs[0] = boff
                         ball_col_kfs[0]  = half.copy()
                         ball_col_poss[0] = (bx_b, by_b)
-
-            # Mettre à jour le buffer frame précédente (pour col 4 N-1)
-            half_prev = half.copy()
 
             # ── Fin d'enregistrement ────────────────────────────────────────
             if now - rec_start >= RECORD_SECS:
