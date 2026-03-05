@@ -52,7 +52,8 @@ YOLO_STILL_PX    = 12     # pixels demi-res : seuil "tête immobile"
 PUTTER_STABLE_SEC  = 2.0
 PUTTER_ABSORB_SEC  = 1.0
 BALL_BLOB_PX        = 40
-PUTTER_BLOB_TRIGGER = 500  # surface diff (px halfres) déclenchant l'enreg.
+PUTTER_BLOB_TRIGGER  = 500  # surface diff (px halfres) déclenchant l'enreg.
+IMPACT_FACE_OFFSET   = 28   # px halfres : décalage face/centroïde putter (R→L)
 
 # Colonne post-impact balle (col 1, index 0)
 BALL_COLS = (0,)
@@ -325,12 +326,14 @@ def main():
     putter_stable_since = 0.0
     last_head_pos       = None   # (cx, cy) demi-res, dernière tête YOLO
 
-    rec_start  = 0.0
-    preview_t  = 0.0
-    shot_count = 0
-    last_path  = ""
-    composite  = None
-    t_last     = time.perf_counter()
+    rec_start    = 0.0
+    preview_t    = 0.0
+    shot_count   = 0
+    last_path    = ""
+    composite    = None
+    t_last       = time.perf_counter()
+    # Buffer pré-déclenchement : dernières frames ARMED pour col 4
+    pre_rec_buf  = deque(maxlen=6)
 
     while True:
         ret, raw = cap.read()
@@ -480,20 +483,19 @@ def main():
                             rec_start     = now
                             kf_frames     = [None] * N_COLS
                             kf_offs       = [float('inf')] * N_COLS
-                            kf_impact      = None
-                            kf_impact_off  = 0.0   # on MAXIMISE le diff balle
-                            half_buf       = deque(maxlen=4)  # buffer adaptatif col 4
-                            impact_offset  = 2     # défaut 2 frames avant le pic
-                            col6_enter_fi  = -1    # frame d'entrée en col 6
-                            col5_enter_fi  = -1    # frame d'entrée en col 5
-                            rec_frame_count = 0    # compteur frames recording
-                            col_prev       = -1    # colonne précédente
+                            kf_impact     = None
+                            # Minimisation : frame où face putter ≈ position balle
+                            kf_impact_off = float('inf')
+                            # Pré-peupler le buffer avec les frames ARMED récentes
+                            # pour avoir des frames "avant le déclencheur" dispo
+                            half_buf      = deque(pre_rec_buf, maxlen=8)
                             ball_col_kfs  = [None] * len(BALL_COLS)
                             ball_col_poss = [None] * len(BALL_COLS)
                             ball_col_offs = [float('inf')] * len(BALL_COLS)
                             sw_cx_max     = -1
                             sw_cx_min     = float('inf')
-                            sw_peaked     = False
+                            # Le déclencheur = downswing déjà commencé → pic déjà passé
+                            sw_peaked     = True
                             sw_done       = False
                             sw_cx_prev    = -1
                             is_ready      = False
@@ -505,11 +507,13 @@ def main():
                 putter_anchor       = None
                 putter_stable_since = 0.0
 
+            # Accumulation du buffer pré-déclenchement (frames ARMED récentes)
+            pre_rec_buf.append(half.copy())
+
         elif state == State.RECORDING:
             cw_h = half.shape[1] // N_COLS
             cy_h = half.shape[0] // 2
-            rec_frame_count += 1
-            half_buf.append(half.copy())   # buffer glissant pour offset adaptatif
+            half_buf.append(half.copy())   # buffer glissant (pre_rec_buf + frames rec)
 
             # ── Position tête : YOLO en priorité, motion en fallback ───────
             head_det = yolo_detect_head(half, yolo)
@@ -528,24 +532,6 @@ def main():
             if cx_h is not None:
                 col = min(cx_h // cw_h, N_COLS - 1)
 
-                # ── Mesure vitesse col 6→5 pour offset adaptatif col 4 ────────
-                # (putter vient de droite→gauche : col 6=index5, col5=index4)
-                if col == 5 and col_prev != 5 and col6_enter_fi < 0:
-                    col6_enter_fi = rec_frame_count
-                if col == 4 and col_prev == 5 and col6_enter_fi >= 0 \
-                        and col5_enter_fi < 0:
-                    col5_enter_fi = rec_frame_count
-                    transit_65    = col5_enter_fi - col6_enter_fi  # frames en col 6
-                    if transit_65 <= 1:
-                        impact_offset = 3   # très rapide
-                    elif transit_65 <= 3:
-                        impact_offset = 2   # rapide
-                    else:
-                        impact_offset = 1   # lent
-                    print(f"[speed] transit col6→5 = {transit_65} frames → "
-                          f"impact_offset = {impact_offset}")
-                col_prev = col
-
                 # Suivi directionnel (pic backswing → downswing)
                 if cx_h > sw_cx_max:
                     sw_cx_max = cx_h
@@ -561,23 +547,22 @@ def main():
 
                 # ── Capture par colonne : tête la plus près du centre ─────
                 if col == 3:
-                    # Col 4 (impact) : pic diff dans zone balle = arrivée du putter.
-                    # On prend impact_offset frames AVANT le pic dans le buffer
-                    # (calibré dynamiquement sur la vitesse col 6→5).
-                    if ball_rest is not None:
+                    # Col 4 (impact) : frame où la FACE du putter est la plus
+                    # proche de la balle, balle encore visible à sa position repos.
+                    # face_x = cx_h - IMPACT_FACE_OFFSET (putter vient de droite)
+                    if ball_rest is not None and cx_h is not None:
                         bx_e = ball_rest[1][0]
                         by_e = ball_rest[1][1]
-                        margin = 22
-                        ball_diff_rgn = diff[max(0, by_e - margin):by_e + margin,
-                                             max(0, bx_e - margin):bx_e + margin + 12]
-                        if ball_diff_rgn.size > 0:
-                            diff_score = float(np.mean(ball_diff_rgn))
-                            if diff_score > kf_impact_off:
-                                kf_impact_off = diff_score
-                                # Chercher impact_offset frames en arrière dans le buffer
-                                buf = list(half_buf)
-                                pick_idx = max(0, len(buf) - 1 - impact_offset)
-                                kf_impact = buf[pick_idx].copy()
+                        br_c = 18
+                        ball_rgn = half[max(0, by_e - br_c):by_e + br_c,
+                                        max(0, bx_e - br_c):bx_e + br_c]
+                        ball_visible = (ball_rgn.size > 0 and
+                                        int(np.sum(np.all(ball_rgn > 185, axis=2))) >= 10)
+                        if ball_visible:
+                            face_off = abs((cx_h - IMPACT_FACE_OFFSET) - bx_e)
+                            if face_off < kf_impact_off:
+                                kf_impact_off = face_off
+                                kf_impact = half.copy()
                 else:
                     # Cols 1-3 et 5-7 : meilleure frame = tête au centre de la col
                     col_center = (col + 0.5) * cw_h
