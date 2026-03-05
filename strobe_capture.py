@@ -44,7 +44,7 @@ SWING_PEAK_DELTA = 5
 BALL_CROP_R      = 30
 
 YOLO_MODEL_PATH  = "runs/detect/runs/putter/putter_detector/weights/best.pt"
-YOLO_CONF_MIN    = 0.35   # confiance min pour valider une détection tête
+YOLO_CONF_MIN    = 0.10   # confiance min pour valider une détection tête
 YOLO_STILL_PX    = 12     # pixels demi-res : seuil "tête immobile"
 
 # Auto-déclenchement
@@ -91,7 +91,7 @@ def yolo_detect_head(frame_bgr, model):
     """Retourne (cx, cy, conf) de la tête de putter, ou None."""
     if model is None:
         return None
-    results = model(frame_bgr, verbose=False)[0]
+    results = model(frame_bgr, conf=YOLO_CONF_MIN, verbose=False)[0]
     if results.boxes is None or len(results.boxes) == 0:
         return None
     boxes = results.boxes
