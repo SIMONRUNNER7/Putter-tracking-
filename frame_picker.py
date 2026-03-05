@@ -517,12 +517,13 @@ def main():
             save(shot_dir, candidates, selections, meta,
                  ball_rest_kf, ball1_frames, ball1_pos, sel_ball1)
             dirty = False
+            if shot_idx < n_shots - 1:                    # Shot suivant auto
+                switch_shot(shot_idx + 1)
+            else:
+                print("[picker] Dernier shot, tous sauvegardés.")
 
         elif key == ord('e'):                             # Exporter pour entraînement
             export_for_training(shot_dir, candidates, selections, meta)
-
-        elif key in (ord('8'), ord('b')):                 # 8 / B : mode balle col1
-            cb_state["ball1_mode"] = not cb_state["ball1_mode"]
 
         elif key in range(ord('1'), ord('1') + N_COLS):   # 1-7 : colonne putter
             cb_state["active_col"] = key - ord('1')
