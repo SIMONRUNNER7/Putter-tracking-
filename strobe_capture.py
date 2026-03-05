@@ -246,7 +246,7 @@ def make_training_frame(kf_frames, ball_rest, ball_col_kfs, ball_col_poss,
 # ── Sauvegarde ────────────────────────────────────────────────────────────────
 def save_shot(kf_frames, composite, n,
               ball_rest=None, ball_col_kfs=None, ball_col_poss=None,
-              W=1280, H=720, col_candidates=None):
+              W=1280, H=720, col_candidates=None, ball_col1_cands=None):
     import json
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(RAW_DIR, exist_ok=True)
@@ -293,15 +293,26 @@ def save_shot(kf_frames, composite, n,
         if ball_col_poss and ball_col_poss[0] is not None:
             ball_col_pos_0 = list(ball_col_poss[0])
 
+    # Candidats balle col1 (plusieurs frames pour frame_picker)
+    ball_col1_cands_pos = []
+    if ball_col1_cands:
+        bc1_dir = os.path.join(shot_dir, "ball_col1_cands")
+        os.makedirs(bc1_dir, exist_ok=True)
+        for fi, (bcf, bcp) in enumerate(ball_col1_cands):
+            cv2.imwrite(os.path.join(bc1_dir, f"frame_{fi:03d}.jpg"),
+                        bcf, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            ball_col1_cands_pos.append(list(bcp))
+
     # Métadonnées JSON (utilisé par frame_picker.py)
     meta = {
-        "tag":            tag,
-        "W":              W,
-        "H":              H,
-        "ball_rest_pos":  ball_rest_pos,
-        "ball_col_pos_0": ball_col_pos_0,
-        "selected":       {str(k): v for k, v in selected_default.items()},
-        "n_candidates":   {str(k): v for k, v in n_cands.items()},
+        "tag":                  tag,
+        "W":                    W,
+        "H":                    H,
+        "ball_rest_pos":        ball_rest_pos,
+        "ball_col_pos_0":       ball_col_pos_0,
+        "ball_col1_cands_pos":  ball_col1_cands_pos,
+        "selected":             {str(k): v for k, v in selected_default.items()},
+        "n_candidates":         {str(k): v for k, v in n_cands.items()},
     }
     with open(os.path.join(shot_dir, "metadata.json"), "w") as fj:
         json.dump(meta, fj, indent=2)
@@ -547,6 +558,7 @@ def main():
                             # Candidats par colonne (pour frame_picker.py)
                             col_candidates  = [[] for _ in range(N_COLS)]
                             col4_entered    = False
+                            ball_col1_cands = []   # candidats balle post-impact col1
                             print(f"[rec] auto-trigger #{shot_count + 1}")
 
             if not putter_found and not is_ready:
@@ -643,6 +655,9 @@ def main():
                     bx_b   = int(np.median(xs))
                     by_b   = int(np.median(ys)) + col0_y0
                     boff   = abs(bx_b - 0.5 * cw_h)
+                    # Conserver tous les candidats (max 15) pour frame_picker
+                    if len(ball_col1_cands) < 15:
+                        ball_col1_cands.append((half.copy(), (bx_b, by_b)))
                     if boff < ball_col_offs[0]:
                         ball_col_offs[0] = boff
                         ball_col_kfs[0]  = half.copy()
@@ -666,7 +681,8 @@ def main():
                     ball_rest=ball_rest,
                     ball_col_kfs=ball_col_kfs,
                     ball_col_poss=ball_col_poss, W=W, H=H,
-                    col_candidates=col_candidates)
+                    col_candidates=col_candidates,
+                    ball_col1_cands=ball_col1_cands)
                 state     = State.PREVIEW
                 preview_t = now
 
