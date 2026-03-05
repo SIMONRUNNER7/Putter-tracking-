@@ -428,8 +428,8 @@ def main():
         shot_dir  = args.shot_dir
         shot_idx  = all_shots.index(shot_dir) if shot_dir in all_shots else 0
     else:
-        shot_dir = find_latest_shot()
-        shot_idx = n_shots - 1 if n_shots > 0 else 0
+        shot_dir = all_shots[0] if all_shots else None
+        shot_idx = 0
 
     if not shot_dir or not os.path.isdir(shot_dir):
         print("Aucun shot trouvé. Lance d'abord strobe_capture.py.")
@@ -527,6 +527,8 @@ def main():
 
         elif key in (ord('8'), ord('b')):                 # 8 / B : mode balle col1
             cb_state["ball1_mode"] = not cb_state["ball1_mode"]
+            print(f"[picker] Mode balle : {'ON' if cb_state['ball1_mode'] else 'OFF'}"
+                  f" | {len(ball1_frames)} frame(s) balle")
 
         elif key in range(ord('1'), ord('1') + N_COLS):   # 1-7 : colonne putter
             cb_state["active_col"] = key - ord('1')
