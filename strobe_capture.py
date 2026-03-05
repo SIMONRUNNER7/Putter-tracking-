@@ -41,7 +41,7 @@ RAW_DIR          = os.path.join(OUT_DIR, "raw")
 MOTION_THRESH    = 25
 MOTION_AREA      = 80
 SWING_PEAK_DELTA = 5
-BALL_CROP_R      = 30
+BALL_CROP_R      = 46
 
 YOLO_MODEL_PATH  = "runs/detect/runs/putter/putter_detector/weights/best.pt"
 YOLO_CONF_MIN    = 0.10   # confiance min pour valider une détection tête
@@ -194,14 +194,25 @@ def make_strobe(kf_frames, W, H, bg_frame=None):
 
 
 def _paste_ball_circle(canvas, kf_halfres, pos_halfres, W, H):
+    """Colle un crop circulaire de la balle avec dégradé (fondu aux bords)."""
     if kf_halfres is None or pos_halfres is None:
         return
     frame = cv2.resize(kf_halfres, (W, H))
     sx = W / (W // 2);  sy = H / (H // 2)
     cx = int(pos_halfres[0] * sx);  cy = int(pos_halfres[1] * sy)
-    mask = np.zeros((H, W), dtype=np.uint8)
-    cv2.circle(mask, (cx, cy), BALL_CROP_R, 255, -1)
-    canvas[mask > 0] = frame[mask > 0]
+    r  = BALL_CROP_R
+
+    x0, x1 = max(0, cx - r), min(W, cx + r + 1)
+    y0, y1 = max(0, cy - r), min(H, cy + r + 1)
+
+    yy, xx  = np.mgrid[y0:y1, x0:x1]
+    dist    = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2).astype(np.float32)
+    # Dégradé quadratique : plein au centre, fondu à 0 sur le rayon
+    alpha   = np.clip(1.0 - (dist / r) ** 2, 0.0, 1.0)[:, :, np.newaxis]
+
+    roi_f = frame[y0:y1, x0:x1].astype(np.float32)
+    roi_c = canvas[y0:y1, x0:x1].astype(np.float32)
+    canvas[y0:y1, x0:x1] = (roi_f * alpha + roi_c * (1.0 - alpha)).astype(np.uint8)
 
 
 def make_training_frame(kf_frames, ball_rest, ball_col_kfs, ball_col_poss,
@@ -369,7 +380,17 @@ def main():
             region = half[max(0, ball_y_exp - br):ball_y_exp + br,
                           max(0, ball_x_exp - br):ball_x_exp + br]
             white_mask   = np.all(region > 200, axis=2)
-            ball_present = int(np.sum(white_mask)) >= BALL_BLOB_PX
+            n_white      = int(np.sum(white_mask))
+            if n_white >= BALL_BLOB_PX:
+                # Vérification compacité : les pixels blancs doivent former un
+                # blob compact (petit écart-type) – évite les faux positifs
+                # (reflets, câbles dispersés, fond clair hors balle)
+                wy, wx = np.where(white_mask)
+                sx = float(np.std(wx)) if len(wx) > 1 else 0.0
+                sy = float(np.std(wy)) if len(wy) > 1 else 0.0
+                ball_present = (sx < 14) and (sy < 14)
+            else:
+                ball_present = False
             if ball_present:
                 ball_rest = (kf_rest, (ball_x_exp, ball_y_exp))
             else:
@@ -384,18 +405,18 @@ def main():
             if ball_present:
                 head_det = yolo_detect_head(half, yolo)
                 if head_det is None:
-                    # Fallback : plus grand blob dans la zone putter (cols 4-6)
-                    pz_x0 = cw_h * 3 + 11
+                    # Fallback 1 : diff vs fond dans la zone putter (cols 3-6)
+                    pz_x0 = cw_h * 3
                     pz_x1 = min(cw_h * 6, half.shape[1])
-                    pz_y0 = max(cy_h - 55, 0)
-                    pz_y1 = min(cy_h + 55, half.shape[0])
+                    pz_y0 = max(cy_h - 60, 0)
+                    pz_y1 = min(cy_h + 60, half.shape[0])
                     diff_pz = diff[pz_y0:pz_y1, pz_x0:pz_x1].astype(np.uint8)
                     _, th_pz = cv2.threshold(diff_pz, MOTION_THRESH, 255,
                                              cv2.THRESH_BINARY)
                     th_pz = cv2.dilate(th_pz, None, iterations=2)
                     pz_cnts, _ = cv2.findContours(th_pz, cv2.RETR_EXTERNAL,
                                                   cv2.CHAIN_APPROX_SIMPLE)
-                    pz_big = [c for c in pz_cnts if cv2.contourArea(c) >= 300]
+                    pz_big = [c for c in pz_cnts if cv2.contourArea(c) >= 80]
                     if pz_big:
                         biggest = max(pz_big, key=cv2.contourArea)
                         Mpz = cv2.moments(biggest)
@@ -403,6 +424,34 @@ def main():
                             fx = int(Mpz["m10"] / Mpz["m00"]) + pz_x0
                             fy = int(Mpz["m01"] / Mpz["m00"]) + pz_y0
                             head_det = (fx, fy, 0.0)   # conf 0 = fallback motion
+
+                if head_det is None:
+                    # Fallback 2 : détection directe par brillance (tête métal.
+                    # blanc/argent très visible sur le mat sombre)
+                    pz_x0b = cw_h * 3
+                    pz_x1b = min(cw_h * 7, half.shape[1])
+                    pz_y0b = max(cy_h - 60, 0)
+                    pz_y1b = min(cy_h + 60, half.shape[0])
+                    zone = half[pz_y0b:pz_y1b, pz_x0b:pz_x1b]
+                    bright_mask = np.all(zone > 175, axis=2).astype(np.uint8) * 255
+                    bright_mask = cv2.dilate(bright_mask, None, iterations=1)
+                    b_cnts, _ = cv2.findContours(bright_mask, cv2.RETR_EXTERNAL,
+                                                 cv2.CHAIN_APPROX_SIMPLE)
+                    ball_x_local = ball_x_exp - pz_x0b
+                    b_candidates = []
+                    for c in b_cnts:
+                        if cv2.contourArea(c) < 60:
+                            continue
+                        Mb = cv2.moments(c)
+                        if Mb["m00"] > 0:
+                            bfx = int(Mb["m10"] / Mb["m00"])
+                            if abs(bfx - ball_x_local) > 25:
+                                b_candidates.append(
+                                    (c, bfx + pz_x0b, int(Mb["m01"] / Mb["m00"]) + pz_y0b)
+                                )
+                    if b_candidates:
+                        best_b = max(b_candidates, key=lambda t: cv2.contourArea(t[0]))
+                        head_det = (best_b[1], best_b[2], 0.0)  # conf 0 = fallback brillance
 
                 if head_det is not None:
                     pcx, pcy, conf = head_det
@@ -494,22 +543,21 @@ def main():
 
                 # ── Capture par colonne : tête la plus près du centre ─────
                 if col == 3:
-                    # Col 4 (impact) : tête la plus proche de la balle
-                    # ET balle encore visible dans le frame
+                    # Col 4 (impact) : DERNIÈRE frame où la balle est encore
+                    # visible à sa position de repos pendant que le putter est
+                    # dans la col 4 → c'est le moment exact du contact face/balle.
                     if ball_rest is not None:
-                        impact_off = abs(cx_h - ball_rest[1][0])
                         bx_e = ball_rest[1][0]
                         by_e = ball_rest[1][1]
-                        br_c = 18
+                        br_c = 20
                         ball_rgn = half[max(0, by_e - br_c):by_e + br_c,
                                         max(0, bx_e - br_c):bx_e + br_c]
                         ball_visible = (ball_rgn.size > 0 and
-                                        int(np.sum(np.all(ball_rgn > 190, axis=2))) >= 15)
-                        # Pénalité si balle déjà partie
-                        adj_off = impact_off if ball_visible else impact_off + 500
-                        if adj_off < kf_impact_off:
-                            kf_impact_off = adj_off
+                                        int(np.sum(np.all(ball_rgn > 185, axis=2))) >= 12)
+                        if ball_visible:
+                            # Mise à jour continue → la DERNIÈRE frame valide = impact
                             kf_impact     = half.copy()
+                            kf_impact_off = 0.0
                 else:
                     # Cols 1-3 et 5-7 : meilleure frame = tête au centre de la col
                     col_center = (col + 0.5) * cw_h
