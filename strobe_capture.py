@@ -53,7 +53,6 @@ PUTTER_STABLE_SEC  = 2.0
 PUTTER_ABSORB_SEC  = 1.0
 BALL_BLOB_PX        = 40
 PUTTER_BLOB_TRIGGER  = 500  # surface diff (px halfres) déclenchant l'enreg.
-IMPACT_FACE_OFFSET   = 28   # px halfres : décalage face/centroïde putter (R→L)
 
 # Colonne post-impact balle (col 1, index 0)
 BALL_COLS = (0,)
@@ -484,8 +483,7 @@ def main():
                             kf_frames     = [None] * N_COLS
                             kf_offs       = [float('inf')] * N_COLS
                             kf_impact     = None
-                            # Minimisation : frame où face putter ≈ position balle
-                            kf_impact_off = float('inf')
+                            kf_impact_off = 0.0   # on MAXIMISE le diff balle
                             # Pré-peupler le buffer avec les frames ARMED récentes
                             # pour avoir des frames "avant le déclencheur" dispo
                             half_buf      = deque(pre_rec_buf, maxlen=8)
@@ -547,22 +545,22 @@ def main():
 
                 # ── Capture par colonne : tête la plus près du centre ─────
                 if col == 3:
-                    # Col 4 (impact) : frame où la FACE du putter est la plus
-                    # proche de la balle, balle encore visible à sa position repos.
-                    # face_x = cx_h - IMPACT_FACE_OFFSET (putter vient de droite)
-                    if ball_rest is not None and cx_h is not None:
+                    # Col 4 (impact) : pic de diff dans la zone balle = face du
+                    # putter au contact. On prend 2 frames en arrière dans le
+                    # buffer (pre_rec_buf garantit des frames avant le déclencheur).
+                    if ball_rest is not None:
                         bx_e = ball_rest[1][0]
                         by_e = ball_rest[1][1]
-                        br_c = 18
-                        ball_rgn = half[max(0, by_e - br_c):by_e + br_c,
-                                        max(0, bx_e - br_c):bx_e + br_c]
-                        ball_visible = (ball_rgn.size > 0 and
-                                        int(np.sum(np.all(ball_rgn > 185, axis=2))) >= 10)
-                        if ball_visible:
-                            face_off = abs((cx_h - IMPACT_FACE_OFFSET) - bx_e)
-                            if face_off < kf_impact_off:
-                                kf_impact_off = face_off
-                                kf_impact = half.copy()
+                        margin = 22
+                        ball_diff_rgn = diff[max(0, by_e - margin):by_e + margin,
+                                             max(0, bx_e - margin):bx_e + margin + 12]
+                        if ball_diff_rgn.size > 0:
+                            diff_score = float(np.mean(ball_diff_rgn))
+                            if diff_score > kf_impact_off:
+                                kf_impact_off = diff_score
+                                buf      = list(half_buf)
+                                pick_idx = max(0, len(buf) - 1 - 2)
+                                kf_impact = buf[pick_idx].copy()
                 else:
                     # Cols 1-3 et 5-7 : meilleure frame = tête au centre de la col
                     col_center = (col + 0.5) * cw_h
@@ -572,7 +570,8 @@ def main():
                         kf_frames[col] = half.copy()
 
             # ── Balle post-impact : scan luminosité en col 1 ──────────────
-            if sw_peaked and ball_rest is not None:
+            # sw_done = putter en follow-through (repart vers droite) = col 1 libre
+            if sw_done and ball_rest is not None:
                 col0_y0 = max(0, cy_h - 30)
                 col0_y1 = min(half.shape[0], cy_h + 30)
                 roi = half[col0_y0:col0_y1, 0:cw_h]
