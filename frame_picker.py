@@ -27,12 +27,92 @@ import sys
 import json
 import glob
 import argparse
+from pathlib import Path
 
 N_COLS      = 7
 BALL_CROP_R = 46      # rayon crop balle (même valeur que strobe_capture.py)
 THUMB_H     = 190     # hauteur zone candidats
 STATUS_H    = 28
 WIN_NAME    = "Frame Picker"
+
+
+# ── Export pour entraînement ─────────────────────────────────────────────────
+
+def export_for_training(shot_dir, candidates, selections, meta):
+    """
+    Exporte les frames sélectionnées vers annotation_output/ avec labels YOLO.
+
+    Pour chaque colonne : image .jpg + label .txt (format YOLO : 0 cx cy w h).
+    La tête du putter est localisée automatiquement via detect_putter_bbox().
+    Si la détection échoue, une bbox approchée basée sur le centre de colonne
+    est utilisée en fallback.
+
+    Étape suivante :
+        python3 training/prepare_dataset.py
+        python3 training/train_detector.py train --data data/putter_dataset/data.yaml
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from training.autolabel import detect_putter_bbox
+        has_autolabel = True
+    except ImportError:
+        has_autolabel = False
+        print("[export] autolabel non disponible → labels approchés (centre col)")
+
+    ann_img = Path("annotation_output/images")
+    ann_lbl = Path("annotation_output/labels")
+    ann_img.mkdir(parents=True, exist_ok=True)
+    ann_lbl.mkdir(parents=True, exist_ok=True)
+
+    tag      = meta.get("tag", os.path.basename(shot_dir))
+    W_half   = meta["W"] // 2
+    exported = 0
+    skipped  = 0
+
+    for col_idx in range(N_COLS):
+        frames = candidates[col_idx]
+        sel    = selections[col_idx]
+        if not frames or sel >= len(frames):
+            skipped += 1
+            continue
+
+        frame = frames[sel]   # demi-résolution
+        stem  = f"{tag}_col{col_idx + 1}"
+
+        # Sauvegarde image
+        img_path = ann_img / f"{stem}.jpg"
+        cv2.imwrite(str(img_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+        # Label YOLO
+        bbox = None
+        if has_autolabel:
+            bbox, _ = detect_putter_bbox(frame)
+
+        if bbox is None:
+            # Fallback : centre de la colonne, largeur fixe
+            h_img, w_img = frame.shape[:2]
+            cx_n = (col_idx + 0.5) / N_COLS
+            cy_n = 0.5
+            bw_n = 1.0 / N_COLS
+            bh_n = 80 / h_img
+            bbox = (cx_n, cy_n, bw_n, bh_n)
+
+        lbl_path = ann_lbl / f"{stem}.txt"
+        cx, cy, bw, bh = bbox
+        with open(lbl_path, "w") as f:
+            f.write(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+
+        exported += 1
+
+    total = exported + skipped
+    print(f"[export] {exported}/{total} cols → annotation_output/")
+    if skipped:
+        print(f"[export] {skipped} col(s) vide(s) ignorée(s)")
+    print("[export] Prochaine étape :")
+    print("         python3 training/prepare_dataset.py")
+    print("         python3 training/train_detector.py train "
+          "--data data/putter_dataset/data.yaml --epochs 50 --model yolov8n.pt")
+    return exported
 
 
 # ── Lecture des shots ─────────────────────────────────────────────────────────
@@ -253,7 +333,7 @@ def build_status(candidates, selections, active_col, dirty, W,
     nav_shots = "  [ / ] : shot" if n_shots > 1 else ""
     msg = (f"  {col_label}  |  Frame {sel}/{n}"
            f"  |  ←/→ : nav   1-7 : col   8/B : balle{nav_shots}"
-           f"   S : save   Q : quit"
+           f"   S : save   E : export train   Q : quit"
            + shot_info
            + ("   [NON SAUVEGARDÉ]" if dirty else "   [OK]"))
     bar = np.full((STATUS_H, W, 3), 15, dtype=np.uint8)
@@ -437,6 +517,9 @@ def main():
             save(shot_dir, candidates, selections, meta,
                  ball_rest_kf, ball1_frames, ball1_pos, sel_ball1)
             dirty = False
+
+        elif key == ord('e'):                             # Exporter pour entraînement
+            export_for_training(shot_dir, candidates, selections, meta)
 
         elif key in (ord('8'), ord('b')):                 # 8 / B : mode balle col1
             cb_state["ball1_mode"] = not cb_state["ball1_mode"]
