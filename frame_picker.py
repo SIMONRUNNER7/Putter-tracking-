@@ -348,9 +348,9 @@ def build_status(all_frames, selections, active_col, dirty, W,
         col_label = f"Col {active_col + 1}"
 
     shot_info = f"  |  Shot {shot_idx + 1}/{n_shots}" if n_shots > 1 else ""
-    nav_shots = "  [ / ] : shot" if n_shots > 1 else ""
+    nav_shots = "  p/n : shot" if n_shots > 1 else ""
     msg = (f"  {col_label}  |  Frame {sel}/{n}"
-           f"  |  ←/→ : nav   1-7 : col   8/B : balle{nav_shots}"
+           f"  |  a/d : nav   1-7 : col   b : balle{nav_shots}"
            f"   S : save+next   E : export   Q : quit"
            + shot_info
            + ("   [NON SAUVEGARDÉ]" if dirty else "   [OK]"))
@@ -459,6 +459,8 @@ def main():
 
     (meta, all_frames, ball_rest_kf, ball1_frames, ball1_pos,
      selections, sel_ball1) = load_shot_state(shot_dir)
+    print(f"[picker] {len(all_frames)} frame(s) chargées | "
+          f"{len(ball1_frames)} frame(s) balle")
     W, H = meta["W"], meta["H"]
 
     active_col = 3
@@ -519,6 +521,8 @@ def main():
         print(f"[picker] Shot {shot_idx + 1}/{n_shots} : {shot_dir}")
         (meta, all_frames, ball_rest_kf, ball1_frames, ball1_pos,
          selections, sel_ball1) = load_shot_state(shot_dir)
+        print(f"[picker] {len(all_frames)} frame(s) chargées | "
+              f"{len(ball1_frames)} frame(s) balle")
         W, H = meta["W"], meta["H"]
         active_col = 3
         cb_state["active_col"] = 3
@@ -560,13 +564,13 @@ def main():
             cb_state["active_col"] = key - ord('1')
             cb_state["ball1_mode"] = False
 
-        elif key == ord('['):                             # Shot précédent
+        elif key in (ord('p'), ord('['), 44):             # P / [ : shot précédent
             if shot_idx > 0:
                 switch_shot(shot_idx - 1)
             else:
                 print("[picker] Premier shot.")
 
-        elif key == ord(']'):                             # Shot suivant
+        elif key in (ord('n'), ord(']'), 46):             # N / ] : shot suivant
             if shot_idx < n_shots - 1:
                 switch_shot(shot_idx + 1)
             else:
