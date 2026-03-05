@@ -50,7 +50,8 @@ YOLO_STILL_PX    = 12     # pixels demi-res : seuil "tête immobile"
 # Auto-déclenchement
 PUTTER_STABLE_SEC  = 2.0
 PUTTER_ABSORB_SEC  = 1.0
-BALL_BLOB_PX       = 40
+BALL_BLOB_PX        = 40
+PUTTER_BLOB_TRIGGER = 500  # surface diff (px halfres) déclenchant l'enreg.
 
 # Colonne post-impact balle (col 1, index 0)
 BALL_COLS = (0,)
@@ -458,14 +459,25 @@ def main():
                             armed_for_swing = True
                             print("[armed] READY – swing !")
                     else:
-                        # Déclenchement swing : tête en mouvement vers col ≥ 4
-                        if pcx >= cw_h * 4 and ball_rest is not None:
+                        # Déclenchement swing : GROS blob de mouvement dans cols 4-7
+                        # → le putter qui swing crée une grande surface diff ;
+                        # objets parasites (câbles, ombres) = petits blobs ignorés.
+                        trig_y0   = max(cy_h - 45, 0)
+                        trig_y1   = min(cy_h + 45, half.shape[0])
+                        diff_trig = diff[trig_y0:trig_y1, cw_h * 4:].astype(np.uint8)
+                        _, th_trig = cv2.threshold(diff_trig, MOTION_THRESH, 255,
+                                                   cv2.THRESH_BINARY)
+                        trig_cnts, _ = cv2.findContours(th_trig, cv2.RETR_EXTERNAL,
+                                                        cv2.CHAIN_APPROX_SIMPLE)
+                        trig_area = sum(cv2.contourArea(c) for c in trig_cnts)
+                        if trig_area >= PUTTER_BLOB_TRIGGER and ball_rest is not None:
                             state         = State.RECORDING
                             rec_start     = now
                             kf_frames     = [None] * N_COLS
                             kf_offs       = [float('inf')] * N_COLS
-                            kf_impact     = None
-                            kf_impact_off = 0.0   # on MAXIMISE le diff balle
+                            kf_impact      = None
+                            kf_impact_off  = 0.0   # on MAXIMISE le diff balle
+                            half_prev      = None  # frame N-1 (pour col 4 -1 frame)
                             ball_col_kfs  = [None] * len(BALL_COLS)
                             ball_col_poss = [None] * len(BALL_COLS)
                             ball_col_offs = [float('inf')] * len(BALL_COLS)
@@ -535,7 +547,11 @@ def main():
                             diff_score = float(np.mean(ball_diff_rgn))
                             if diff_score > kf_impact_off:
                                 kf_impact_off = diff_score
-                                kf_impact     = half.copy()
+                                # Prendre la frame PRÉCÉDENTE : le pic diff se
+                                # produit quand le putter est SUR la balle ; la
+                                # frame d'avant montre la face juste au contact.
+                                kf_impact = (half_prev if half_prev is not None
+                                             else half).copy()
                 else:
                     # Cols 1-3 et 5-7 : meilleure frame = tête au centre de la col
                     col_center = (col + 0.5) * cw_h
@@ -560,6 +576,9 @@ def main():
                         ball_col_offs[0] = boff
                         ball_col_kfs[0]  = half.copy()
                         ball_col_poss[0] = (bx_b, by_b)
+
+            # Mettre à jour le buffer frame précédente (pour col 4 N-1)
+            half_prev = half.copy()
 
             # ── Fin d'enregistrement ────────────────────────────────────────
             if now - rec_start >= RECORD_SECS:
