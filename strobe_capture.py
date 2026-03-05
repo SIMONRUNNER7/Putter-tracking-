@@ -246,13 +246,67 @@ def make_training_frame(kf_frames, ball_rest, ball_col_kfs, ball_col_poss,
 # ── Sauvegarde ────────────────────────────────────────────────────────────────
 def save_shot(kf_frames, composite, n,
               ball_rest=None, ball_col_kfs=None, ball_col_poss=None,
-              W=1280, H=720):
+              W=1280, H=720, col_candidates=None):
+    import json
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(RAW_DIR, exist_ok=True)
     tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     cv2.imwrite(os.path.join(OUT_DIR, f"strobe_{tag}.png"), composite)
 
+    # ── Dossier candidats pour frame_picker ───────────────────────
+    shot_dir = os.path.join(RAW_DIR, f"shot_{tag}")
+    os.makedirs(shot_dir, exist_ok=True)
+
+    # Composite de référence
+    cv2.imwrite(os.path.join(shot_dir, "composite.jpg"), composite,
+                [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+    # Sauvegarder candidats par colonne
+    n_cands = {}
+    selected_default = {}
+    if col_candidates:
+        for col_idx, frames in enumerate(col_candidates):
+            col_dir = os.path.join(shot_dir, f"col{col_idx + 1}")
+            os.makedirs(col_dir, exist_ok=True)
+            for fi, frame in enumerate(frames):
+                cv2.imwrite(os.path.join(col_dir, f"frame_{fi:03d}.jpg"),
+                            frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            n_cands[col_idx] = len(frames)
+            # La sélection par défaut = frame la plus proche de la
+            # sélection automatique (kf_frames[col_idx])
+            selected_default[col_idx] = max(0, len(frames) - 3) if col_idx == 3 else 0
+
+    # Balle au repos
+    ball_rest_pos = None
+    if ball_rest is not None:
+        kf_r, pos_r = ball_rest
+        cv2.imwrite(os.path.join(shot_dir, "ball_rest.jpg"),
+                    kf_r, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        ball_rest_pos = list(pos_r)
+
+    # Balle post-impact col 1
+    ball_col_pos_0 = None
+    if ball_col_kfs and ball_col_kfs[0] is not None:
+        cv2.imwrite(os.path.join(shot_dir, "ball_col1.jpg"),
+                    ball_col_kfs[0], [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if ball_col_poss and ball_col_poss[0] is not None:
+            ball_col_pos_0 = list(ball_col_poss[0])
+
+    # Métadonnées JSON (utilisé par frame_picker.py)
+    meta = {
+        "tag":            tag,
+        "W":              W,
+        "H":              H,
+        "ball_rest_pos":  ball_rest_pos,
+        "ball_col_pos_0": ball_col_pos_0,
+        "selected":       {str(k): v for k, v in selected_default.items()},
+        "n_candidates":   {str(k): v for k, v in n_cands.items()},
+    }
+    with open(os.path.join(shot_dir, "metadata.json"), "w") as fj:
+        json.dump(meta, fj, indent=2)
+
+    # Compatibilité : sauvegarder aussi les fichiers plats existants
     saved_raw = 0
     for i, kf in enumerate(kf_frames):
         if kf is None:
@@ -266,20 +320,11 @@ def save_shot(kf_frames, composite, n,
         cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_rest.jpg"),
                     cv2.resize(kf_r, (W, H)), [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-    labels  = ["ball_col3", "ball_col2", "ball_col1"]
-    n_snaps = 0
-    for i, kf in enumerate(ball_col_kfs or []):
-        if kf is None:
-            continue
-        lbl = labels[i] if i < len(labels) else f"ball_{i}"
-        cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_{lbl}.jpg"),
-                    cv2.resize(kf, (W, H)), [cv2.IMWRITE_JPEG_QUALITY, 95])
-        n_snaps += 1
-
     cv2.imwrite(os.path.join(RAW_DIR, f"{tag}_training.jpg"), composite,
                 [cv2.IMWRITE_JPEG_QUALITY, 95])
     comp_path = os.path.join(OUT_DIR, f"strobe_{tag}.png")
-    print(f"[save] #{n:03d}  → {comp_path}  ({saved_raw} cols, {n_snaps} snaps balle)")
+    print(f"[save] #{n:03d}  → {comp_path}  ({saved_raw} cols | "
+          f"candidats: {sum(n_cands.values())} frames → {shot_dir})")
     return comp_path
 
 
@@ -499,6 +544,9 @@ def main():
                             is_ready      = False
                             armed_for_swing = False
                             putter_anchor = None
+                            # Candidats par colonne (pour frame_picker.py)
+                            col_candidates  = [[] for _ in range(N_COLS)]
+                            col4_entered    = False
                             print(f"[rec] auto-trigger #{shot_count + 1}")
 
             if not putter_found and not is_ready:
@@ -542,6 +590,19 @@ def main():
                     if sw_cx_prev >= 0 and (cx_h - sw_cx_prev) > SWING_PEAK_DELTA:
                         sw_done = True
                 sw_cx_prev = cx_h
+
+                # ── Accumulation candidats (pour frame_picker) ────────────
+                if col == 3:
+                    if not col4_entered:
+                        col4_entered = True
+                        # Première frame col 4 : sauvegarder tout le buffer
+                        # (inclut les frames pre_rec_buf = avant le déclencheur)
+                        for _f in list(half_buf):
+                            col_candidates[3].append(_f.copy())
+                    else:
+                        col_candidates[3].append(half.copy())
+                elif len(col_candidates[col]) < 30:  # limiter à 30 frames/col
+                    col_candidates[col].append(half.copy())
 
                 # ── Capture par colonne : tête la plus près du centre ─────
                 if col == 3:
@@ -604,7 +665,8 @@ def main():
                     kf_frames, composite, shot_count,
                     ball_rest=ball_rest,
                     ball_col_kfs=ball_col_kfs,
-                    ball_col_poss=ball_col_poss, W=W, H=H)
+                    ball_col_poss=ball_col_poss, W=W, H=H,
+                    col_candidates=col_candidates)
                 state     = State.PREVIEW
                 preview_t = now
 
