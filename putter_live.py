@@ -943,24 +943,37 @@ class PutterLive:
                 result.append(None)
                 continue
             kf_h, kf_w = kf.shape[:2]
-            col_w = kf_w // N_COLS
-            # Crop to this column's x-range (with small margin) so YOLO picks
-            # the putter head in column i, not other putters in the scene.
-            x0 = max(0, i * col_w - col_w // 4)
-            x1 = min(kf_w, (i + 1) * col_w + col_w // 4)
-            crop = kf[:, x0:x1]
-            preds = self._yolo.predict(crop, conf=0.01, verbose=False)
+            col_w  = kf_w // N_COLS
+            col_x0 = i * col_w
+            col_x1 = kf_w if i == N_COLS - 1 else (i + 1) * col_w
+
+            # Run on the full frame — narrow crops distort aspect ratio → YOLO fails
+            preds = self._yolo.predict(kf, conf=0.05, verbose=False)
             boxes = preds[0].boxes
             if boxes is None or len(boxes) == 0:
-                print(f"[yolo] col {i}: no detection  (img shape={crop.shape})")
+                print(f"[yolo] col {i}: no detection")
                 result.append(None)
                 continue
-            confs  = boxes.conf.tolist()
-            best_i = int(max(range(len(confs)), key=lambda k: confs[k]))
-            cx, cy, w, h = boxes.xywh[best_i].tolist()
-            # cx is relative to crop → add x0 to get full-frame cx
-            cx += x0
-            print(f"[yolo] col {i}: detected conf={confs[best_i]:.2f}  cx={cx:.0f} cy={cy:.0f}")
+
+            xywh  = boxes.xywh.tolist()
+            confs = boxes.conf.tolist()
+
+            # Keep only detections whose centre falls in this column's x-range
+            in_col = [(confs[j], j) for j, b in enumerate(xywh)
+                      if col_x0 <= b[0] < col_x1]
+
+            if not in_col:
+                # Fallback: detection nearest to the column centre
+                col_cx = (col_x0 + col_x1) / 2.0
+                in_col = sorted(range(len(xywh)),
+                                key=lambda j: abs(xywh[j][0] - col_cx))
+                best_j = in_col[0]
+            else:
+                in_col.sort(reverse=True)   # highest confidence first
+                best_j = in_col[0][1]
+
+            cx, cy, w, h = xywh[best_j][:4]
+            print(f"[yolo] col {i}: cx={cx:.0f} cy={cy:.0f} conf={confs[best_j]:.2f}")
             result.append((cx, cy, w, h, 0.0))
         return result
 
@@ -1075,24 +1088,12 @@ class PutterLive:
         if ball_init is not None:
             bix, biy = int(ball_init[0]), int(ball_init[1])
 
-            # Post-impact position: use col-0 centre of the putter arc, or
-            # extrapolate from launch direction, or default to left edge.
-            r_res = self.result
-            if centers_disp[0] is not None:
-                tgt_x, tgt_y = centers_disp[0][0], biy
-            elif r_res and r_res.launch_dir is not None:
-                dist = bix - col_w_disp // 2
-                rad  = math.radians(r_res.launch_dir)
-                tgt_x = int(bix - abs(dist) * math.cos(rad))
-                tgt_y = int(biy + abs(dist) * math.sin(rad))
-            else:
-                tgt_x, tgt_y = col_w_disp // 2, biy
+            # Post-impact position: centre of column 1 (0-indexed col 0), same y
+            tgt_x = col_w_disp // 2
+            tgt_y = biy
 
-            tgt_x = max(0, min(self.W - 1, tgt_x))
-            tgt_y = max(0, min(self.H - 1, tgt_y))
-
-            # Blue connecting line (ball trajectory)
-            cv2.line(out, (tgt_x, tgt_y), (bix, biy), (200, 80, 0), 2, cv2.LINE_AA)
+            # Blue line: initial ball → post-impact (launch direction vector)
+            cv2.line(out, (bix, biy), (tgt_x, tgt_y), (200, 80, 0), 2, cv2.LINE_AA)
 
             # Large cyan circle at post-impact (col 1 area)
             cv2.circle(out, (tgt_x, tgt_y), 22, (0, 0, 0),  -1, cv2.LINE_AA)
