@@ -939,15 +939,24 @@ class PutterLive:
             if kf is None:
                 result.append(None)
                 continue
-            preds = self._yolo.predict(kf, conf=0.01, verbose=False)
+            kf_h, kf_w = kf.shape[:2]
+            col_w = kf_w // N_COLS
+            # Crop to this column's x-range (with small margin) so YOLO picks
+            # the putter head in column i, not other putters in the scene.
+            x0 = max(0, i * col_w - col_w // 4)
+            x1 = min(kf_w, (i + 1) * col_w + col_w // 4)
+            crop = kf[:, x0:x1]
+            preds = self._yolo.predict(crop, conf=0.01, verbose=False)
             boxes = preds[0].boxes
             if boxes is None or len(boxes) == 0:
-                print(f"[yolo] col {i}: no detection  (img shape={kf.shape})")
+                print(f"[yolo] col {i}: no detection  (img shape={crop.shape})")
                 result.append(None)
                 continue
             confs  = boxes.conf.tolist()
             best_i = int(max(range(len(confs)), key=lambda k: confs[k]))
             cx, cy, w, h = boxes.xywh[best_i].tolist()
+            # cx is relative to crop → add x0 to get full-frame cx
+            cx += x0
             print(f"[yolo] col {i}: detected conf={confs[best_i]:.2f}  cx={cx:.0f} cy={cy:.0f}")
             result.append((cx, cy, w, h, 0.0))
         return result
@@ -1135,7 +1144,7 @@ class PutterLive:
             hx += tw + 30
 
         # HUD hint bottom-right
-        hint = "SPACE: new shot   T: annotate   Q: quit"
+        hint = "L: retour live   SPACE: nouveau coup   T: annoter   Q: quitter"
         (hw, _), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
         cv2.putText(out, hint, (self.W - hw - 10, self.H + PANEL_H - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 120, 120), 1, cv2.LINE_AA)
@@ -1607,6 +1616,12 @@ class PutterLive:
                     self._ann_drawing   = False
                     self.state          = AppState.ANNOTATE
                     print("[annotate] Draw blue boxes around putter heads.")
+
+            elif key in (ord('l'), ord('L')):
+                if self.state == AppState.KEYFRAMES:
+                    # Return to live view without full reset
+                    self.state = AppState.READY
+                    print("[live] Back to READY.")
 
             elif key in (ord('s'), ord('S')):
                 if self.state == AppState.ANNOTATE:
