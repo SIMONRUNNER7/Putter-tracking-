@@ -60,8 +60,15 @@ ARC_STRAIGHT_PX    = 12    # max deviation → "Straight"
 ARC_SLIGHT_PX      = 35    # max deviation → "Slight Arc" (else "Strong Arc")
 
 STILL_THRESHOLD_PX = 20    # px – max spread of positions to be "still"
-STILL_SECS         = 2.0   # s  – duration to be still before auto-countdown
+STILL_SECS         = 1.5   # s  – durée de présence avant auto-countdown
 ZONE_MIN_AREA      = 50    # px² – min contour area in zone to count as object
+
+# ── Zones par défaut (caméra overhead 1280×720, ajustables avec Z/B) ──────────
+# Exprimées en fraction du frame (x, y, w, h) pour s'adapter à toute résolution
+PUTTER_ZONE_REL = (0.45, 0.38, 0.14, 0.27)   # tête de putter au repos (zone blanche)
+BALL_ZONE_REL   = (0.30, 0.40, 0.12, 0.23)   # balle à l'adresse      (zone verte)
+BALL_BRIGHT_THR = 190    # seuil luminosité pour détecter la balle blanche
+BALL_MIN_PX     = 60     # nombre minimum de pixels brillants = balle présente
 
 ANN_DIR            = "annotations"  # directory for YOLO OBB training data
 
@@ -189,11 +196,20 @@ class PutterLive:
         self._track_mode = "none"
 
         # ── Zone-based detection ──────────────────────────────────────────
-        self._zone_rect: Optional[tuple] = None       # (x, y, w, h)
+        # Zones pré-définies selon la résolution caméra
+        self._zone_rect = (
+            int(PUTTER_ZONE_REL[0] * self.W), int(PUTTER_ZONE_REL[1] * self.H),
+            int(PUTTER_ZONE_REL[2] * self.W), int(PUTTER_ZONE_REL[3] * self.H),
+        )
+        self._ball_zone_rect = (
+            int(BALL_ZONE_REL[0] * self.W), int(BALL_ZONE_REL[1] * self.H),
+            int(BALL_ZONE_REL[2] * self.W), int(BALL_ZONE_REL[3] * self.H),
+        )
         self._zone_mog2  = cv2.createBackgroundSubtractorMOG2(
             history=120, varThreshold=36, detectShadows=False)
         self._zone_pos_hist: deque = deque(maxlen=20)  # recent zone positions
         self._zone_still_since: Optional[float] = None
+        self._both_since: Optional[float] = None       # présence simultanée putter+balle
         self._zone_last_pos: Optional[tuple] = None
         self._zone_setup_start: Optional[tuple] = None
         self._zone_setup_end:   Optional[tuple] = None
@@ -204,7 +220,6 @@ class PutterLive:
         self._rec_bg_live:   Optional[np.ndarray] = None
         self._ball_roi_ref:  Optional[np.ndarray] = None
         self._ball_moved:    bool = False
-        self._ball_zone_rect: Optional[tuple] = None   # zone balle (touche B)
         self._setup_which    = "putter"                 # 'putter' ou 'ball'
         self._yolo_tick      = 0
         self._yolo_ready_box: Optional[tuple] = None   # (x1,y1,x2,y2) dernière détection YOLO
@@ -1032,10 +1047,16 @@ class PutterLive:
             return np.stack([cs_x(t_f), cs_y(t_f)], axis=1).astype(np.int32).reshape(-1, 1, 2)
 
         r = self.result
+        # Source de trajectoire : result.positions > rep_positions > centers_disp
+        _traj_src = []
         if r and len(r.positions) >= 4:
-            step    = max(1, len(r.positions) // 120)
-            traj_r  = r.positions[::step]
-            traj_f  = _filter_outliers(traj_r)
+            _traj_src = r.positions
+        elif self._rep_positions and sum(1 for p in self._rep_positions if p) >= 4:
+            _traj_src = [p for p in self._rep_positions if p is not None]
+
+        if len(_traj_src) >= 4:
+            step    = max(1, len(_traj_src) // 120)
+            traj_f  = _filter_outliers(_traj_src[::step])
             smooth  = _spline_arc(traj_f, n_fine=500)
             if smooth is not None:
                 self._draw_tapered_arc(out, smooth,
@@ -1126,90 +1147,72 @@ class PutterLive:
                     self._draw_path(frame, self._last_path,
                                     color=(35, 80, 35), width=1, centerline=False)
 
-                # ── YOLO putter detection (temps réel, toutes les 4 frames) ──
+                # ── YOLO putter (toutes les 4 frames) ──────────────────────
                 self._yolo_tick += 1
-                yolo_pos = None
                 if self._yolo is not None and self._yolo_tick % 4 == 0:
                     try:
-                        _preds = self._yolo.predict(frame, conf=0.15, verbose=False)
-                        _boxes = _preds[0].boxes
+                        _half_r = cv2.resize(frame, (self.W // 2, self.H // 2))
+                        _preds  = self._yolo.predict(_half_r, conf=0.12, verbose=False)
+                        _boxes  = _preds[0].boxes
                         if _boxes is not None and len(_boxes) > 0:
-                            _confs  = _boxes.conf.tolist()
-                            _best   = int(max(range(len(_confs)), key=lambda k: _confs[k]))
-                            _x1, _y1, _x2, _y2 = [int(v) for v in _boxes.xyxy[_best].tolist()]
-                            self._yolo_ready_box = (_x1, _y1, _x2, _y2)
+                            _confs = _boxes.conf.tolist()
+                            _bi    = int(max(range(len(_confs)), key=lambda k: _confs[k]))
+                            _x1h, _y1h, _x2h, _y2h = [int(v) for v in
+                                                        _boxes.xyxy[_bi].tolist()]
+                            # Remettre en coordonnées pleine résolution
+                            self._yolo_ready_box = (_x1h*2, _y1h*2, _x2h*2, _y2h*2)
                         else:
                             self._yolo_ready_box = None
                     except Exception:
                         self._yolo_ready_box = None
 
-                if self._yolo_ready_box is not None:
-                    _x1, _y1, _x2, _y2 = self._yolo_ready_box
-                    yolo_pos = ((_x1 + _x2) // 2, (_y1 + _y2) // 2)
-                    cv2.rectangle(frame, (_x1, _y1), (_x2, _y2), C["cyan"], 2, cv2.LINE_AA)
-                    self._track_mode = "yolo"
-
-                # ── Détection balle dans ball zone (blob lumineux = balle blanche) ──
-                ball_present = True   # pas de contrainte si zone non définie
-                if self._ball_zone_rect is not None:
-                    _bx, _by, _bw, _bh = self._ball_zone_rect
-                    _ball_roi = frame[_by:_by + _bh, _bx:_bx + _bw]
-                    if _ball_roi.size > 0:
-                        _gray_b = cv2.cvtColor(_ball_roi, cv2.COLOR_BGR2GRAY)
-                        _, _bright = cv2.threshold(_gray_b, 200, 255, cv2.THRESH_BINARY)
-                        ball_present = cv2.countNonZero(_bright) > 80
-                    ball_clr = C["green"] if ball_present else C["red"]
-                    cv2.rectangle(frame, (_bx, _by), (_bx + _bw, _by + _bh),
-                                  ball_clr, 2, cv2.LINE_AA)
-                    if not ball_present:
-                        self._put(frame, "Balle ?", (_bx, _by - 6),
-                                  scale=0.45, color=C["red"])
-
-                # ── Zone putter (blanc) ─────────────────────────────────────
+                # ── Dessiner zone putter (blanc) + détection ────────────────
+                putter_in_zone = False
                 if self._zone_rect is not None:
                     zx, zy, zw, zh = self._zone_rect
                     cv2.rectangle(frame, (zx, zy), (zx + zw, zy + zh),
                                   C["white"], 2, cv2.LINE_AA)
+                    if self._yolo_ready_box is not None:
+                        _px1, _py1, _px2, _py2 = self._yolo_ready_box
+                        _pcx, _pcy = (_px1 + _px2) // 2, (_py1 + _py2) // 2
+                        putter_in_zone = (zx <= _pcx <= zx + zw and zy <= _pcy <= zy + zh)
+                        cv2.rectangle(frame, (_px1, _py1), (_px2, _py2),
+                                      C["cyan"], 2, cv2.LINE_AA)
+                        self._track_mode = "yolo"
 
-                # Position courante : YOLO en priorité, sinon zone MOG2
-                detect_pos = yolo_pos
-                if detect_pos is None and self._zone_rect is not None:
-                    detect_pos = self._detect_in_zone(frame)
-                    if detect_pos is not None:
-                        self._track_mode = "zone"
+                # ── Dessiner zone balle (verte) + détection balle blanche ───
+                ball_in_zone = False
+                if self._ball_zone_rect is not None:
+                    _bx, _by, _bw, _bh = self._ball_zone_rect
+                    _ball_roi = frame[_by:_by + _bh, _bx:_bx + _bw]
+                    if _ball_roi.size > 0:
+                        _gb = cv2.cvtColor(_ball_roi, cv2.COLOR_BGR2GRAY)
+                        _, _br2 = cv2.threshold(_gb, BALL_BRIGHT_THR, 255, cv2.THRESH_BINARY)
+                        ball_in_zone = cv2.countNonZero(_br2) > BALL_MIN_PX
+                    ball_clr = C["green"] if ball_in_zone else (80, 180, 80)
+                    cv2.rectangle(frame, (_bx, _by), (_bx + _bw, _by + _bh),
+                                  ball_clr, 2, cv2.LINE_AA)
 
-                if detect_pos is not None:
-                    self._zone_pos_hist.append(detect_pos)
-                    self._zone_last_pos = detect_pos
-                    cv2.circle(frame, detect_pos, 10, C["cyan"], -1, cv2.LINE_AA)
-                    cv2.circle(frame, detect_pos, 12, C["white"],  2, cv2.LINE_AA)
-
-                    # Détection immobilité
-                    if len(self._zone_pos_hist) >= 8:
-                        xs = [p[0] for p in self._zone_pos_hist]
-                        ys = [p[1] for p in self._zone_pos_hist]
-                        spread = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
-                        if spread < STILL_THRESHOLD_PX:
-                            if self._zone_still_since is None:
-                                self._zone_still_since = now
-                            elapsed = now - self._zone_still_since
-                            prog = min(1.0, elapsed / STILL_SECS)
-                            cv2.ellipse(frame, detect_pos, (22, 22),
-                                        -90, 0, int(360 * prog),
-                                        C["green"], 3, cv2.LINE_AA)
-                            self._put(frame,
-                                      f"Hold... {elapsed:.1f}/{STILL_SECS:.0f}s",
-                                      (detect_pos[0] + 25, detect_pos[1] - 5),
-                                      scale=0.5, color=C["green"])
-                            if elapsed >= STILL_SECS and ball_present:
-                                self._zone_still_since = None
-                                self._zone_pos_hist.clear()
-                                self.state     = AppState.COUNTDOWN
-                                self._cd_start = now
-                        else:
-                            self._zone_still_since = None
+                # ── Auto-start : putter + balle présents simultanément ──────
+                both = putter_in_zone and ball_in_zone
+                if both:
+                    if self._both_since is None:
+                        self._both_since = now
+                    elapsed = now - self._both_since
+                    prog    = min(1.0, elapsed / STILL_SECS)
+                    # Anneau de progression sur la zone putter
+                    if self._zone_rect is not None:
+                        _zc = (zx + zw // 2, zy + zh // 2)
+                        cv2.ellipse(frame, _zc, (30, 30), -90, 0, int(360 * prog),
+                                    C["green"], 3, cv2.LINE_AA)
+                        self._put(frame, f"{elapsed:.1f}s / {STILL_SECS:.0f}s",
+                                  (_zc[0] + 35, _zc[1]), scale=0.45, color=C["green"])
+                    if elapsed >= STILL_SECS:
+                        self._both_since = None
+                        self.state       = AppState.COUNTDOWN
+                        self._cd_start   = now
                 else:
-                    self._zone_still_since = None
+                    self._both_since = None
                     if pos:
                         cv2.circle(frame, pos, 7, C["green"], -1)
 
@@ -1276,20 +1279,19 @@ class PutterLive:
                 zone_pos_rec = self._detect_in_zone(frame)
                 track_pos = zone_pos_rec or pos   # prefer zone centroid
 
-                # ── YOLO tracking en live (toutes les 3 frames) ────────────
-                # Remplace/complète ArUco+CSRT pour le tracking et la colonne
-                if self._yolo is not None and self._rep_ctr % 3 == 0:
+                # ── YOLO tracking toutes les 6 frames sur _half (rapide) ───
+                if self._yolo is not None and self._rep_ctr % 6 == 0:
                     try:
-                        _pr = self._yolo.predict(frame, conf=0.15, verbose=False)
+                        _pr = self._yolo.predict(_half, conf=0.12, verbose=False)
                         _br = _pr[0].boxes
                         if _br is not None and len(_br) > 0:
-                            _ci = int(max(range(len(_br.conf.tolist())),
-                                         key=lambda k: _br.conf.tolist()[k]))
-                            _ycx = int(_br.xywh[_ci][0])
-                            _ycy = int(_br.xywh[_ci][1])
-                            _yolo_rp = (_ycx, _ycy)
-                            track_pos = _yolo_rp   # meilleure position pour la colonne
-                            if pos is None:        # Ajouter aux records si pas d'ArUco/CSRT
+                            _ci  = int(max(range(len(_br.conf.tolist())),
+                                          key=lambda k: _br.conf.tolist()[k]))
+                            # _half est à moitié résolution → ×2 pour coordonnées réelles
+                            _ycx = int(_br.xywh[_ci][0]) * 2
+                            _ycy = int(_br.xywh[_ci][1]) * 2
+                            track_pos = (_ycx, _ycy)   # meilleure source pour la colonne
+                            if pos is None:             # ajouter aux records si pas d'ArUco
                                 _rv = (
                                     math.hypot(_ycx - self.records[-1].pos[0],
                                                _ycy - self.records[-1].pos[1])
@@ -1297,7 +1299,7 @@ class PutterLive:
                                     if self.records else 0.0
                                 )
                                 self.records.append(
-                                    FrameRec(ts=now, pos=_yolo_rp, angle=0.0, vel=_rv))
+                                    FrameRec(ts=now, pos=(_ycx, _ycy), angle=0.0, vel=_rv))
                     except Exception:
                         pass
 
