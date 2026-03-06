@@ -206,6 +206,8 @@ class PutterLive:
         self._ball_moved:    bool = False
         self._ball_zone_rect: Optional[tuple] = None   # zone balle (touche B)
         self._setup_which    = "putter"                 # 'putter' ou 'ball'
+        self._yolo_tick      = 0
+        self._yolo_ready_box: Optional[tuple] = None   # (x1,y1,x2,y2) dernière détection YOLO
 
         # ── KEYFRAMES post-processing ─────────────────────────────────────
         self._strobe_indices: list = []
@@ -986,8 +988,8 @@ class PutterLive:
             dcx = int(cx * scale_x);  dcy = int(cy * scale_y)
             dw  = w * scale_x;        dh  = h * scale_y
             pts = cv2.boxPoints(((float(dcx), float(dcy)), (dw, dh), angle_deg))
-            # Cadre arrondi sans fond – pas de remplissage blanc
-            self._draw_rounded_box(out, pts, (200, 200, 200), thickness=2, radius=7)
+            # Cadre blanc arrondi sans fond
+            self._draw_rounded_box(out, pts, (255, 255, 255), thickness=2, radius=7)
             centers_disp[i] = (dcx, dcy)
 
         # Fallback: stored positions
@@ -1124,60 +1126,90 @@ class PutterLive:
                     self._draw_path(frame, self._last_path,
                                     color=(35, 80, 35), width=1, centerline=False)
 
-                # Zone detection + auto-countdown
-                # Zone balle (verte)
-                if self._ball_zone_rect is not None:
-                    bx, by, bw, bh = self._ball_zone_rect
-                    cv2.rectangle(frame, (bx, by), (bx + bw, by + bh),
-                                  C["green"], 2, cv2.LINE_AA)
+                # ── YOLO putter detection (temps réel, toutes les 4 frames) ──
+                self._yolo_tick += 1
+                yolo_pos = None
+                if self._yolo is not None and self._yolo_tick % 4 == 0:
+                    _preds = self._yolo.predict(frame, conf=0.25, verbose=False,
+                                                device='mps')
+                    _boxes = _preds[0].boxes
+                    if _boxes is not None and len(_boxes) > 0:
+                        _confs  = _boxes.conf.tolist()
+                        _best   = int(max(range(len(_confs)), key=lambda k: _confs[k]))
+                        _x1, _y1, _x2, _y2 = [int(v) for v in _boxes.xyxy[_best].tolist()]
+                        self._yolo_ready_box = (_x1, _y1, _x2, _y2)
+                    else:
+                        self._yolo_ready_box = None
 
+                if self._yolo_ready_box is not None:
+                    _x1, _y1, _x2, _y2 = self._yolo_ready_box
+                    yolo_pos = ((_x1 + _x2) // 2, (_y1 + _y2) // 2)
+                    cv2.rectangle(frame, (_x1, _y1), (_x2, _y2), C["cyan"], 2, cv2.LINE_AA)
+                    self._track_mode = "yolo"
+
+                # ── Détection balle dans ball zone (blob lumineux = balle blanche) ──
+                ball_present = True   # pas de contrainte si zone non définie
+                if self._ball_zone_rect is not None:
+                    _bx, _by, _bw, _bh = self._ball_zone_rect
+                    _ball_roi = frame[_by:_by + _bh, _bx:_bx + _bw]
+                    if _ball_roi.size > 0:
+                        _gray_b = cv2.cvtColor(_ball_roi, cv2.COLOR_BGR2GRAY)
+                        _, _bright = cv2.threshold(_gray_b, 200, 255, cv2.THRESH_BINARY)
+                        ball_present = cv2.countNonZero(_bright) > 80
+                    ball_clr = C["green"] if ball_present else C["red"]
+                    cv2.rectangle(frame, (_bx, _by), (_bx + _bw, _by + _bh),
+                                  ball_clr, 2, cv2.LINE_AA)
+                    if not ball_present:
+                        self._put(frame, "Balle ?", (_bx, _by - 6),
+                                  scale=0.45, color=C["red"])
+
+                # ── Zone putter (blanc) ─────────────────────────────────────
                 if self._zone_rect is not None:
                     zx, zy, zw, zh = self._zone_rect
-                    # Draw zone rectangle (white)
                     cv2.rectangle(frame, (zx, zy), (zx + zw, zy + zh),
                                   C["white"], 2, cv2.LINE_AA)
 
-                    zone_pos = self._detect_in_zone(frame)
-                    if zone_pos is not None:
-                        self._zone_pos_hist.append(zone_pos)
-                        self._zone_last_pos = zone_pos
+                # Position courante : YOLO en priorité, sinon zone MOG2
+                detect_pos = yolo_pos
+                if detect_pos is None and self._zone_rect is not None:
+                    detect_pos = self._detect_in_zone(frame)
+                    if detect_pos is not None:
                         self._track_mode = "zone"
 
-                        cv2.circle(frame, zone_pos, 10, C["cyan"], -1, cv2.LINE_AA)
-                        cv2.circle(frame, zone_pos, 12, C["white"],  2, cv2.LINE_AA)
+                if detect_pos is not None:
+                    self._zone_pos_hist.append(detect_pos)
+                    self._zone_last_pos = detect_pos
+                    cv2.circle(frame, detect_pos, 10, C["cyan"], -1, cv2.LINE_AA)
+                    cv2.circle(frame, detect_pos, 12, C["white"],  2, cv2.LINE_AA)
 
-                        # Still detection: spread of last N positions
-                        if len(self._zone_pos_hist) >= 8:
-                            xs = [p[0] for p in self._zone_pos_hist]
-                            ys = [p[1] for p in self._zone_pos_hist]
-                            spread = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
-                            if spread < STILL_THRESHOLD_PX:
-                                if self._zone_still_since is None:
-                                    self._zone_still_since = now
-                                elapsed = now - self._zone_still_since
-                                prog = min(1.0, elapsed / STILL_SECS)
-                                # Progress ring around detected point
-                                cv2.ellipse(frame, zone_pos, (22, 22),
-                                            -90, 0, int(360 * prog),
-                                            C["green"], 3, cv2.LINE_AA)
-                                # Still timer label
-                                self._put(frame,
-                                          f"Hold... {elapsed:.1f}/{STILL_SECS:.0f}s",
-                                          (zone_pos[0] + 25, zone_pos[1] - 5),
-                                          scale=0.5, color=C["green"])
-                                if elapsed >= STILL_SECS:
-                                    # ▶ Auto-start countdown
-                                    self._zone_still_since = None
-                                    self._zone_pos_hist.clear()
-                                    self.state     = AppState.COUNTDOWN
-                                    self._cd_start = now
-                            else:
+                    # Détection immobilité
+                    if len(self._zone_pos_hist) >= 8:
+                        xs = [p[0] for p in self._zone_pos_hist]
+                        ys = [p[1] for p in self._zone_pos_hist]
+                        spread = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+                        if spread < STILL_THRESHOLD_PX:
+                            if self._zone_still_since is None:
+                                self._zone_still_since = now
+                            elapsed = now - self._zone_still_since
+                            prog = min(1.0, elapsed / STILL_SECS)
+                            cv2.ellipse(frame, detect_pos, (22, 22),
+                                        -90, 0, int(360 * prog),
+                                        C["green"], 3, cv2.LINE_AA)
+                            self._put(frame,
+                                      f"Hold... {elapsed:.1f}/{STILL_SECS:.0f}s",
+                                      (detect_pos[0] + 25, detect_pos[1] - 5),
+                                      scale=0.5, color=C["green"])
+                            if elapsed >= STILL_SECS and ball_present:
                                 self._zone_still_since = None
-                    else:
-                        self._zone_still_since = None
-
-                elif pos:
-                    cv2.circle(frame, pos, 7, C["green"], -1)
+                                self._zone_pos_hist.clear()
+                                self.state     = AppState.COUNTDOWN
+                                self._cd_start = now
+                        else:
+                            self._zone_still_since = None
+                else:
+                    self._zone_still_since = None
+                    if pos:
+                        cv2.circle(frame, pos, 7, C["green"], -1)
 
                 extra = [f"Face : {angle:+.1f}°"] if angle is not None else []
                 self._draw_hud(frame, fps, extra)
@@ -1397,27 +1429,29 @@ class PutterLive:
                             self._kf_done = True
 
                 if not self._kf_done:
-                    f_idx = min(self._kf_idx, len(self._rep_frames) - 1)
-                    disp  = cv2.resize(self._rep_frames[f_idx], (self.W, self.H))
+                    f_idx  = min(self._kf_idx, len(self._rep_frames) - 1)
+                    cur_f  = self._rep_frames[f_idx]
+                    sf_h2, sf_w2 = cur_f.shape[:2]
+                    cw_src = sf_w2 // N_COLS
+
+                    # Gel progressif : colonnes scannées = frame figée, autres = frame courante
+                    composite2 = cur_f.copy()
+                    for i in range(N_COLS):
+                        src_f = None
+                        # Priorité : frame capturée en live (RECORDING)
+                        if self._kf_col_frames[i] is not None:
+                            src_f = self._kf_col_frames[i]
+                        # Sinon : meilleur index replay trouvé jusqu'ici
+                        elif (self._strobe_indices[i] is not None
+                              and self._strobe_indices[i] < len(self._rep_frames)):
+                            src_f = self._rep_frames[self._strobe_indices[i]]
+                        if src_f is not None:
+                            x0 = i * cw_src
+                            x1 = sf_w2 if i == N_COLS - 1 else x0 + cw_src
+                            composite2[:, x0:x1] = src_f[:, x0:x1]
+
                     frame = np.zeros((self.H + PANEL_H, self.W, 3), dtype=np.uint8)
-                    frame[:self.H] = disp
-
-                    if self._kf_cur_col is not None:
-                        c  = self._kf_cur_col
-                        x0 = c * col_w_d
-                        x1 = x0 + col_w_d if c < N_COLS - 1 else self.W
-                        frame[:vid_h, x0:x1] = np.clip(
-                            frame[:vid_h, x0:x1].astype(np.int32) + 50,
-                            0, 255).astype(np.uint8)
-
-                    if self._kf_flash_col >= 0 and now - self._kf_flash_t < 0.5:
-                        c  = self._kf_flash_col
-                        x0 = c * col_w_d
-                        x1 = x0 + col_w_d if c < N_COLS - 1 else self.W
-                        frame[:vid_h, x0:x1] = np.clip(
-                            frame[:vid_h, x0:x1].astype(np.int32) + 110,
-                            0, 255).astype(np.uint8)
-
+                    frame[:vid_h] = cv2.resize(composite2, (self.W, vid_h))
                     for i in range(1, N_COLS):
                         cv2.line(frame, (i * col_w_d, 0),
                                  (i * col_w_d, vid_h), (80, 80, 80), 1)
