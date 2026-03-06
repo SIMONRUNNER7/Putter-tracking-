@@ -6,26 +6,10 @@ Usage:
     python3 frame_picker.py                  # premier shot dans captures/raw/
     python3 frame_picker.py captures/raw/shot_20240305_123456/
 
-Touches:
-    1-7       sélectionner la colonne putter active
-    8 / B     basculer en mode balle (frame balle post-impact)
-    ←  / ,    frame précédente dans le pool
-    →  / .    frame suivante dans le pool
-    [         shot précédent
-    ]         shot suivant
-    S         sauvegarder et passer au shot suivant
-    E         exporter pour entraînement YOLO
-    Q / Esc   quitter
-
-Souris:
-    Clic gauche sur le composite   → changer la colonne active
-    Clic gauche sur un thumbnail   → sélectionner cette frame
-
-Flux :
-    Étape 1 – CLUB  : touches 1-7 pour choisir la colonne, ←/→ pour naviguer
-              dans TOUTES les frames enregistrées et choisir la meilleure.
-    Étape 2 – BALLE : appuyer sur 8/B, puis ←/→ pour choisir la frame balle.
-    S         : sauvegarde et passe automatiquement au shot suivant.
+Interface:
+    Clic sur le composite         → changer la colonne active
+    Clic sur un thumbnail         → sélectionner cette frame
+    Boutons en bas de la fenêtre  → toutes les actions disponibles
 """
 
 import cv2
@@ -42,15 +26,13 @@ BALL_CROP_R = 46      # rayon crop balle
 THUMB_H     = 190     # hauteur zone thumbnails
 THUMB_W     = 120     # largeur fixe d'un thumbnail (strip scrollable)
 STATUS_H    = 28
+BTN_H       = 50      # hauteur barre de boutons
 WIN_NAME    = "Frame Picker"
 
 
 # ── Export pour entraînement ─────────────────────────────────────────────────
 
 def export_for_training(shot_dir, all_frames, selections, meta):
-    """
-    Exporte les frames sélectionnées vers annotation_output/ avec labels YOLO.
-    """
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from training.autolabel import detect_putter_bbox
@@ -104,10 +86,6 @@ def export_for_training(shot_dir, all_frames, selections, meta):
     print(f"[export] {exported}/{total} cols → annotation_output/")
     if skipped:
         print(f"[export] {skipped} col(s) vide(s) ignorée(s)")
-    print("[export] Prochaine étape :")
-    print("         python3 training/prepare_dataset.py")
-    print("         python3 training/train_detector.py train "
-          "--data data/putter_dataset/data.yaml --epochs 50 --model yolov8n.pt")
     return exported
 
 
@@ -118,7 +96,7 @@ def find_all_shots(base="captures/raw"):
 
 
 def find_latest_shot(base="captures/raw"):
-    shots = find_all_shots(base)
+    shots = find_all_shots()
     return shots[-1] if shots else None
 
 
@@ -177,7 +155,6 @@ def load_shot(shot_dir):
 
 
 def load_shot_state(shot_dir):
-    """Charge un shot et initialise toutes les sélections."""
     meta, all_frames, ball_rest_kf, ball1_frames, ball1_pos = load_shot(shot_dir)
     n_all = len(all_frames)
 
@@ -239,7 +216,6 @@ def build_composite(all_frames, selections, meta,
                     (col_idx * col_w + 6, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 120), 1)
 
-    # Surligner colonne active (cyan) en mode club
     if not ball1_mode:
         ax0 = active_col * col_w
         ax1 = W if active_col == N_COLS - 1 else ax0 + col_w
@@ -248,16 +224,13 @@ def build_composite(all_frames, selections, meta,
         cv2.addWeighted(canvas, 0.82, hl, 0.18, 0, canvas)
         cv2.rectangle(canvas, (ax0, 0), (ax1, H), (0, 200, 255), 2)
 
-    # Overlay balle repos (col 4)
     _paste_ball(canvas, ball_rest_kf, meta.get("ball_rest_pos"), W, H)
 
-    # Overlay balle post-impact (col 1)
     if ball1_frames and 0 <= sel_ball1 < len(ball1_frames):
         pos = (ball1_pos[sel_ball1] if sel_ball1 < len(ball1_pos)
                else meta.get("ball_col_pos_0"))
         _paste_ball(canvas, ball1_frames[sel_ball1], pos, W, H)
 
-    # Surligner col 1 en orange en mode balle
     if ball1_mode:
         hl2 = canvas.copy()
         cv2.rectangle(hl2, (0, 0), (col_w, H), (0, 140, 255), -1)
@@ -269,7 +242,73 @@ def build_composite(all_frames, selections, meta,
     return canvas
 
 
-# ── Bande de thumbnails (fenêtre scrollable centrée sur la sélection) ─────────
+# ── Barre de boutons ──────────────────────────────────────────────────────────
+
+def _draw_btn(bar, x0, x1, label, bg_color, text_color=(230, 230, 230),
+              border_color=(160, 160, 160)):
+    """Dessine un bouton dans la barre."""
+    cv2.rectangle(bar, (x0 + 2, 2), (x1 - 2, BTN_H - 2), bg_color, -1)
+    cv2.rectangle(bar, (x0 + 2, 2), (x1 - 2, BTN_H - 2), border_color, 1)
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
+    tx = x0 + max(4, (x1 - x0 - tw) // 2)
+    ty = BTN_H // 2 + th // 2
+    cv2.putText(bar, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                text_color, 1, cv2.LINE_AA)
+
+
+def build_buttons(W, shot_idx, n_shots, ball1_mode, dirty, n_frames,
+                  active_col_idx, ball1_frames):
+    """
+    Construit la barre de boutons et retourne (image, regions).
+    regions = liste de (action_id, x0, x1)
+    """
+    bar = np.full((BTN_H, W, 3), (30, 30, 30), dtype=np.uint8)
+
+    # Définition des boutons dans l'ordre d'affichage
+    # (label, action_id, bg_color, condition)
+    btn_defs = []
+
+    if n_shots > 1:
+        btn_defs.append(("< SHOT",  "prev_shot",    (70, 70, 70)))
+        btn_defs.append(("SHOT >",  "next_shot",    (70, 70, 70)))
+
+    btn_defs.append(("< FRAME",    "prev_frame",   (60, 80, 110)))
+    btn_defs.append(("FRAME >",    "next_frame",   (60, 80, 110)))
+
+    ball_bg = (20, 110, 140) if ball1_mode else (20, 70, 90)
+    btn_defs.append(("BALLE",      "toggle_ball",  ball_bg))
+
+    save_bg = (20, 130, 20) if dirty else (20, 80, 20)
+    btn_defs.append(("SAUVEGARDER","save",          save_bg))
+
+    btn_defs.append(("EXPORTER",   "export",       (80, 60, 20)))
+    btn_defs.append(("QUITTER",    "quit",         (100, 20, 20)))
+
+    n_btns = len(btn_defs)
+    bw     = W // n_btns
+    regions = []
+
+    for i, (label, action_id, bg) in enumerate(btn_defs):
+        x0 = i * bw
+        x1 = W if i == n_btns - 1 else x0 + bw
+        _draw_btn(bar, x0, x1, label, bg)
+        regions.append((action_id, x0, x1))
+
+    # Indicateur shot en haut à droite
+    if n_shots > 1:
+        info = f"Shot {shot_idx + 1}/{n_shots}"
+        cv2.putText(bar, info, (W - 140, 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 160, 160), 1)
+
+    # Indicateur frames en haut à gauche
+    info_f = f"{n_frames} frames"
+    cv2.putText(bar, info_f, (6, 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (110, 110, 110), 1)
+
+    return bar, regions
+
+
+# ── Bande de thumbnails ───────────────────────────────────────────────────────
 
 def build_strip(all_frames, sel, W,
                 ball1_mode=False, ball1_frames=None, sel_ball1=0):
@@ -279,19 +318,19 @@ def build_strip(all_frames, sel, W,
         bg        = (20, 10, 0)
         sel_color = (0, 140, 255)
         label_pfx = "B"
-        tw        = min(W // len(frames), 260)   # variable (peu de frames)
+        tw        = min(W // len(frames), 260)
     else:
         frames    = all_frames
         cur_sel   = sel
         bg        = (20, 20, 20)
         sel_color = (0, 220, 0)
         label_pfx = ""
-        tw        = THUMB_W                       # fixe (nombreuses frames)
+        tw        = THUMB_W
 
     strip = np.full((THUMB_H, W, 3), bg, dtype=np.uint8)
 
     if not frames:
-        msg = "Aucun candidat balle" if ball1_mode else "Aucune frame enregistrée"
+        msg = "Aucun candidat balle" if ball1_mode else "Aucune frame enregistree"
         cv2.putText(strip, msg, (10, THUMB_H // 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (120, 120, 120), 1)
         return strip
@@ -320,7 +359,6 @@ def build_strip(all_frames, sel, W,
         cv2.rectangle(strip, (x0, 0), (x0 + tw - 1, THUMB_H - 23),
                       color, thickness)
 
-    # Indicateur de position scrollbar (mode club uniquement)
     if not ball1_mode and n > max_vis:
         bar_y  = THUMB_H - 4
         bar_x0 = int(W * start / n)
@@ -331,11 +369,10 @@ def build_strip(all_frames, sel, W,
     return strip
 
 
-# ── Barre de statut ───────────────────────────────────────────────────────────
+# ── Barre de statut (info seulement) ─────────────────────────────────────────
 
 def build_status(all_frames, selections, active_col, dirty, W,
-                 ball1_mode=False, ball1_frames=None, sel_ball1=0,
-                 shot_idx=0, n_shots=1):
+                 ball1_mode=False, ball1_frames=None, sel_ball1=0):
     n_all = len(all_frames)
 
     if ball1_mode and ball1_frames:
@@ -347,13 +384,8 @@ def build_status(all_frames, selections, active_col, dirty, W,
         sel       = (selections[active_col] + 1) if n_all > 0 else 0
         col_label = f"Col {active_col + 1}"
 
-    shot_info = f"  |  Shot {shot_idx + 1}/{n_shots}" if n_shots > 1 else ""
-    nav_shots = "  p/n : shot" if n_shots > 1 else ""
-    msg = (f"  {col_label}  |  Frame {sel}/{n}"
-           f"  |  a/d : nav   1-7 : col   b : balle{nav_shots}"
-           f"   S : save+next   E : export   Q : quit"
-           + shot_info
-           + ("   [NON SAUVEGARDÉ]" if dirty else "   [OK]"))
+    state_txt = "NON SAUVEGARDE" if dirty else "sauvegarde"
+    msg = f"  {col_label}  |  Frame {sel}/{n}  |  {state_txt}"
     bar = np.full((STATUS_H, W, 3), 15, dtype=np.uint8)
     cv2.putText(bar, msg, (6, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.42,
@@ -366,7 +398,7 @@ def build_status(all_frames, selections, active_col, dirty, W,
 def render(all_frames, selections, meta, ball_rest_kf,
            ball1_frames, ball1_pos, sel_ball1,
            active_col, dirty, ball1_mode,
-           shot_idx=0, n_shots=1):
+           shot_idx=0, n_shots=1, btn_regions_out=None):
     W   = meta["W"]
     H   = meta["H"]
     sel = selections[active_col] if active_col < N_COLS else 0
@@ -374,16 +406,28 @@ def render(all_frames, selections, meta, ball_rest_kf,
     composite = build_composite(all_frames, selections, meta,
                                 ball_rest_kf, ball1_frames, ball1_pos,
                                 sel_ball1, active_col, ball1_mode)
+
+    btn_bar, regions = build_buttons(
+        W, shot_idx, n_shots, ball1_mode, dirty,
+        n_frames=len(all_frames),
+        active_col_idx=active_col,
+        ball1_frames=ball1_frames)
+
+    if btn_regions_out is not None:
+        btn_regions_out.clear()
+        btn_regions_out.extend(regions)
+
     strip = cv2.resize(
         build_strip(all_frames, sel, W,
                     ball1_mode=ball1_mode,
                     ball1_frames=ball1_frames, sel_ball1=sel_ball1),
         (W, THUMB_H))
+
     status = build_status(all_frames, selections, active_col, dirty, W,
                           ball1_mode=ball1_mode, ball1_frames=ball1_frames,
-                          sel_ball1=sel_ball1,
-                          shot_idx=shot_idx, n_shots=n_shots)
-    return np.vstack([composite, strip, status])
+                          sel_ball1=sel_ball1)
+
+    return np.vstack([composite, btn_bar, strip, status])
 
 
 # ── Sauvegarde ────────────────────────────────────────────────────────────────
@@ -397,7 +441,6 @@ def save(shot_dir, all_frames, selections, meta,
     with open(os.path.join(shot_dir, "metadata.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
-    # Régénérer le composite SANS surlignage
     col_w  = W // N_COLS
     canvas = np.zeros((H, W, 3), dtype=np.uint8)
     n_all  = len(all_frames)
@@ -463,27 +506,42 @@ def main():
           f"{len(ball1_frames)} frame(s) balle")
     W, H = meta["W"], meta["H"]
 
-    active_col = 3
-    ball1_mode = False
-    dirty      = False
+    active_col  = 3
+    ball1_mode  = False
+    dirty       = False
+    btn_regions = []   # mis à jour à chaque render()
 
     cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WIN_NAME, W, H + THUMB_H + STATUS_H)
+    cv2.resizeWindow(WIN_NAME, W, H + BTN_H + THUMB_H + STATUS_H)
 
-    cb_state = {"active_col": active_col, "ball1_mode": False}
+    cb_state = {
+        "active_col": active_col,
+        "ball1_mode": False,
+        "action":     None,   # action déclenchée par un bouton
+    }
 
     def on_mouse(event, x, y, flags, param):
         nonlocal dirty, sel_ball1
         if event != cv2.EVENT_LBUTTONDOWN:
             return
+
+        # Zone composite → changer colonne active
         if y < H:
-            # Clic composite → changer colonne active
             col_w   = W // N_COLS
             clicked = min(x // col_w, N_COLS - 1)
             param["active_col"] = clicked
             param["ball1_mode"] = False
             return
-        if y < H + THUMB_H:
+
+        # Zone boutons
+        if H <= y < H + BTN_H:
+            for action_id, bx0, bx1 in btn_regions:
+                if bx0 <= x < bx1:
+                    param["action"] = action_id
+            return
+
+        # Zone strip thumbnails
+        if H + BTN_H <= y < H + BTN_H + THUMB_H:
             if param["ball1_mode"] and ball1_frames:
                 n  = len(ball1_frames)
                 tw = min(W // n, 260)
@@ -496,7 +554,6 @@ def main():
                 ac = param["active_col"]
                 if ac >= N_COLS:
                     return
-                # Calculer la fenêtre visible (même logique que build_strip)
                 max_vis = max(1, W // THUMB_W)
                 cur_sel = selections[ac]
                 half    = max_vis // 2
@@ -527,7 +584,7 @@ def main():
         active_col = 3
         cb_state["active_col"] = 3
         cb_state["ball1_mode"] = False
-        cv2.resizeWindow(WIN_NAME, W, H + THUMB_H + STATUS_H)
+        cv2.resizeWindow(WIN_NAME, W, H + BTN_H + THUMB_H + STATUS_H)
 
     while True:
         active_col = cb_state["active_col"]
@@ -536,14 +593,50 @@ def main():
         frame = render(all_frames, selections, meta, ball_rest_kf,
                        ball1_frames, ball1_pos, sel_ball1,
                        active_col, dirty, ball1_mode,
-                       shot_idx=shot_idx, n_shots=n_shots)
+                       shot_idx=shot_idx, n_shots=n_shots,
+                       btn_regions_out=btn_regions)
         cv2.imshow(WIN_NAME, frame)
-        key = cv2.waitKey(40) & 0xFF
 
-        if key in (ord('q'), 27):                        # Q / Esc
-            break
+        # ── Traitement des actions boutons ────────────────────────────────────
+        action = cb_state.pop("action", None)
+        if action is None:
+            cb_state["action"] = None   # remettre la clé
 
-        elif key == ord('s'):                             # Sauvegarder + shot suivant
+        if action == "prev_shot":
+            if shot_idx > 0:
+                switch_shot(shot_idx - 1)
+            else:
+                print("[picker] Premier shot.")
+
+        elif action == "next_shot":
+            if shot_idx < n_shots - 1:
+                switch_shot(shot_idx + 1)
+            else:
+                print("[picker] Dernier shot.")
+
+        elif action == "prev_frame":
+            if ball1_mode and ball1_frames:
+                sel_ball1 = max(0, sel_ball1 - 1)
+                dirty = True
+            elif active_col < N_COLS and all_frames:
+                selections[active_col] = max(0, selections[active_col] - 1)
+                dirty = True
+
+        elif action == "next_frame":
+            if ball1_mode and ball1_frames:
+                sel_ball1 = min(len(ball1_frames) - 1, sel_ball1 + 1)
+                dirty = True
+            elif active_col < N_COLS and all_frames:
+                selections[active_col] = min(
+                    len(all_frames) - 1, selections[active_col] + 1)
+                dirty = True
+
+        elif action == "toggle_ball":
+            cb_state["ball1_mode"] = not ball1_mode
+            print(f"[picker] Mode balle : {'ON' if not ball1_mode else 'OFF'}"
+                  f" | {len(ball1_frames)} frame(s) balle")
+
+        elif action == "save":
             save(shot_dir, all_frames, selections, meta,
                  ball_rest_kf, ball1_frames, ball1_pos, sel_ball1)
             dirty = False
@@ -552,31 +645,46 @@ def main():
             else:
                 print("[picker] Dernier shot, tous sauvegardés.")
 
-        elif key == ord('e'):                             # Exporter pour entraînement
+        elif action == "export":
             export_for_training(shot_dir, all_frames, selections, meta)
 
-        elif key in (ord('8'), ord('b')):                 # 8 / B : mode balle
-            cb_state["ball1_mode"] = not cb_state["ball1_mode"]
-            print(f"[picker] Mode balle : {'ON' if cb_state['ball1_mode'] else 'OFF'}"
-                  f" | {len(ball1_frames)} frame(s) balle")
+        elif action == "quit":
+            break
 
-        elif key in range(ord('1'), ord('1') + N_COLS):   # 1-7 : colonne putter
-            cb_state["active_col"] = key - ord('1')
-            cb_state["ball1_mode"] = False
+        # ── Raccourcis clavier (conservés en complément) ──────────────────────
+        key = cv2.waitKey(40) & 0xFF
 
-        elif key in (ord('p'), ord('['), 44):             # P / [ : shot précédent
-            if shot_idx > 0:
-                switch_shot(shot_idx - 1)
-            else:
-                print("[picker] Premier shot.")
+        if key in (ord('q'), 27):
+            break
 
-        elif key in (ord('n'), ord(']'), 46):             # N / ] : shot suivant
+        elif key == ord('s'):
+            save(shot_dir, all_frames, selections, meta,
+                 ball_rest_kf, ball1_frames, ball1_pos, sel_ball1)
+            dirty = False
             if shot_idx < n_shots - 1:
                 switch_shot(shot_idx + 1)
             else:
-                print("[picker] Dernier shot.")
+                print("[picker] Dernier shot, tous sauvegardés.")
 
-        elif key in (81, ord(','), ord('a')):             # ← : frame précédente
+        elif key == ord('e'):
+            export_for_training(shot_dir, all_frames, selections, meta)
+
+        elif key in (ord('8'), ord('b')):
+            cb_state["ball1_mode"] = not cb_state["ball1_mode"]
+
+        elif key in range(ord('1'), ord('1') + N_COLS):
+            cb_state["active_col"] = key - ord('1')
+            cb_state["ball1_mode"] = False
+
+        elif key in (ord('p'), ord('['), 44):
+            if shot_idx > 0:
+                switch_shot(shot_idx - 1)
+
+        elif key in (ord('n'), ord(']'), 46):
+            if shot_idx < n_shots - 1:
+                switch_shot(shot_idx + 1)
+
+        elif key in (81, ord(','), ord('a')):
             if ball1_mode and ball1_frames:
                 sel_ball1 = max(0, sel_ball1 - 1)
                 dirty = True
@@ -584,7 +692,7 @@ def main():
                 selections[active_col] = max(0, selections[active_col] - 1)
                 dirty = True
 
-        elif key in (83, ord('.'), ord('d')):             # → : frame suivante
+        elif key in (83, ord('.'), ord('d')):
             if ball1_mode and ball1_frames:
                 sel_ball1 = min(len(ball1_frames) - 1, sel_ball1 + 1)
                 dirty = True
@@ -595,7 +703,7 @@ def main():
 
     cv2.destroyAllWindows()
     if dirty:
-        print("[picker] Modifications non sauvegardées (appuie sur S avant de quitter).")
+        print("[picker] Modifications non sauvegardées.")
 
 
 if __name__ == "__main__":
