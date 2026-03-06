@@ -220,6 +220,9 @@ class PutterLive:
         self._rec_bg_live:   Optional[np.ndarray] = None
         self._ball_roi_ref:  Optional[np.ndarray] = None
         self._ball_moved:    bool = False
+        self._half_buf: deque    = deque(maxlen=6)  # ring buffer for impact timing
+        self._shot_count: int    = 0
+        self._ball_init_pos: Optional[tuple] = None   # ball centre before stroke
         self._setup_which    = "putter"                 # 'putter' ou 'ball'
         self._yolo_tick      = 0
         self._yolo_ready_box: Optional[tuple] = None   # (x1,y1,x2,y2) dernière détection YOLO
@@ -961,11 +964,18 @@ class PutterLive:
             result.append((cx, cy, w, h, 0.0))
         return result
 
-    def _draw_strobe_composite(self) -> np.ndarray:
-        N_COLS  = 7
-        HEADER  = 40   # orange header bar height
+    def _draw_strobe_composite(self) -> np.ndarray:  # noqa: C901
+        N_COLS = 7
+        HDR_H  = 38   # dark header height (matches reference image)
+        # BGR colour palette (reference = dark bg, gold text, red arc, cyan ball)
+        GOLD  = (0,  180, 220)    # amber-gold
+        WHITE = (240, 240, 240)
+        RED   = (30,   30, 220)   # pure red in BGR
+        CYAN  = (220, 200,  30)   # cyan-ish in BGR
+
         out = np.zeros((self.H + PANEL_H, self.W, 3), dtype=np.uint8)
 
+        # ── 1. Strobe mosaic ──────────────────────────────────────────────
         src_cols = self._kf_col_frames
         if not any(f is not None for f in src_cols):
             frames = self._rep_frames
@@ -980,48 +990,45 @@ class PutterLive:
         if ref_frame is None:
             return out
 
-        sf_h = ref_frame.shape[0]
-        sf_w = ref_frame.shape[1]
-        col_w = sf_w // N_COLS
-
-        frames    = self._rep_frames
-        composite = frames[0].copy() if frames else np.zeros((sf_h, sf_w, 3), dtype=np.uint8)
+        sf_h, sf_w = ref_frame.shape[:2]
+        col_w_src  = sf_w // N_COLS
+        frames     = self._rep_frames
+        composite  = (frames[0].copy() if frames
+                      else np.zeros((sf_h, sf_w, 3), dtype=np.uint8))
 
         for i, kf in enumerate(src_cols[:N_COLS]):
             if kf is None:
                 continue
-            x0 = i * col_w
-            x1 = sf_w if i == N_COLS - 1 else x0 + col_w
+            x0 = i * col_w_src
+            x1 = sf_w if i == N_COLS - 1 else x0 + col_w_src
             composite[:, x0:x1] = kf[:, x0:x1]
 
-        # Fill full output (video + panel area) with scaled composite
-        out[:] = cv2.resize(composite, (self.W, self.H + PANEL_H))
-        # Darken panel zone slightly
-        out[self.H:] = (out[self.H:].astype(np.int32) * 60 // 100).astype(np.uint8)
+        out[:self.H] = cv2.resize(composite, (self.W, self.H))
+        out[self.H:] = (out[self.H:].astype(np.int32) * 55 // 100).astype(np.uint8)
 
-        vid_h = self.H
-
-        # YOLO detection boxes
+        # ── 2. YOLO: one putter-head detection per column ─────────────────
         if self._strobe_det is None:
             self._strobe_det = self._run_yolo_strobe()
 
-        scale_x = self.W  / sf_w
-        scale_y = vid_h   / sf_h
+        scale_x    = self.W  / sf_w
+        scale_y    = self.H  / sf_h
+        col_w_disp = self.W  // N_COLS
         centers_disp: list = [None] * N_COLS
 
         for i, box in enumerate(self._strobe_det):
             if box is None:
                 continue
-            cx, cy, w, h, angle_deg = box
-            dcx = int(cx * scale_x);  dcy = int(cy * scale_y)
-            dw  = w * scale_x;        dh  = h * scale_y
+            cx, cy, bw, bh, angle_deg = box
+            dcx = int(cx * scale_x)
+            dcy = int(cy * scale_y)
+            dw  = bw * scale_x
+            dh  = bh * scale_y
             pts = cv2.boxPoints(((float(dcx), float(dcy)), (dw, dh), angle_deg))
-            self._draw_rounded_box(out, pts, (255, 255, 255), thickness=2, radius=7)
+            self._draw_rounded_box(out, pts, WHITE, thickness=2, radius=8)
             centers_disp[i] = (dcx, dcy)
 
-        # Fallback: stored positions
+        # Fallback: replay / result positions for columns with no YOLO hit
         r_fb = self.result
-        col_w_disp = self.W // N_COLS
         for i in range(N_COLS):
             if centers_disp[i] is not None:
                 continue
@@ -1031,123 +1038,138 @@ class PutterLive:
                 centers_disp[i] = self._rep_positions[fidx]
                 continue
             if r_fb and r_fb.positions:
-                x0 = i * col_w_disp
-                x1 = (i + 1) * col_w_disp if i < N_COLS - 1 else self.W
-                in_col = [p for p in r_fb.positions if x0 <= p[0] < x1]
+                cx0 = i * col_w_disp
+                cx1 = (i + 1) * col_w_disp if i < N_COLS - 1 else self.W
+                in_col = [p for p in r_fb.positions if cx0 <= p[0] < cx1]
                 if in_col:
                     centers_disp[i] = in_col[len(in_col) // 2]
 
-        # ── Arc effilé rouge ────────────────────────────────────────────────
-        def _filter_outliers(pts_list, margin=50):
-            if len(pts_list) < 4:
-                return pts_list
-            ys = np.array([p[1] for p in pts_list], float)
-            med = float(np.median(ys))
-            mad = float(np.median(np.abs(ys - med))) + 1.0
-            return [p for p in pts_list if abs(p[1] - med) < 3.5 * mad + margin]
-
-        def _spline_arc(pts_list, n_fine=400):
-            pts_s = sorted(pts_list, key=lambda p: p[0])
-            if len(pts_s) < 2:
+        # ── 3. Putter arc: thick red spline through all column centres ─────
+        def _spline_through(pts_list, n_fine=500):
+            valid = sorted([p for p in pts_list if p is not None], key=lambda p: p[0])
+            if len(valid) < 2:
                 return None
-            t_k = np.linspace(0.0, 1.0, len(pts_s))
-            xs  = np.array([p[0] for p in pts_s], float)
-            ys  = np.array([p[1] for p in pts_s], float)
-            cs_x = CubicSpline(t_k, xs)
-            cs_y = CubicSpline(t_k, ys)
+            t_k = np.linspace(0.0, 1.0, len(valid))
+            xs  = np.array([p[0] for p in valid], float)
+            ys  = np.array([p[1] for p in valid], float)
+            try:
+                cs_x = CubicSpline(t_k, xs)
+                cs_y = CubicSpline(t_k, ys)
+            except Exception:
+                return None
             t_f = np.linspace(0.0, 1.0, n_fine)
             return np.stack([cs_x(t_f), cs_y(t_f)], axis=1).astype(np.int32).reshape(-1, 1, 2)
 
-        r = self.result
-        # Source de trajectoire : result.positions > rep_positions > centers_disp
-        _traj_src = []
-        if r and len(r.positions) >= 4:
-            _traj_src = r.positions
-        elif self._rep_positions and sum(1 for p in self._rep_positions if p) >= 4:
-            _traj_src = [p for p in self._rep_positions if p is not None]
+        smooth = _spline_through(centers_disp)
+        if smooth is not None:
+            self._draw_tapered_arc(out, smooth,
+                                   shadow_color=(0, 0, 50),
+                                   main_color=RED, max_thick=7)
 
-        if len(_traj_src) >= 4:
-            step    = max(1, len(_traj_src) // 120)
-            traj_f  = _filter_outliers(_traj_src[::step])
-            smooth  = _spline_arc(traj_f, n_fine=500)
-            if smooth is not None:
-                self._draw_tapered_arc(out, smooth,
-                                       shadow_color=(0, 0, 60),
-                                       main_color=(20, 20, 230),
-                                       max_thick=8)
-        else:
-            arc_pts = _filter_outliers([pt for pt in centers_disp if pt is not None])
-            smooth  = _spline_arc(arc_pts, n_fine=300)
-            if smooth is not None:
-                self._draw_tapered_arc(out, smooth,
-                                       shadow_color=(0, 0, 60),
-                                       main_color=(20, 20, 230),
-                                       max_thick=6)
+        # ── 4. Ball trajectory (initial pos col 4 → post-impact col 1) ────
+        ball_init = self._ball_init_pos
+        if ball_init is None and self._ball_zone_rect is not None:
+            _bx, _by, _bw, _bh = self._ball_zone_rect
+            ball_init = (_bx + _bw // 2, _by + _bh // 2)
 
-        # Head markers (cyan circles)
+        if ball_init is not None:
+            bix, biy = int(ball_init[0]), int(ball_init[1])
+
+            # Post-impact position: use col-0 centre of the putter arc, or
+            # extrapolate from launch direction, or default to left edge.
+            r_res = self.result
+            if centers_disp[0] is not None:
+                tgt_x, tgt_y = centers_disp[0][0], biy
+            elif r_res and r_res.launch_dir is not None:
+                dist = bix - col_w_disp // 2
+                rad  = math.radians(r_res.launch_dir)
+                tgt_x = int(bix - abs(dist) * math.cos(rad))
+                tgt_y = int(biy + abs(dist) * math.sin(rad))
+            else:
+                tgt_x, tgt_y = col_w_disp // 2, biy
+
+            tgt_x = max(0, min(self.W - 1, tgt_x))
+            tgt_y = max(0, min(self.H - 1, tgt_y))
+
+            # Blue connecting line (ball trajectory)
+            cv2.line(out, (tgt_x, tgt_y), (bix, biy), (200, 80, 0), 2, cv2.LINE_AA)
+
+            # Large cyan circle at post-impact (col 1 area)
+            cv2.circle(out, (tgt_x, tgt_y), 22, (0, 0, 0),  -1, cv2.LINE_AA)
+            cv2.circle(out, (tgt_x, tgt_y), 20, CYAN,         2, cv2.LINE_AA)
+
+            # Smaller cyan circle at initial ball position (col 4)
+            cv2.circle(out, (bix, biy), 14, (0, 0, 0),  -1, cv2.LINE_AA)
+            cv2.circle(out, (bix, biy), 12, CYAN,         2, cv2.LINE_AA)
+
+        # ── 5. Putter-head centre markers (gold dot + white ring) ─────────
         for pt in centers_disp:
             if pt is None:
                 continue
-            cv2.circle(out, pt, 10, (0,   0,   0), -1, cv2.LINE_AA)
-            cv2.circle(out, pt,  8, (220, 200, 30), -1, cv2.LINE_AA)
-            cv2.circle(out, pt, 10, (255, 255, 255),  1, cv2.LINE_AA)
+            cv2.circle(out, pt,  9, (0,   0,   0),   -1, cv2.LINE_AA)
+            cv2.circle(out, pt,  7, (30, 160, 220),   -1, cv2.LINE_AA)
+            cv2.circle(out, pt,  9, (200, 200, 200),   1, cv2.LINE_AA)
 
-        # Impact column: red vertical line
-        imp_col = 3   # default center column
-        if r and 0 <= r.impact_idx < len(r.positions):
-            imp_x = r.positions[r.impact_idx][0]
-            imp_col = min(int(imp_x / col_w_disp), N_COLS - 1)
-        cv2.line(out, (imp_col * col_w_disp + col_w_disp // 2, 0),
-                 (imp_col * col_w_disp + col_w_disp // 2, vid_h),
-                 (0, 0, 200), 1, cv2.LINE_AA)
-
-        # Column dividers
+        # ── 6. Column dividers ─────────────────────────────────────────────
         for i in range(1, N_COLS):
-            cv2.line(out, (i * col_w_disp, 0), (i * col_w_disp, vid_h + PANEL_H),
-                     (60, 60, 60), 1)
+            cv2.line(out, (i * col_w_disp, 0),
+                     (i * col_w_disp, self.H + PANEL_H), (55, 55, 55), 1)
 
-        # Target line (horizontal, calibrated direction)
-        if centers_disp:
-            valid = [pt for pt in centers_disp if pt is not None]
-            if valid:
-                avg_y = int(np.mean([pt[1] for pt in valid]))
-                cv2.line(out, (0, avg_y), (self.W, avg_y), (200, 120, 30), 1, cv2.LINE_AA)
+        # ── 7. Impact column: red vertical line at column 4 ───────────────
+        imp_cx = 3 * col_w_disp + col_w_disp // 2
+        cv2.line(out, (imp_cx, 0), (imp_cx, self.H), (0, 0, 200), 2, cv2.LINE_AA)
 
-        # ── Orange header bar ─────────────────────────────────────────────
-        cv2.rectangle(out, (0, 0), (self.W, HEADER), (0, 100, 200), -1)   # BGR orange
-        cv2.rectangle(out, (0, 0), (self.W, HEADER), (0, 130, 255), 1)    # border
+        # ── 8. Horizontal baseline through putter-head average y ──────────
+        valid_c = [pt for pt in centers_disp if pt is not None]
+        if valid_c:
+            avg_y = int(np.mean([pt[1] for pt in valid_c]))
+            cv2.line(out, (0, avg_y), (self.W, avg_y), (100, 120, 180), 1, cv2.LINE_AA)
+
+        # ── 9. Dark header bar (reference UI style) ────────────────────────
+        cv2.rectangle(out, (0, 0), (self.W, HDR_H), (25, 40, 65), -1)
+        cv2.line(out, (0, HDR_H), (self.W, HDR_H), (0, 110, 180), 1)
 
         def _angle_str(v):
-            if v is None: return "--"
+            if v is None:
+                return "--"
             side = "R" if v > 0.05 else ("L" if v < -0.05 else "")
             return f"{side}{abs(v):.1f}°"
 
-        face_str = _angle_str(r.face_impact if r else None)
-        path_str = _angle_str(r.launch_dir  if r else None)
-        arc_str  = r.arc_class if r else "--"
-        arc_clr  = (C["green"]  if r and r.arc_class == "Straight" else
-                    C["yellow"] if r and r.arc_class == "Slight Arc" else
-                    C["orange"])
+        r_res = self.result
+        face_str = _angle_str(r_res.face_impact if r_res else None)
+        path_str = _angle_str(r_res.launch_dir  if r_res else None)
+        arc_str  = r_res.arc_class if r_res else "--"
+        arc_clr  = ((30, 200,  60) if r_res and r_res.arc_class == "Straight" else
+                    (30, 200, 200) if r_res and r_res.arc_class == "Slight Arc" else
+                    (0, 140, 255))
 
-        hdr_items = [
-            (f"Face: {face_str}", C["white"]),
-            (f"Path: {path_str}", C["white"]),
-            (arc_str, arc_clr),
-        ]
-        hx = 14
-        for txt, clr in hdr_items:
-            (tw, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-            cv2.putText(out, txt, (hx, HEADER - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
-            cv2.putText(out, txt, (hx, HEADER - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, clr, 1, cv2.LINE_AA)
-            hx += tw + 30
+        # Left: title
+        cv2.putText(out, "ANALYSE  SWING", (12, HDR_H - 11),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, GOLD, 1, cv2.LINE_AA)
 
-        # HUD hint bottom-right
+        # Centre: metrics
+        mx = 205
+        for txt, clr in [(f"Face {face_str}", WHITE),
+                         (f"Path {path_str}", WHITE),
+                         (arc_str,            arc_clr)]:
+            (tw, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+            cv2.putText(out, txt, (mx, HDR_H - 11),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(out, txt, (mx, HDR_H - 11),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, clr, 1, cv2.LINE_AA)
+            mx += tw + 22
+
+        # Right: shot counter
+        shot_str = f"#{self._shot_count:03d}"
+        (sw, _), _ = cv2.getTextSize(shot_str, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
+        cv2.putText(out, shot_str, (self.W - sw - 12, HDR_H - 11),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, GOLD, 1, cv2.LINE_AA)
+
+        # ── 10. Bottom hint ────────────────────────────────────────────────
         hint = "L: retour live   SPACE: nouveau coup   T: annoter   Q: quitter"
-        (hw, _), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
-        cv2.putText(out, hint, (self.W - hw - 10, self.H + PANEL_H - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 120, 120), 1, cv2.LINE_AA)
+        (hw, _), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.36, 1)
+        cv2.putText(out, hint, (self.W - hw - 8, self.H + PANEL_H - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (100, 100, 100), 1, cv2.LINE_AA)
 
         return out
 
@@ -1307,6 +1329,8 @@ class PutterLive:
                     self._rec_bg_live   = None
                     self._ball_roi_ref  = None
                     self._ball_moved    = False
+                    self._half_buf.clear()
+                    self._ball_init_pos = None
 
             # ── RECORDING ─────────────────────────────────────────────────
             elif self.state == AppState.RECORDING:
@@ -1363,6 +1387,14 @@ class PutterLive:
                         _brx1, _brx2 = _bw // 2 - 40, _bw // 2 + 40
                     _roi_slice = _gray_h[_bry1:_bry2, _brx1:_brx2]
                     self._ball_roi_ref = _roi_slice.astype(np.float32) if _roi_slice.size > 0 else None
+                    # Store full-res ball center for trajectory display
+                    self._ball_init_pos = (
+                        (_brx1 + _brx2) * 1,   # already half-res x; scale ×2 below
+                        (_bry1 + _bry2) * 1,
+                    )
+                    if self._ball_zone_rect is not None:
+                        _bzx, _bzy, _bzw, _bzh = self._ball_zone_rect
+                        self._ball_init_pos = (_bzx + _bzw // 2, _bzy + _bzh // 2)
                 else:
                     _diff_h = np.abs(_gray_h.astype(np.float32) - self._rec_bg_live)
                     _, _th_h = cv2.threshold(
@@ -1397,9 +1429,16 @@ class PutterLive:
                         _roi_now = _gray_h[_bry1:_bry2, _brx1:_brx2].astype(np.float32)
                         if np.mean(np.abs(_roi_now - self._ball_roi_ref)) > 15.0:
                             self._ball_moved = True
-                            self._kf_col_frames[3] = _half.copy()
+                            # Use the frame from ~3 frames ago to catch putter AT impact,
+                            # not already past the ball.
+                            early = (self._half_buf[0]
+                                     if len(self._half_buf) >= 3
+                                     else _half)
+                            self._kf_col_frames[3] = early
                             self._kf_col_offs[3]   = 0.0
 
+                # Ring buffer for impact-timing look-back
+                self._half_buf.append(_half.copy())
                 self._rep_ctr += 1
                 if self._rep_ctr % self._replay_sub == 0:
                     self._rep_frames.append(_half.copy())
@@ -1432,6 +1471,7 @@ class PutterLive:
                 self._kf_init    = False
                 self._strobe_det = None
                 self._kf_done   = False
+                self._shot_count += 1
                 self.state      = AppState.KEYFRAMES
 
             # ── REPLAY ────────────────────────────────────────────────────
@@ -1530,8 +1570,9 @@ class PutterLive:
                                  (i * col_w_d, vid_h), (80, 80, 80), 1)
                 else:
                     frame = self._draw_strobe_composite()
-
-                self._draw_hud(frame, fps, ["SPACE = new shot   T = annotate"])
+                    # composite already has its own header — skip generic HUD
+                    cv2.imshow("Putter Live", frame)
+                    continue
 
             # ── ANNOTATE ──────────────────────────────────────────────────
             elif self.state == AppState.ANNOTATE:
@@ -1653,6 +1694,8 @@ class PutterLive:
                 self._rec_bg_live    = None
                 self._ball_roi_ref   = None
                 self._ball_moved     = False
+                self._half_buf.clear()
+                self._ball_init_pos  = None
                 print("[reset]")
 
             elif key in (ord('f'), ord('F')):
