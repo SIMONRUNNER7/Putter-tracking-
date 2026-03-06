@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-train_annotated.py – Build a YOLO OBB dataset from annotations and launch training.
+train_annotated.py – Build a YOLO detect dataset from annotations and launch training.
 
 Usage:
     python3 train_annotated.py
 
 Reads annotations from ./annotation_output/labels/ + ./annotation_output/images/
 Splits 80/20 train/val, writes a YOLO dataset structure, then calls:
-    yolo obb train ...
+    yolo detect train ...
 """
 import os, shutil, random, yaml, sys, glob
 
 LBL_DIR    = os.path.join("annotation_output", "labels")
 IMG_DIR    = os.path.join("annotation_output", "images")
 DS_DIR     = "putter_dataset"
-MODEL_BASE = "yolov8n-obb.pt"   # nano OBB – fast to train
+MODEL_BASE = "yolov8n.pt"   # nano detect
 
 def build_dataset():
     pairs = []
@@ -38,6 +38,10 @@ def build_dataset():
     split = max(1, int(len(pairs) * 0.8))
     train_pairs = pairs[:split]
     val_pairs   = pairs[split:] or pairs[:1]   # at least 1 val sample
+
+    # Reconstruire proprement le dataset (supprimer l'ancien pour éviter les conflits)
+    if os.path.isdir(DS_DIR):
+        shutil.rmtree(DS_DIR)
 
     for subset, subset_pairs in [("train", train_pairs), ("val", val_pairs)]:
         img_dir = os.path.join(DS_DIR, "images", subset)
@@ -78,15 +82,15 @@ def main():
     print(f"[train] Starting training with {MODEL_BASE} ...")
     model.train(
         data    = yaml_path,
-        task    = "obb",
         epochs  = 80,
         imgsz   = 640,
         batch   = 8,
-        name    = "putter_obb",
-        project = "runs/obb",
+        name    = "putter_det",
+        project = "runs/detect",
         exist_ok= True,
+        device  = "mps",   # Apple Silicon GPU
     )
-    best = os.path.join("runs", "obb", "putter_obb", "weights", "best.pt")
+    best = os.path.join("runs", "detect", "putter_det", "weights", "best.pt")
     print(f"\n[train] Done!  Best model: {best}")
     print("[train] Update _MODEL_PATH in putter_live.py to use it.")
 
