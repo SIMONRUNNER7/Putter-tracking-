@@ -1570,9 +1570,6 @@ class PutterLive:
                                  (i * col_w_d, vid_h), (80, 80, 80), 1)
                 else:
                     frame = self._draw_strobe_composite()
-                    # composite already has its own header — skip generic HUD
-                    cv2.imshow("Putter Live", frame)
-                    continue
 
             # ── ANNOTATE ──────────────────────────────────────────────────
             elif self.state == AppState.ANNOTATE:
