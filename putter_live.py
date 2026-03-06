@@ -1313,6 +1313,9 @@ class PutterLive:
                 zone_pos_rec = self._detect_in_zone(frame)
                 track_pos = zone_pos_rec or pos   # prefer zone centroid
 
+                # Per-column live capture using background subtraction
+                _half  = cv2.resize(frame, (self.W // 2, self.H // 2))
+
                 # ── YOLO tracking toutes les 6 frames sur _half (rapide) ───
                 if self._yolo is not None and self._rep_ctr % 6 == 0:
                     try:
@@ -1337,8 +1340,6 @@ class PutterLive:
                     except Exception:
                         pass
 
-                # Per-column live capture using background subtraction
-                _half  = cv2.resize(frame, (self.W // 2, self.H // 2))
                 _gray_h = cv2.GaussianBlur(
                     cv2.cvtColor(_half, cv2.COLOR_BGR2GRAY), (21, 21), 0)
                 if self._rec_bg_live is None:
