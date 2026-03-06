@@ -204,6 +204,8 @@ class PutterLive:
         self._rec_bg_live:   Optional[np.ndarray] = None
         self._ball_roi_ref:  Optional[np.ndarray] = None
         self._ball_moved:    bool = False
+        self._ball_zone_rect: Optional[tuple] = None   # zone balle (touche B)
+        self._setup_which    = "putter"                 # 'putter' ou 'ball'
 
         # ── KEYFRAMES post-processing ─────────────────────────────────────
         self._strobe_indices: list = []
@@ -316,13 +318,17 @@ class PutterLive:
                 x1, y1 = self._zone_setup_end
                 zw, zh = abs(x1 - x0), abs(y1 - y0)
                 if zw > 20 and zh > 20:
-                    self._zone_rect = (min(x0, x1), min(y0, y1), zw, zh)
-                    # Reset MOG2 so it re-learns the background
-                    self._zone_mog2 = cv2.createBackgroundSubtractorMOG2(
-                        history=120, varThreshold=36, detectShadows=False)
-                    self._zone_pos_hist.clear()
-                    self._zone_still_since = None
-                    print(f"[zone] set to {self._zone_rect}")
+                    if self._setup_which == "ball":
+                        self._ball_zone_rect = (min(x0, x1), min(y0, y1), zw, zh)
+                        print(f"[ball_zone] set to {self._ball_zone_rect}")
+                    else:
+                        self._zone_rect = (min(x0, x1), min(y0, y1), zw, zh)
+                        # Reset MOG2 so it re-learns the background
+                        self._zone_mog2 = cv2.createBackgroundSubtractorMOG2(
+                            history=120, varThreshold=36, detectShadows=False)
+                        self._zone_pos_hist.clear()
+                        self._zone_still_since = None
+                        print(f"[zone] set to {self._zone_rect}")
                 self._zone_setup_start = None
                 self._zone_setup_end   = None
                 self.state = AppState.READY
@@ -664,9 +670,16 @@ class PutterLive:
                    (cx + w, cy + h), (cx - w, cy + h)]
         for i in range(4):
             self._draw_dashed(frame, corners[i], corners[(i + 1) % 4], C["gray"])
-        zone_hint = "Z = draw detection zone  (putter rests inside it)" \
-                    if self._zone_rect is None else \
-                    "Zone active – place putter head inside zone"
+        pz_ok = self._zone_rect is not None
+        bz_ok = self._ball_zone_rect is not None
+        if not pz_ok and not bz_ok:
+            zone_hint = "Z = zone putter   B = zone balle   (dessiner les deux)"
+        elif not pz_ok:
+            zone_hint = "Z = zone putter  [balle OK]"
+        elif not bz_ok:
+            zone_hint = "B = zone balle  [putter OK]"
+        else:
+            zone_hint = "Zones actives – putter en zone putter pour demarrer"
         tips = [
             zone_hint,
             "C = calibrate target   |   F = CSRT ROI   |   M = print markers",
@@ -696,6 +709,48 @@ class PutterLive:
         ey  = int(pos[1] - math.sin(rad) * 50)
         cv2.arrowedLine(frame, pos, (ex, ey),
                         C["cyan"], 2, cv2.LINE_AA, tipLength=0.3)
+
+    def _draw_rounded_box(self, frame, pts: np.ndarray, color, thickness=1, radius=6):
+        """Contour d'un rectangle orienté avec coins arrondis (Bézier quadratique)."""
+        fpts = pts.astype(float)
+        n = len(fpts)
+        for i in range(n):
+            p1 = fpts[i];  p2 = fpts[(i + 1) % n]
+            v = p2 - p1;   L = float(np.linalg.norm(v))
+            if L < 1:
+                continue
+            u = v / L;  r = min(radius, L / 2 - 1)
+            a = (p1 + u * r).astype(int)
+            b = (p2 - u * r).astype(int)
+            cv2.line(frame, tuple(a), tuple(b), color, thickness, cv2.LINE_AA)
+        for i in range(n):
+            pv = fpts[(i - 1) % n];  pc = fpts[i];  pn = fpts[(i + 1) % n]
+            v1 = pv - pc;  v2 = pn - pc
+            L1 = float(np.linalg.norm(v1));  L2 = float(np.linalg.norm(v2))
+            if L1 < 1 or L2 < 1:
+                continue
+            r = min(radius, L1 / 2 - 1, L2 / 2 - 1)
+            a = pc + v1 / L1 * r;  b = pc + v2 / L2 * r
+            arc = np.array(
+                [(1 - t)**2 * a + 2 * (1 - t) * t * pc + t**2 * b
+                 for t in np.linspace(0, 1, 8)],
+                dtype=np.int32,
+            )
+            cv2.polylines(frame, [arc.reshape(-1, 1, 2)], False, color, thickness, cv2.LINE_AA)
+
+    def _draw_tapered_arc(self, frame, smooth_pts, shadow_color, main_color, max_thick=7):
+        """Arc effilé : épais au centre, pointu aux deux extrémités."""
+        n = len(smooth_pts)
+        if n < 2:
+            return
+        for pass_color, pass_extra in [(shadow_color, 3), (main_color, 0)]:
+            for i in range(n - 1):
+                t = i / max(1, n - 2)
+                thick = max(1, int(round(1 + (max_thick - 1) * math.sin(t * math.pi))))
+                cv2.line(frame,
+                         tuple(smooth_pts[i][0]),
+                         tuple(smooth_pts[i + 1][0]),
+                         pass_color, thick + pass_extra, cv2.LINE_AA)
 
     def _draw_results(self, frame, r: Result):
         ph = 90
@@ -868,17 +923,16 @@ class PutterLive:
                 result.append(None)
                 continue
             preds = self._yolo.predict(kf, conf=0.01, verbose=False)
-            obb = preds[0].obb
-            if obb is None or len(obb) == 0:
+            boxes = preds[0].boxes
+            if boxes is None or len(boxes) == 0:
                 print(f"[yolo] col {i}: no detection  (img shape={kf.shape})")
                 result.append(None)
                 continue
-            confs  = obb.conf.tolist()
+            confs  = boxes.conf.tolist()
             best_i = int(max(range(len(confs)), key=lambda k: confs[k]))
-            cx, cy, w, h, r = obb.xywhr[best_i].tolist()
-            angle_deg = math.degrees(r)
-            print(f"[yolo] col {i}: detected conf={confs[best_i]:.2f}  cx={cx:.0f} cy={cy:.0f} angle={angle_deg:.1f}°")
-            result.append((cx, cy, w, h, angle_deg))
+            cx, cy, w, h = boxes.xywh[best_i].tolist()
+            print(f"[yolo] col {i}: detected conf={confs[best_i]:.2f}  cx={cx:.0f} cy={cy:.0f}")
+            result.append((cx, cy, w, h, 0.0))
         return result
 
     def _draw_strobe_composite(self) -> np.ndarray:
@@ -925,25 +979,16 @@ class PutterLive:
         scale_y = vid_h   / sf_h
         centers_disp: list = [None] * N_COLS
 
-        overlay = out.copy()
         for i, box in enumerate(self._strobe_det):
             if box is None:
                 continue
             cx, cy, w, h, angle_deg = box
             dcx = int(cx * scale_x);  dcy = int(cy * scale_y)
             dw  = w * scale_x;        dh  = h * scale_y
-            pts = cv2.boxPoints(((float(dcx), float(dcy)), (dw, dh), angle_deg)).astype(np.int32)
-            cv2.drawContours(overlay, [pts], 0, (255, 255, 255), -1)
+            pts = cv2.boxPoints(((float(dcx), float(dcy)), (dw, dh), angle_deg))
+            # Cadre arrondi sans fond – pas de remplissage blanc
+            self._draw_rounded_box(out, pts, (200, 200, 200), thickness=2, radius=7)
             centers_disp[i] = (dcx, dcy)
-        cv2.addWeighted(overlay, 0.5, out, 0.5, 0, out)
-        for i, box in enumerate(self._strobe_det):
-            if box is None:
-                continue
-            cx, cy, w, h, angle_deg = box
-            dcx = int(cx * scale_x);  dcy = int(cy * scale_y)
-            dw  = w * scale_x;        dh  = h * scale_y
-            pts = cv2.boxPoints(((float(dcx), float(dcy)), (dw, dh), angle_deg)).astype(np.int32)
-            cv2.drawContours(out, [pts], 0, (255, 255, 255), 1, cv2.LINE_AA)
 
         # Fallback: stored positions
         r_fb = self.result
@@ -963,28 +1008,46 @@ class PutterLive:
                 if in_col:
                     centers_disp[i] = in_col[len(in_col) // 2]
 
-        # Arc lissé (spline cubique) à travers les centres détectés
-        arc_pts = [pt for pt in centers_disp if pt is not None]
-        if len(arc_pts) >= 2:
-            arc_pts_s = sorted(arc_pts, key=lambda p: p[0])
-            t_knots = np.linspace(0.0, 1.0, len(arc_pts_s))
-            xs = np.array([p[0] for p in arc_pts_s], dtype=float)
-            ys = np.array([p[1] for p in arc_pts_s], dtype=float)
-            cs_x = CubicSpline(t_knots, xs)
-            cs_y = CubicSpline(t_knots, ys)
-            t_fine = np.linspace(0.0, 1.0, 300)
-            smooth = np.stack([cs_x(t_fine), cs_y(t_fine)], axis=1).astype(np.int32).reshape(-1, 1, 2)
-            cv2.polylines(out, [smooth], False, (0, 0, 0),   5, cv2.LINE_AA)
-            cv2.polylines(out, [smooth], False, (0, 0, 220), 2, cv2.LINE_AA)
+        # ── Arc effilé rouge ────────────────────────────────────────────────
+        def _filter_outliers(pts_list, margin=50):
+            if len(pts_list) < 4:
+                return pts_list
+            ys = np.array([p[1] for p in pts_list], float)
+            med = float(np.median(ys))
+            mad = float(np.median(np.abs(ys - med))) + 1.0
+            return [p for p in pts_list if abs(p[1] - med) < 3.5 * mad + margin]
 
-        # Full recorded trajectory (red arc)
+        def _spline_arc(pts_list, n_fine=400):
+            pts_s = sorted(pts_list, key=lambda p: p[0])
+            if len(pts_s) < 2:
+                return None
+            t_k = np.linspace(0.0, 1.0, len(pts_s))
+            xs  = np.array([p[0] for p in pts_s], float)
+            ys  = np.array([p[1] for p in pts_s], float)
+            cs_x = CubicSpline(t_k, xs)
+            cs_y = CubicSpline(t_k, ys)
+            t_f = np.linspace(0.0, 1.0, n_fine)
+            return np.stack([cs_x(t_f), cs_y(t_f)], axis=1).astype(np.int32).reshape(-1, 1, 2)
+
         r = self.result
-        if r and len(r.positions) >= 2:
-            step = max(1, len(r.positions) // 80)
-            traj = np.array(r.positions[::step], np.int32).reshape(-1, 1, 2)
-            cv2.polylines(out, [traj], False, ( 20,  20, 160), 7, cv2.LINE_AA)
-            cv2.polylines(out, [traj], False, ( 50,  50, 255), 4, cv2.LINE_AA)
-            cv2.polylines(out, [traj], False, (180, 180, 255), 2, cv2.LINE_AA)
+        if r and len(r.positions) >= 4:
+            step    = max(1, len(r.positions) // 120)
+            traj_r  = r.positions[::step]
+            traj_f  = _filter_outliers(traj_r)
+            smooth  = _spline_arc(traj_f, n_fine=500)
+            if smooth is not None:
+                self._draw_tapered_arc(out, smooth,
+                                       shadow_color=(0, 0, 60),
+                                       main_color=(20, 20, 230),
+                                       max_thick=8)
+        else:
+            arc_pts = _filter_outliers([pt for pt in centers_disp if pt is not None])
+            smooth  = _spline_arc(arc_pts, n_fine=300)
+            if smooth is not None:
+                self._draw_tapered_arc(out, smooth,
+                                       shadow_color=(0, 0, 60),
+                                       main_color=(20, 20, 230),
+                                       max_thick=6)
 
         # Head markers (taille réduite à 1/3)
         for pt in centers_disp:
@@ -1062,6 +1125,12 @@ class PutterLive:
                                     color=(35, 80, 35), width=1, centerline=False)
 
                 # Zone detection + auto-countdown
+                # Zone balle (verte)
+                if self._ball_zone_rect is not None:
+                    bx, by, bw, bh = self._ball_zone_rect
+                    cv2.rectangle(frame, (bx, by), (bx + bw, by + bh),
+                                  C["green"], 2, cv2.LINE_AA)
+
                 if self._zone_rect is not None:
                     zx, zy, zw, zh = self._zone_rect
                     # Draw zone rectangle (white)
@@ -1119,9 +1188,12 @@ class PutterLive:
                     cv2.rectangle(frame,
                                   self._zone_setup_start, self._zone_setup_end,
                                   C["white"], 2, cv2.LINE_AA)
-                self._put(frame,
-                          "Drag to draw detection zone around putter head rest area",
-                          (14, 55), scale=0.65, color=C["white"])
+                _setup_msg = (
+                    "Glisser pour definir la ZONE BALLE  (autour de la balle au depart)"
+                    if self._setup_which == "ball" else
+                    "Glisser pour definir la ZONE PUTTER  (autour de la tete au repos)"
+                )
+                self._put(frame, _setup_msg, (14, 55), scale=0.65, color=C["white"])
                 self._draw_hud(frame, fps)
 
             # ── COUNTDOWN ─────────────────────────────────────────────────
@@ -1130,7 +1202,11 @@ class PutterLive:
                 self._draw_target_line(frame)
                 if pos:
                     cv2.circle(frame, pos, 7, C["white"], -1)
-                # Also show zone during countdown
+                # Also show zones during countdown
+                if self._ball_zone_rect is not None:
+                    bx, by, bw, bh = self._ball_zone_rect
+                    cv2.rectangle(frame, (bx, by), (bx + bw, by + bh),
+                                  C["green"], 1)
                 if self._zone_rect is not None:
                     zx, zy, zw, zh = self._zone_rect
                     cv2.rectangle(frame, (zx, zy), (zx + zw, zy + zh),
@@ -1173,9 +1249,15 @@ class PutterLive:
                 if self._rec_bg_live is None:
                     self._rec_bg_live = _gray_h.astype(np.float32)
                     _bh, _bw = _half.shape[:2]
-                    _bry1, _bry2 = _bh // 2 - 20, _bh // 2 + 20
-                    _brx1, _brx2 = _bw // 2 - 40, _bw // 2 + 40
-                    self._ball_roi_ref = _gray_h[_bry1:_bry2, _brx1:_brx2].astype(np.float32)
+                    if self._ball_zone_rect is not None:
+                        _bzx, _bzy, _bzw, _bzh = self._ball_zone_rect
+                        _bry1 = max(0, _bzy // 2);  _bry2 = min(_bh, (_bzy + _bzh) // 2)
+                        _brx1 = max(0, _bzx // 2);  _brx2 = min(_bw, (_bzx + _bzw) // 2)
+                    else:
+                        _bry1, _bry2 = _bh // 2 - 20, _bh // 2 + 20
+                        _brx1, _brx2 = _bw // 2 - 40, _bw // 2 + 40
+                    _roi_slice = _gray_h[_bry1:_bry2, _brx1:_brx2]
+                    self._ball_roi_ref = _roi_slice.astype(np.float32) if _roi_slice.size > 0 else None
                 else:
                     _diff_h = np.abs(_gray_h.astype(np.float32) - self._rec_bg_live)
                     _, _th_h = cv2.threshold(
@@ -1200,8 +1282,13 @@ class PutterLive:
                             and any(f is not None for f in self._kf_col_frames)
                             and self._ball_roi_ref is not None):
                         _bh2, _bw2 = _half.shape[:2]
-                        _bry1, _bry2 = _bh2 // 2 - 20, _bh2 // 2 + 20
-                        _brx1, _brx2 = _bw2 // 2 - 40, _bw2 // 2 + 40
+                        if self._ball_zone_rect is not None:
+                            _bzx, _bzy, _bzw, _bzh = self._ball_zone_rect
+                            _bry1 = max(0, _bzy // 2);  _bry2 = min(_bh2, (_bzy + _bzh) // 2)
+                            _brx1 = max(0, _bzx // 2);  _brx2 = min(_bw2, (_bzx + _bzw) // 2)
+                        else:
+                            _bry1, _bry2 = _bh2 // 2 - 20, _bh2 // 2 + 20
+                            _brx1, _brx2 = _bw2 // 2 - 40, _bw2 // 2 + 40
                         _roi_now = _gray_h[_bry1:_bry2, _brx1:_brx2].astype(np.float32)
                         if np.mean(np.abs(_roi_now - self._ball_roi_ref)) > 15.0:
                             self._ball_moved = True
@@ -1404,8 +1491,15 @@ class PutterLive:
 
             elif key in (ord('z'), ord('Z')):
                 if self.state == AppState.READY:
+                    self._setup_which = "putter"
                     self.state = AppState.ZONE_SETUP
-                    print("[zone] Drag to draw detection zone.")
+                    print("[zone] Drag to draw putter detection zone.")
+
+            elif key in (ord('b'), ord('B')):
+                if self.state == AppState.READY:
+                    self._setup_which = "ball"
+                    self.state = AppState.ZONE_SETUP
+                    print("[ball_zone] Drag to draw ball zone.")
 
             elif key in (ord('t'), ord('T')):
                 if self.state == AppState.KEYFRAMES:
