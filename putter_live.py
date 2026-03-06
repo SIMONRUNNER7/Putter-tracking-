@@ -60,15 +60,15 @@ ARC_STRAIGHT_PX    = 12    # max deviation → "Straight"
 ARC_SLIGHT_PX      = 35    # max deviation → "Slight Arc" (else "Strong Arc")
 
 STILL_THRESHOLD_PX = 20    # px – max spread of positions to be "still"
-STILL_SECS         = 1.5   # s  – durée de présence avant auto-countdown
+STILL_SECS         = 1.5
 ZONE_MIN_AREA      = 50    # px² – min contour area in zone to count as object
 
 # ── Zones par défaut (caméra overhead 1280×720, ajustables avec Z/B) ──────────
 # Exprimées en fraction du frame (x, y, w, h) pour s'adapter à toute résolution
-PUTTER_ZONE_REL = (0.45, 0.38, 0.14, 0.27)   # tête de putter au repos (zone blanche)
-BALL_ZONE_REL   = (0.30, 0.40, 0.12, 0.23)   # balle à l'adresse      (zone verte)
-BALL_BRIGHT_THR = 190    # seuil luminosité pour détecter la balle blanche
-BALL_MIN_PX     = 60     # nombre minimum de pixels brillants = balle présente
+PUTTER_ZONE_REL = (0.46, 0.37, 0.14, 0.27)   # tête de putter au repos (zone blanche)
+BALL_ZONE_REL   = (0.32, 0.37, 0.13, 0.27)   # balle – collée à gauche de la zone putter
+BALL_BRIGHT_THR = 185
+BALL_MIN_PX     = 50
 
 ANN_DIR            = "annotations"  # directory for YOLO OBB training data
 
@@ -954,8 +954,7 @@ class PutterLive:
 
     def _draw_strobe_composite(self) -> np.ndarray:
         N_COLS  = 7
-        vid_h   = self.H
-        panel_h = PANEL_H
+        HEADER  = 40   # orange header bar height
         out = np.zeros((self.H + PANEL_H, self.W, 3), dtype=np.uint8)
 
         src_cols = self._kf_col_frames
@@ -972,8 +971,8 @@ class PutterLive:
         if ref_frame is None:
             return out
 
-        sf_w  = ref_frame.shape[1]
-        sf_h  = ref_frame.shape[0]
+        sf_h = ref_frame.shape[0]
+        sf_w = ref_frame.shape[1]
         col_w = sf_w // N_COLS
 
         frames    = self._rep_frames
@@ -986,7 +985,12 @@ class PutterLive:
             x1 = sf_w if i == N_COLS - 1 else x0 + col_w
             composite[:, x0:x1] = kf[:, x0:x1]
 
-        out[:vid_h] = cv2.resize(composite, (self.W, vid_h))
+        # Fill full output (video + panel area) with scaled composite
+        out[:] = cv2.resize(composite, (self.W, self.H + PANEL_H))
+        # Darken panel zone slightly
+        out[self.H:] = (out[self.H:].astype(np.int32) * 60 // 100).astype(np.uint8)
+
+        vid_h = self.H
 
         # YOLO detection boxes
         if self._strobe_det is None:
@@ -1003,7 +1007,6 @@ class PutterLive:
             dcx = int(cx * scale_x);  dcy = int(cy * scale_y)
             dw  = w * scale_x;        dh  = h * scale_y
             pts = cv2.boxPoints(((float(dcx), float(dcy)), (dw, dh), angle_deg))
-            # Cadre blanc arrondi sans fond
             self._draw_rounded_box(out, pts, (255, 255, 255), thickness=2, radius=7)
             centers_disp[i] = (dcx, dcy)
 
@@ -1072,21 +1075,39 @@ class PutterLive:
                                        main_color=(20, 20, 230),
                                        max_thick=6)
 
-        # Head markers (taille réduite à 1/3)
+        # Head markers (cyan circles)
         for pt in centers_disp:
             if pt is None:
                 continue
-            cv2.circle(out, pt,  5, (  0,   0,   0), -1, cv2.LINE_AA)
-            cv2.circle(out, pt,  4, ( 50,  50, 255), -1, cv2.LINE_AA)
-            cv2.circle(out, pt,  5, (255, 255, 255),  1, cv2.LINE_AA)
+            cv2.circle(out, pt, 10, (0,   0,   0), -1, cv2.LINE_AA)
+            cv2.circle(out, pt,  8, (220, 200, 30), -1, cv2.LINE_AA)
+            cv2.circle(out, pt, 10, (255, 255, 255),  1, cv2.LINE_AA)
+
+        # Impact column: red vertical line
+        imp_col = 3   # default center column
+        if r and 0 <= r.impact_idx < len(r.positions):
+            imp_x = r.positions[r.impact_idx][0]
+            imp_col = min(int(imp_x / col_w_disp), N_COLS - 1)
+        cv2.line(out, (imp_col * col_w_disp + col_w_disp // 2, 0),
+                 (imp_col * col_w_disp + col_w_disp // 2, vid_h),
+                 (0, 0, 200), 1, cv2.LINE_AA)
 
         # Column dividers
         for i in range(1, N_COLS):
-            cv2.line(out, (i * col_w_disp, 0), (i * col_w_disp, vid_h),
+            cv2.line(out, (i * col_w_disp, 0), (i * col_w_disp, vid_h + PANEL_H),
                      (60, 60, 60), 1)
-        cv2.line(out, (0, vid_h), (self.W, vid_h), (60, 60, 60), 1)
 
-        # Metrics panel
+        # Target line (horizontal, calibrated direction)
+        if centers_disp:
+            valid = [pt for pt in centers_disp if pt is not None]
+            if valid:
+                avg_y = int(np.mean([pt[1] for pt in valid]))
+                cv2.line(out, (0, avg_y), (self.W, avg_y), (200, 120, 30), 1, cv2.LINE_AA)
+
+        # ── Orange header bar ─────────────────────────────────────────────
+        cv2.rectangle(out, (0, 0), (self.W, HEADER), (0, 100, 200), -1)   # BGR orange
+        cv2.rectangle(out, (0, 0), (self.W, HEADER), (0, 130, 255), 1)    # border
+
         def _angle_str(v):
             if v is None: return "--"
             side = "R" if v > 0.05 else ("L" if v < -0.05 else "")
@@ -1094,20 +1115,30 @@ class PutterLive:
 
         face_str = _angle_str(r.face_impact if r else None)
         path_str = _angle_str(r.launch_dir  if r else None)
-        col_l = self.W // 4
-        col_rr = 3 * self.W // 4
-        lbl_y = vid_h + int(panel_h * 0.30)
-        val_y = vid_h + int(panel_h * 0.80)
+        arc_str  = r.arc_class if r else "--"
+        arc_clr  = (C["green"]  if r and r.arc_class == "Straight" else
+                    C["yellow"] if r and r.arc_class == "Slight Arc" else
+                    C["orange"])
 
-        for label, value, cx in [("Face Angle", face_str, col_l),
-                                   ("Launch Direction", path_str, col_rr)]:
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 1)
-            cv2.putText(out, label, (cx - tw // 2, lbl_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (160, 160, 160), 1, cv2.LINE_AA)
-            sc, tk = 2.8, 4
-            (vw, vh), _ = cv2.getTextSize(value, cv2.FONT_HERSHEY_SIMPLEX, sc, tk)
-            cv2.putText(out, value, (cx - vw // 2, val_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, sc, (255, 255, 255), tk, cv2.LINE_AA)
+        hdr_items = [
+            (f"Face: {face_str}", C["white"]),
+            (f"Path: {path_str}", C["white"]),
+            (arc_str, arc_clr),
+        ]
+        hx = 14
+        for txt, clr in hdr_items:
+            (tw, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+            cv2.putText(out, txt, (hx, HEADER - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(out, txt, (hx, HEADER - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, clr, 1, cv2.LINE_AA)
+            hx += tw + 30
+
+        # HUD hint bottom-right
+        hint = "SPACE: new shot   T: annotate   Q: quit"
+        (hw, _), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+        cv2.putText(out, hint, (self.W - hw - 10, self.H + PANEL_H - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 120, 120), 1, cv2.LINE_AA)
 
         return out
 
@@ -1166,16 +1197,19 @@ class PutterLive:
                     except Exception:
                         self._yolo_ready_box = None
 
-                # ── Dessiner zone putter (blanc) + détection ────────────────
+                # ── Dessiner zone putter (blanc) + détection par luminosité ─
                 putter_in_zone = False
                 if self._zone_rect is not None:
                     zx, zy, zw, zh = self._zone_rect
+                    _proi = frame[zy:zy + zh, zx:zx + zw]
+                    if _proi.size > 0:
+                        _pg = cv2.cvtColor(_proi, cv2.COLOR_BGR2GRAY)
+                        putter_in_zone = int(np.sum(_pg > BALL_BRIGHT_THR)) > BALL_MIN_PX * 4
+                    p_clr = C["white"] if putter_in_zone else (120, 120, 120)
                     cv2.rectangle(frame, (zx, zy), (zx + zw, zy + zh),
-                                  C["white"], 2, cv2.LINE_AA)
+                                  p_clr, 2, cv2.LINE_AA)
                     if self._yolo_ready_box is not None:
                         _px1, _py1, _px2, _py2 = self._yolo_ready_box
-                        _pcx, _pcy = (_px1 + _px2) // 2, (_py1 + _py2) // 2
-                        putter_in_zone = (zx <= _pcx <= zx + zw and zy <= _pcy <= zy + zh)
                         cv2.rectangle(frame, (_px1, _py1), (_px2, _py2),
                                       C["cyan"], 2, cv2.LINE_AA)
                         self._track_mode = "yolo"
