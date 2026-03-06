@@ -1130,15 +1130,17 @@ class PutterLive:
                 self._yolo_tick += 1
                 yolo_pos = None
                 if self._yolo is not None and self._yolo_tick % 4 == 0:
-                    _preds = self._yolo.predict(frame, conf=0.25, verbose=False,
-                                                device='mps')
-                    _boxes = _preds[0].boxes
-                    if _boxes is not None and len(_boxes) > 0:
-                        _confs  = _boxes.conf.tolist()
-                        _best   = int(max(range(len(_confs)), key=lambda k: _confs[k]))
-                        _x1, _y1, _x2, _y2 = [int(v) for v in _boxes.xyxy[_best].tolist()]
-                        self._yolo_ready_box = (_x1, _y1, _x2, _y2)
-                    else:
+                    try:
+                        _preds = self._yolo.predict(frame, conf=0.15, verbose=False)
+                        _boxes = _preds[0].boxes
+                        if _boxes is not None and len(_boxes) > 0:
+                            _confs  = _boxes.conf.tolist()
+                            _best   = int(max(range(len(_confs)), key=lambda k: _confs[k]))
+                            _x1, _y1, _x2, _y2 = [int(v) for v in _boxes.xyxy[_best].tolist()]
+                            self._yolo_ready_box = (_x1, _y1, _x2, _y2)
+                        else:
+                            self._yolo_ready_box = None
+                    except Exception:
                         self._yolo_ready_box = None
 
                 if self._yolo_ready_box is not None:
@@ -1264,7 +1266,7 @@ class PutterLive:
             elif self.state == AppState.RECORDING:
                 rem = RECORD_SECS - (now - self._rec_start)
 
-                # Record tracked position
+                # Record tracked position (ArUco / CSRT)
                 if pos is not None:
                     self.records.append(FrameRec(
                         ts=now, pos=pos, angle=angle or 0.0, vel=vel
@@ -1273,6 +1275,31 @@ class PutterLive:
                 # Zone-position also feeds column capture
                 zone_pos_rec = self._detect_in_zone(frame)
                 track_pos = zone_pos_rec or pos   # prefer zone centroid
+
+                # ── YOLO tracking en live (toutes les 3 frames) ────────────
+                # Remplace/complète ArUco+CSRT pour le tracking et la colonne
+                if self._yolo is not None and self._rep_ctr % 3 == 0:
+                    try:
+                        _pr = self._yolo.predict(frame, conf=0.15, verbose=False)
+                        _br = _pr[0].boxes
+                        if _br is not None and len(_br) > 0:
+                            _ci = int(max(range(len(_br.conf.tolist())),
+                                         key=lambda k: _br.conf.tolist()[k]))
+                            _ycx = int(_br.xywh[_ci][0])
+                            _ycy = int(_br.xywh[_ci][1])
+                            _yolo_rp = (_ycx, _ycy)
+                            track_pos = _yolo_rp   # meilleure position pour la colonne
+                            if pos is None:        # Ajouter aux records si pas d'ArUco/CSRT
+                                _rv = (
+                                    math.hypot(_ycx - self.records[-1].pos[0],
+                                               _ycy - self.records[-1].pos[1])
+                                    / max(1e-6, now - self.records[-1].ts)
+                                    if self.records else 0.0
+                                )
+                                self.records.append(
+                                    FrameRec(ts=now, pos=_yolo_rp, angle=0.0, vel=_rv))
+                    except Exception:
+                        pass
 
                 # Per-column live capture using background subtraction
                 _half  = cv2.resize(frame, (self.W // 2, self.H // 2))
