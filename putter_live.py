@@ -215,8 +215,9 @@ class PutterLive:
         self._zone_setup_end:   Optional[tuple] = None
 
         # ── Live keyframe capture per column ─────────────────────────────
-        self._kf_col_frames: list = [None] * 7
-        self._kf_col_offs:   list = [float('inf')] * 7
+        self._kf_col_frames: list   = [None] * 7
+        self._kf_col_offs:   list   = [float('inf')] * 7
+        self._kf_col_centers: list  = [None] * 7   # (cx,cy) in _half px, motion centroid
         self._rec_bg_live:   Optional[np.ndarray] = None
         self._ball_roi_ref:  Optional[np.ndarray] = None
         self._ball_moved:    bool = False
@@ -943,12 +944,20 @@ class PutterLive:
                 result.append(None)
                 continue
             kf_h, kf_w = kf.shape[:2]
-            col_w  = kf_w // N_COLS
-            col_x0 = i * col_w
-            col_x1 = kf_w if i == N_COLS - 1 else (i + 1) * col_w
 
-            # Run on the full frame — narrow crops distort aspect ratio → YOLO fails
-            preds = self._yolo.predict(kf, conf=0.05, verbose=False)
+            # Expected position: use stored motion centroid if available,
+            # otherwise fall back to geometric column centre.
+            known = (self._kf_col_centers[i]
+                     if i < len(self._kf_col_centers) else None)
+            if known is not None:
+                expected_cx, expected_cy = float(known[0]), float(known[1])
+            else:
+                col_w  = kf_w // N_COLS
+                expected_cx = (i + 0.5) * col_w
+                expected_cy = kf_h / 2.0
+
+            # Run YOLO on the full frame (no crop — narrow crops break detection)
+            preds = self._yolo.predict(kf, conf=0.03, verbose=False)
             boxes = preds[0].boxes
             if boxes is None or len(boxes) == 0:
                 print(f"[yolo] col {i}: no detection")
@@ -958,20 +967,10 @@ class PutterLive:
             xywh  = boxes.xywh.tolist()
             confs = boxes.conf.tolist()
 
-            # Keep only detections whose centre falls in this column's x-range
-            in_col = [(confs[j], j) for j, b in enumerate(xywh)
-                      if col_x0 <= b[0] < col_x1]
-
-            if not in_col:
-                # Fallback: detection nearest to the column centre
-                col_cx = (col_x0 + col_x1) / 2.0
-                in_col = sorted(range(len(xywh)),
-                                key=lambda j: abs(xywh[j][0] - col_cx))
-                best_j = in_col[0]
-            else:
-                in_col.sort(reverse=True)   # highest confidence first
-                best_j = in_col[0][1]
-
+            # Pick detection whose centre is nearest to the expected position
+            best_j = min(range(len(xywh)),
+                         key=lambda j: math.hypot(xywh[j][0] - expected_cx,
+                                                   xywh[j][1] - expected_cy))
             cx, cy, w, h = xywh[best_j][:4]
             print(f"[yolo] col {i}: cx={cx:.0f} cy={cy:.0f} conf={confs[best_j]:.2f}")
             result.append((cx, cy, w, h, 0.0))
@@ -1040,16 +1039,24 @@ class PutterLive:
             self._draw_rounded_box(out, pts, WHITE, thickness=2, radius=8)
             centers_disp[i] = (dcx, dcy)
 
-        # Fallback: replay / result positions for columns with no YOLO hit
+        # Fallback priority: motion centroid → replay positions → result positions
         r_fb = self.result
         for i in range(N_COLS):
             if centers_disp[i] is not None:
                 continue
+            # 1. Motion centroid stored during RECORDING (most reliable)
+            kc = self._kf_col_centers[i] if i < len(self._kf_col_centers) else None
+            if kc is not None:
+                # kc is in _half space → scale to display
+                centers_disp[i] = (int(kc[0] * scale_x), int(kc[1] * scale_y))
+                continue
+            # 2. Stored replay position at the keyframe index
             fidx = self._strobe_indices[i] if i < len(self._strobe_indices) else None
             if (fidx is not None and fidx < len(self._rep_positions)
                     and self._rep_positions[fidx] is not None):
                 centers_disp[i] = self._rep_positions[fidx]
                 continue
+            # 3. Result positions filtered by column x-range
             if r_fb and r_fb.positions:
                 cx0 = i * col_w_disp
                 cx1 = (i + 1) * col_w_disp if i < N_COLS - 1 else self.W
@@ -1325,13 +1332,14 @@ class PutterLive:
                     self._rep_ctr       = 0
                     self._pos_buf.clear()
                     self._ang_buf.clear()
-                    self._kf_col_frames = [None] * 7
-                    self._kf_col_offs   = [float('inf')] * 7
-                    self._rec_bg_live   = None
-                    self._ball_roi_ref  = None
-                    self._ball_moved    = False
+                    self._kf_col_frames   = [None] * 7
+                    self._kf_col_offs     = [float('inf')] * 7
+                    self._kf_col_centers  = [None] * 7
+                    self._rec_bg_live     = None
+                    self._ball_roi_ref    = None
+                    self._ball_moved      = False
                     self._half_buf.clear()
-                    self._ball_init_pos = None
+                    self._ball_init_pos   = None
 
             # ── RECORDING ─────────────────────────────────────────────────
             elif self.state == AppState.RECORDING:
@@ -1409,12 +1417,14 @@ class PutterLive:
                             _M_h = cv2.moments(_c_h)
                             if _M_h["m00"] > 0:
                                 _cx_h   = int(_M_h["m10"] / _M_h["m00"])
+                                _cy_h   = int(_M_h["m01"] / _M_h["m00"])
                                 _col_wh = _half.shape[1] // 7
                                 _col_h  = min(_cx_h // _col_wh, 6)
                                 _off_h  = abs(_cx_h - (_col_h + 0.5) * _col_wh)
                                 if _off_h < self._kf_col_offs[_col_h]:
-                                    self._kf_col_offs[_col_h]   = _off_h
-                                    self._kf_col_frames[_col_h] = _half.copy()
+                                    self._kf_col_offs[_col_h]    = _off_h
+                                    self._kf_col_frames[_col_h]  = _half.copy()
+                                    self._kf_col_centers[_col_h] = (_cx_h, _cy_h)
                     # Ball impact detection
                     if (not self._ball_moved
                             and any(f is not None for f in self._kf_col_frames)
@@ -1435,8 +1445,15 @@ class PutterLive:
                             early = (self._half_buf[0]
                                      if len(self._half_buf) >= 3
                                      else _half)
-                            self._kf_col_frames[3] = early
-                            self._kf_col_offs[3]   = 0.0
+                            self._kf_col_frames[3]  = early
+                            self._kf_col_offs[3]    = 0.0
+                            # centroid = ball zone centre (putter is at ball)
+                            if self._ball_zone_rect is not None:
+                                _bzx, _bzy, _bzw, _bzh = self._ball_zone_rect
+                                self._kf_col_centers[3] = (
+                                    (_bzx + _bzw // 2) // 2,  # half-res
+                                    (_bzy + _bzh // 2) // 2,
+                                )
 
                 # Ring buffer for impact-timing look-back
                 self._half_buf.append(_half.copy())
@@ -1687,11 +1704,12 @@ class PutterLive:
                 self._kf_init        = False
                 self._strobe_indices = []
                 self._strobe_det     = None
-                self._kf_col_frames  = [None] * 7
-                self._kf_col_offs    = [float('inf')] * 7
-                self._rec_bg_live    = None
-                self._ball_roi_ref   = None
-                self._ball_moved     = False
+                self._kf_col_frames   = [None] * 7
+                self._kf_col_offs     = [float('inf')] * 7
+                self._kf_col_centers  = [None] * 7
+                self._rec_bg_live     = None
+                self._ball_roi_ref    = None
+                self._ball_moved      = False
                 self._half_buf.clear()
                 self._ball_init_pos  = None
                 print("[reset]")
