@@ -57,6 +57,10 @@ PUTTER_BLOB_TRIGGER  = 500  # surface diff (px halfres) déclenchant l'enreg.
 # Colonne post-impact balle (col 1, index 0)
 BALL_COLS = (0,)
 
+# Rectangle de suivi tête putter (full-res)
+HEAD_BOX_W = 90
+HEAD_BOX_H = 44
+
 # ── Palette ────────────────────────────────────────────────────────────────────
 DIM_COLOR  = (40, 40, 40)
 GRID_COLOR = (55, 55, 55)
@@ -178,7 +182,13 @@ def draw_guide_overlay(img, W, H, ball_pos_fullres=None, head_pos_fullres=None):
 
 
 # ── Composites ────────────────────────────────────────────────────────────────
-def make_strobe(kf_frames, W, H, bg_frame=None):
+def make_strobe(kf_frames, W, H, bg_frame=None, head_positions=None):
+    """
+    Composite 7 colonnes.
+    head_positions : liste de N_COLS éléments (cx, cy) en demi-résolution, ou None.
+                     Si fourni, dessine un rectangle de suivi sur chaque tête et
+                     un arc rouge passant par leurs centres.
+    """
     canvas = np.zeros((H, W, 3), dtype=np.uint8)
     col_w  = W // N_COLS
     bg_full = cv2.resize(bg_frame, (W, H)) if bg_frame is not None else None
@@ -192,6 +202,37 @@ def make_strobe(kf_frames, W, H, bg_frame=None):
     draw_column_grid(canvas, W, H)
     for i in range(N_COLS):
         put_text(canvas, str(i + 1), (i * col_w + 6, 22), scale=0.5, color=DIM_TEXT)
+
+    # ── Rectangles de suivi + arc rouge ────────────────────────────────────────
+    if head_positions:
+        sx = W / (W // 2)   # 2.0  (demi-res → full-res)
+        sy = H / (H // 2)
+        arc_pts = []
+        hw = HEAD_BOX_W // 2
+        hh = HEAD_BOX_H // 2
+        for i, pos_h in enumerate(head_positions):
+            if pos_h is None or kf_frames[i] is None:
+                continue
+            cx = int(pos_h[0] * sx)
+            cy = int(pos_h[1] * sy)
+            arc_pts.append((cx, cy))
+            # Fond semi-transparent cyan
+            ov = canvas.copy()
+            cv2.rectangle(ov, (cx - hw, cy - hh), (cx + hw, cy + hh),
+                          (0, 220, 255), -1)
+            cv2.addWeighted(ov, 0.12, canvas, 0.88, 0, canvas)
+            # Bordure cyan
+            cv2.rectangle(canvas, (cx - hw, cy - hh), (cx + hw, cy + hh),
+                          (0, 220, 255), 2, cv2.LINE_AA)
+
+        # Arc rouge passant par les centres (trié gauche→droite)
+        if len(arc_pts) >= 2:
+            arc_pts.sort(key=lambda p: p[0])
+            pts = np.array(arc_pts, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(canvas, [pts], False, (0, 0, 255), 2, cv2.LINE_AA)
+            for p in arc_pts:
+                cv2.circle(canvas, p, 4, (0, 0, 255), -1, cv2.LINE_AA)
+
     return canvas
 
 
@@ -218,27 +259,49 @@ def _paste_ball_circle(canvas, kf_halfres, pos_halfres, W, H):
 
 
 def make_training_frame(kf_frames, ball_rest, ball_col_kfs, ball_col_poss,
-                        W, H, bg_frame=None):
+                        W, H, bg_frame=None, head_positions=None):
     """
     Composite final :
-    - Strobe 7 colonnes (tête au centre de chaque col ; col 4 = impact balle+tête)
+    - Strobe 7 colonnes avec rectangles de suivi tête + arc rouge
     - Overlay cercle balle initiale en col 4 (position de repos)
     - Overlay cercle balle post-impact en col 1
+    - Flèche rouge de direction : balle col 4 → balle col 1
     """
-    canvas = make_strobe(kf_frames, W, H, bg_frame=bg_frame)
+    canvas = make_strobe(kf_frames, W, H, bg_frame=bg_frame,
+                         head_positions=head_positions)
+
+    sx = W / (W // 2)
+    sy = H / (H // 2)
 
     # Balle initiale (col 4 : position de repos avant swing)
+    ball_col4_full = None
     if ball_rest is not None:
         kf_r, pos_r = ball_rest
         _paste_ball_circle(canvas, kf_r, pos_r, W, H)
+        ball_col4_full = (int(pos_r[0] * sx), int(pos_r[1] * sy))
 
     # Balle post-impact (col 1) — seulement si le putter a atteint col 1.
-    # Si col 1 est vide (putter n'y est pas allé), on n'affiche PAS la balle
-    # seule : le fond complet de col 1 est déjà présent via make_strobe,
-    # ce qui rend le strobe homogène visuellement.
+    ball_col1_full = None
     if kf_frames[0] is not None:
-        for kf, pos in zip(ball_col_kfs or [], ball_col_poss or []):
+        for idx, (kf, pos) in enumerate(
+                zip(ball_col_kfs or [], ball_col_poss or [])):
             _paste_ball_circle(canvas, kf, pos, W, H)
+            if idx == 0 and pos is not None:
+                ball_col1_full = (int(pos[0] * sx), int(pos[1] * sy))
+
+    # ── Flèche de direction balle : col 4 (repos) → col 1 (post-impact) ───────
+    if ball_col4_full is not None and ball_col1_full is not None:
+        # Ligne pointillée rouge + flèche finale
+        p4 = ball_col4_full
+        p1 = ball_col1_full
+        # Dessiner d'abord une ombre noire pour la lisibilité
+        cv2.arrowedLine(canvas, p4, p1, (0, 0, 0),    4, cv2.LINE_AA, tipLength=0.07)
+        cv2.arrowedLine(canvas, p4, p1, (0, 0, 255),  2, cv2.LINE_AA, tipLength=0.07)
+        # Points aux extrémités
+        cv2.circle(canvas, p4, 5, (0, 0, 0),   -1, cv2.LINE_AA)
+        cv2.circle(canvas, p4, 4, (0, 200, 80), -1, cv2.LINE_AA)  # vert = départ
+        cv2.circle(canvas, p1, 5, (0, 0, 0),   -1, cv2.LINE_AA)
+        cv2.circle(canvas, p1, 4, (0, 0, 255), -1, cv2.LINE_AA)   # rouge = arrivée
 
     return canvas
 
@@ -379,6 +442,7 @@ def main():
     # Strobe : une frame par colonne (tête au centre)
     kf_frames     = [None] * N_COLS
     kf_offs       = [float('inf')] * N_COLS   # dist tête ↔ centre col
+    kf_head_pos   = [None] * N_COLS           # (cx, cy) demi-res par colonne
     kf_impact     = None
     kf_impact_off = float('inf')
 
@@ -561,6 +625,7 @@ def main():
                             rec_start     = now
                             kf_frames     = [None] * N_COLS
                             kf_offs       = [float('inf')] * N_COLS
+                            kf_head_pos   = [None] * N_COLS
                             kf_impact     = None
                             kf_impact_off = 0.0   # on MAXIMISE le diff balle
                             # Pré-peupler le buffer avec les frames ARMED récentes
@@ -604,15 +669,18 @@ def main():
             head_det = yolo_detect_head(half, yolo)
             if head_det is not None:
                 cx_h = head_det[0]
+                cy_h = head_det[1]
             else:
                 # Fallback : centroïde du plus grand blob de mouvement
                 sig_cnts = [c for c in cnts if cv2.contourArea(c) >= MOTION_AREA]
                 cx_h = None
+                cy_h = None
                 if sig_cnts:
                     best_c = max(sig_cnts, key=cv2.contourArea)
                     M = cv2.moments(best_c)
                     if M["m00"] > 0:
                         cx_h = int(M["m10"] / M["m00"])
+                        cy_h = int(M["m01"] / M["m00"])
 
             if cx_h is not None:
                 col = min(cx_h // cw_h, N_COLS - 1)
@@ -661,6 +729,10 @@ def main():
                                 buf      = list(half_buf)
                                 pick_idx = max(0, len(buf) - 1 - 2)
                                 kf_impact = buf[pick_idx].copy()
+                                # Position tête col 4 : position courante
+                                kf_head_pos[3] = (
+                                    cx_h,
+                                    cy_h if cy_h is not None else half.shape[0] // 2)
                 else:
                     # Cols 1-3 et 5-7 : meilleure frame = tête au centre de la col
                     col_center = (col + 0.5) * cw_h
@@ -669,6 +741,9 @@ def main():
                         kf_offs[col]          = off
                         kf_frames[col]        = half.copy()
                         kf_best_all_idx[col]  = len(all_rec_frames) - 1
+                        kf_head_pos[col]      = (
+                            cx_h,
+                            cy_h if cy_h is not None else half.shape[0] // 2)
 
             # ── Balle post-impact : scan luminosité en col 1 ──────────────
             # sw_done = putter en follow-through (repart vers droite) = col 1 libre
@@ -703,7 +778,8 @@ def main():
                 shot_count += 1
                 composite = make_training_frame(
                     kf_frames, ball_rest, ball_col_kfs, ball_col_poss,
-                    W, H, bg_frame=bg_frame_color)
+                    W, H, bg_frame=bg_frame_color,
+                    head_positions=kf_head_pos)
                 last_path = save_shot(
                     kf_frames, composite, shot_count,
                     ball_rest=ball_rest,
