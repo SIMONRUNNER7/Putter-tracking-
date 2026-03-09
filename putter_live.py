@@ -919,70 +919,38 @@ class PutterLive:
 
     # ── Strobe composite ──────────────────────────────────────────────────────
 
-    def _run_yolo_strobe(self) -> list:
+    def _run_yolo_strobe(self, composite: np.ndarray) -> list:
+        """Lance YOLO sur l'image composite (résolution display) et retourne
+        une détection par colonne en coordonnées display."""
         N_COLS = 7
+        result = [None] * N_COLS
         if self._yolo is None:
             print("[yolo] model is None – skipping detection")
-            return [None] * N_COLS
+            return result
 
-        src_cols = self._kf_col_frames
-        n_kf = sum(1 for f in src_cols if f is not None)
-        print(f"[yolo] _kf_col_frames non-None: {n_kf}/7")
-        if not any(f is not None for f in src_cols):
-            frames = self._rep_frames
-            if not frames:
-                print("[yolo] no replay frames either – nothing to detect")
-                return [None] * N_COLS
-            src_cols = [
-                frames[idx] if idx is not None and idx < len(frames) else None
-                for idx in (list(self._strobe_indices[:N_COLS]) + [None] * N_COLS)[:N_COLS]
-            ]
-            n_fb = sum(1 for f in src_cols if f is not None)
-            print(f"[yolo] fallback frames non-None: {n_fb}/7  strobe_indices={self._strobe_indices}")
+        h, w = composite.shape[:2]
+        col_w = w // N_COLS
 
-        result = []
-        for i, kf in enumerate(src_cols[:N_COLS]):
-            if kf is None:
-                result.append(None)
-                continue
-            kf_h, kf_w = kf.shape[:2]
-            col_w = kf_w // N_COLS
-            # Column i x range in frame coordinates
-            x0_col = i * col_w
-            x1_col = kf_w if i == N_COLS - 1 else (i + 1) * col_w
+        preds = self._yolo.predict(composite, conf=0.05, verbose=False)
+        boxes = preds[0].boxes
+        if boxes is None or len(boxes) == 0:
+            print("[yolo] composite: no detection")
+            return result
 
-            # Run YOLO on the full frame (no crop — narrow crops break detection)
-            preds = self._yolo.predict(kf, conf=0.03, verbose=False)
-            boxes = preds[0].boxes
-            if boxes is None or len(boxes) == 0:
-                print(f"[yolo] col {i}: no detection")
-                result.append(None)
-                continue
+        xywh  = boxes.xywh.tolist()
+        confs = boxes.conf.tolist()
 
-            xywh  = boxes.xywh.tolist()
-            confs = boxes.conf.tolist()
+        # Associer chaque détection à sa colonne (la plus haute conf gagne)
+        best_conf = [-1.0] * N_COLS
+        for j in range(len(xywh)):
+            cx, cy, bw, bh = xywh[j][:4]
+            conf = confs[j]
+            col = min(int(cx // col_w), N_COLS - 1)
+            if conf > best_conf[col]:
+                best_conf[col] = conf
+                result[col] = (cx, cy, bw, bh, 0.0)
+            print(f"[yolo] composite col={col} cx={cx:.0f} cy={cy:.0f} conf={conf:.2f}")
 
-            # Filter: keep detections whose centre falls within column i x range
-            in_col = [
-                (j, xywh[j], confs[j])
-                for j in range(len(xywh))
-                if x0_col <= xywh[j][0] < x1_col
-            ]
-
-            if in_col:
-                # Pick highest confidence detection in this column
-                best = max(in_col, key=lambda t: t[2])
-                cx, cy, w, h = best[1][:4]
-                print(f"[yolo] col {i}: cx={cx:.0f} cy={cy:.0f} conf={best[2]:.2f}")
-            else:
-                # Fallback: pick detection whose centre x is nearest to column centre
-                col_cx = (x0_col + x1_col) / 2.0
-                best_j = min(range(len(xywh)),
-                             key=lambda j: abs(xywh[j][0] - col_cx))
-                cx, cy, w, h = xywh[best_j][:4]
-                print(f"[yolo] col {i}: fallback nearest cx={cx:.0f} conf={confs[best_j]:.2f}")
-
-            result.append((cx, cy, w, h, 0.0))
         return result
 
     def _draw_strobe_composite(self) -> np.ndarray:  # noqa: C901
@@ -1027,65 +995,30 @@ class PutterLive:
         out[:self.H] = cv2.resize(composite, (self.W, self.H))
         out[self.H:] = (out[self.H:].astype(np.int32) * 55 // 100).astype(np.uint8)
 
-        # ── 2. YOLO: one putter-head detection per column ─────────────────
+        # ── 2. YOLO: détection de toutes les têtes sur l'image composite ─────
+        # On tourne YOLO directement sur l'image assemblée (résolution display) —
+        # toutes les têtes sont visibles d'un coup, plus de problème de frame/colonne.
         if self._strobe_det is None:
-            self._strobe_det = self._run_yolo_strobe()
+            self._strobe_det = self._run_yolo_strobe(out[:self.H].copy())
 
-        scale_x    = self.W  / sf_w
-        scale_y    = self.H  / sf_h
         col_w_disp = self.W  // N_COLS
         centers_disp: list = [None] * N_COLS
 
-        # Taille de boîte par défaut (en pixels display) si YOLO ne donne pas de dims
+        # Taille de boîte par défaut en pixels display
         _DEF_BOX_W = int(self.W / N_COLS * 0.72)
         _DEF_BOX_H = int(self.H * 0.20)
 
         for i, box in enumerate(self._strobe_det):
             if box is None:
-                # Fallback : si centre YOLO enregistré, dessiner boîte estimée
-                kc = self._kf_col_centers[i] if i < len(self._kf_col_centers) else None
-                if kc is None:
-                    continue
-                dcx = int(kc[0] * scale_x)
-                dcy = int(kc[1] * scale_y)
-                pts = cv2.boxPoints(((float(dcx), float(dcy)),
-                                     (_DEF_BOX_W, _DEF_BOX_H), 0.0))
-                self._draw_rounded_box(out, pts, (160, 160, 160), thickness=1, radius=8)
-                centers_disp[i] = (dcx, dcy)
                 continue
             cx, cy, bw, bh, angle_deg = box
-            dcx = int(cx * scale_x)
-            dcy = int(cy * scale_y)
-            dw  = max(bw * scale_x, _DEF_BOX_W * 0.5)
-            dh  = max(bh * scale_y, _DEF_BOX_H * 0.5)
+            dcx = int(cx)
+            dcy = int(cy)
+            dw  = max(float(bw), _DEF_BOX_W * 0.5)
+            dh  = max(float(bh), _DEF_BOX_H * 0.5)
             pts = cv2.boxPoints(((float(dcx), float(dcy)), (dw, dh), angle_deg))
             self._draw_rounded_box(out, pts, WHITE, thickness=2, radius=8)
             centers_disp[i] = (dcx, dcy)
-
-        # Fallback priority: motion centroid → replay positions → result positions
-        r_fb = self.result
-        for i in range(N_COLS):
-            if centers_disp[i] is not None:
-                continue
-            # 1. Motion centroid stored during RECORDING (most reliable)
-            kc = self._kf_col_centers[i] if i < len(self._kf_col_centers) else None
-            if kc is not None:
-                # kc is in _half space → scale to display
-                centers_disp[i] = (int(kc[0] * scale_x), int(kc[1] * scale_y))
-                continue
-            # 2. Stored replay position at the keyframe index
-            fidx = self._strobe_indices[i] if i < len(self._strobe_indices) else None
-            if (fidx is not None and fidx < len(self._rep_positions)
-                    and self._rep_positions[fidx] is not None):
-                centers_disp[i] = self._rep_positions[fidx]
-                continue
-            # 3. Result positions filtered by column x-range
-            if r_fb and r_fb.positions:
-                cx0 = i * col_w_disp
-                cx1 = (i + 1) * col_w_disp if i < N_COLS - 1 else self.W
-                in_col = [p for p in r_fb.positions if cx0 <= p[0] < cx1]
-                if in_col:
-                    centers_disp[i] = in_col[len(in_col) // 2]
 
         # ── 3. Putter arc: thick red spline through all column centres ─────
         def _spline_through(pts_list, n_fine=500):
@@ -1118,11 +1051,11 @@ class PutterLive:
         if ball_init is not None:
             bix, biy = int(ball_init[0]), int(ball_init[1])
 
-            # Dernière position réelle de la balle après impact (half-res → display)
+            # Dernière position réelle de la balle après impact (half-res × 2 → display)
             ball_last = self._ball_last_pos
             if ball_last is not None:
-                tgt_x = int(ball_last[0] * scale_x)
-                tgt_y = int(ball_last[1] * scale_y)
+                tgt_x = int(ball_last[0] * 2)
+                tgt_y = int(ball_last[1] * 2)
             else:
                 # Fallback : centre de la col 1 à la même hauteur que l'impact
                 tgt_x = col_w_disp // 2
@@ -1370,7 +1303,21 @@ class PutterLive:
                     self._half_buf.clear()
                     self._ball_init_pos   = None
                     self._ball_last_pos   = None
+                    # Initialiser le tracking YOLO depuis le centre de la zone putter
+                    # pour éviter de partir sur un putter du rack
                     self._last_yolo_half_pos = None
+                    if self._zone_rect is not None:
+                        _zx, _zy, _zw, _zh = self._zone_rect
+                        self._last_yolo_half_pos = (
+                            (_zx + _zw // 2) // 2,
+                            (_zy + _zh // 2) // 2,
+                        )
+                    elif self._yolo_ready_box is not None:
+                        _rx1, _ry1, _rx2, _ry2 = self._yolo_ready_box
+                        self._last_yolo_half_pos = (
+                            int((_rx1 + _rx2) / 4),
+                            int((_ry1 + _ry2) / 4),
+                        )
 
             # ── RECORDING ─────────────────────────────────────────────────
             elif self.state == AppState.RECORDING:
