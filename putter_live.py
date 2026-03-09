@@ -224,9 +224,11 @@ class PutterLive:
         self._half_buf: deque    = deque(maxlen=6)  # ring buffer for impact timing
         self._shot_count: int    = 0
         self._ball_init_pos: Optional[tuple] = None   # ball centre before stroke
+        self._ball_last_pos: Optional[tuple] = None   # ball last tracked position after impact (half-res)
         self._setup_which    = "putter"                 # 'putter' ou 'ball'
         self._yolo_tick      = 0
         self._yolo_ready_box: Optional[tuple] = None   # (x1,y1,x2,y2) dernière détection YOLO
+        self._last_yolo_half_pos: Optional[tuple] = None  # dernière position YOLO demi-res (tracking continuité)
 
         # ── KEYFRAMES post-processing ─────────────────────────────────────
         self._strobe_indices: list = []
@@ -1034,14 +1036,28 @@ class PutterLive:
         col_w_disp = self.W  // N_COLS
         centers_disp: list = [None] * N_COLS
 
+        # Taille de boîte par défaut (en pixels display) si YOLO ne donne pas de dims
+        _DEF_BOX_W = int(self.W / N_COLS * 0.72)
+        _DEF_BOX_H = int(self.H * 0.20)
+
         for i, box in enumerate(self._strobe_det):
             if box is None:
+                # Fallback : si centre YOLO enregistré, dessiner boîte estimée
+                kc = self._kf_col_centers[i] if i < len(self._kf_col_centers) else None
+                if kc is None:
+                    continue
+                dcx = int(kc[0] * scale_x)
+                dcy = int(kc[1] * scale_y)
+                pts = cv2.boxPoints(((float(dcx), float(dcy)),
+                                     (_DEF_BOX_W, _DEF_BOX_H), 0.0))
+                self._draw_rounded_box(out, pts, (160, 160, 160), thickness=1, radius=8)
+                centers_disp[i] = (dcx, dcy)
                 continue
             cx, cy, bw, bh, angle_deg = box
             dcx = int(cx * scale_x)
             dcy = int(cy * scale_y)
-            dw  = bw * scale_x
-            dh  = bh * scale_y
+            dw  = max(bw * scale_x, _DEF_BOX_W * 0.5)
+            dh  = max(bh * scale_y, _DEF_BOX_H * 0.5)
             pts = cv2.boxPoints(((float(dcx), float(dcy)), (dw, dh), angle_deg))
             self._draw_rounded_box(out, pts, WHITE, thickness=2, radius=8)
             centers_disp[i] = (dcx, dcy)
@@ -1093,7 +1109,7 @@ class PutterLive:
                                    shadow_color=(0, 0, 50),
                                    main_color=RED, max_thick=7)
 
-        # ── 4. Ball trajectory (initial pos col 4 → post-impact col 1) ────
+        # ── 4. Ball trajectory (impact col 4 → dernière pos balle col 1) ───
         ball_init = self._ball_init_pos
         if ball_init is None and self._ball_zone_rect is not None:
             _bx, _by, _bw, _bh = self._ball_zone_rect
@@ -1102,18 +1118,24 @@ class PutterLive:
         if ball_init is not None:
             bix, biy = int(ball_init[0]), int(ball_init[1])
 
-            # Post-impact position: centre of column 1 (0-indexed col 0), same y
-            tgt_x = col_w_disp // 2
-            tgt_y = biy
+            # Dernière position réelle de la balle après impact (half-res → display)
+            ball_last = self._ball_last_pos
+            if ball_last is not None:
+                tgt_x = int(ball_last[0] * scale_x)
+                tgt_y = int(ball_last[1] * scale_y)
+            else:
+                # Fallback : centre de la col 1 à la même hauteur que l'impact
+                tgt_x = col_w_disp // 2
+                tgt_y = biy
 
-            # Blue line: initial ball → post-impact (launch direction vector)
+            # Ligne cyan : position impact → dernière position balle
             cv2.line(out, (bix, biy), (tgt_x, tgt_y), (200, 80, 0), 2, cv2.LINE_AA)
 
-            # Large cyan circle at post-impact (col 1 area)
+            # Grand cercle cyan à la dernière position balle (direction de la balle)
             cv2.circle(out, (tgt_x, tgt_y), 22, (0, 0, 0),  -1, cv2.LINE_AA)
             cv2.circle(out, (tgt_x, tgt_y), 20, CYAN,         2, cv2.LINE_AA)
 
-            # Smaller cyan circle at initial ball position (col 4)
+            # Petit cercle cyan à la position d'impact (col 4)
             cv2.circle(out, (bix, biy), 14, (0, 0, 0),  -1, cv2.LINE_AA)
             cv2.circle(out, (bix, biy), 12, CYAN,         2, cv2.LINE_AA)
 
@@ -1347,6 +1369,8 @@ class PutterLive:
                     self._ball_moved      = False
                     self._half_buf.clear()
                     self._ball_init_pos   = None
+                    self._ball_last_pos   = None
+                    self._last_yolo_half_pos = None
 
             # ── RECORDING ─────────────────────────────────────────────────
             elif self.state == AppState.RECORDING:
@@ -1370,14 +1394,28 @@ class PutterLive:
                 # ── YOLO tracking toutes les 3 frames sur _half ─────────────
                 if self._yolo is not None and self._rep_ctr % 3 == 0:
                     try:
-                        _pr = self._yolo.predict(_half, conf=0.12, verbose=False)
+                        _pr = self._yolo.predict(_half, conf=0.08, verbose=False)
                         _br = _pr[0].boxes
                         if _br is not None and len(_br) > 0:
-                            _ci  = int(max(range(len(_br.conf.tolist())),
-                                          key=lambda k: _br.conf.tolist()[k]))
+                            _xywh_list = _br.xywh.tolist()
+                            _conf_list  = _br.conf.tolist()
+                            if self._last_yolo_half_pos is not None:
+                                # Continuité : prendre la détection la plus proche
+                                # de la dernière position connue (évite de sauter
+                                # sur un putter du rack après l'impact)
+                                _lx, _ly = self._last_yolo_half_pos
+                                _ci = min(range(len(_xywh_list)),
+                                          key=lambda k: math.hypot(
+                                              _xywh_list[k][0] - _lx,
+                                              _xywh_list[k][1] - _ly))
+                            else:
+                                # Première détection : plus haute confiance
+                                _ci = int(max(range(len(_conf_list)),
+                                              key=lambda k: _conf_list[k]))
                             # Coordonnées en demi-résolution
-                            _yolo_cx_h = int(_br.xywh[_ci][0])
-                            _yolo_cy_h = int(_br.xywh[_ci][1])
+                            _yolo_cx_h = int(_xywh_list[_ci][0])
+                            _yolo_cy_h = int(_xywh_list[_ci][1])
+                            self._last_yolo_half_pos = (_yolo_cx_h, _yolo_cy_h)
                             # Pleine résolution pour track_pos et records
                             _ycx = _yolo_cx_h * 2
                             _ycy = _yolo_cy_h * 2
@@ -1457,6 +1495,33 @@ class PutterLive:
                                     (_bzx + _bzw // 2) // 2,  # half-res
                                     (_bzy + _bzh // 2) // 2,
                                 )
+
+                # ── Suivi de la balle après l'impact ─────────────────────────
+                # Cherche le blob blanc (balle) dans la moitié du frame
+                # correspondant à la direction du coup (côté opposé à l'adresse)
+                if self._ball_moved:
+                    _bh2, _bw2 = _half.shape[:2]
+                    # Zone de recherche : toute la largeur, bande horizontale de la balle
+                    if self._ball_zone_rect is not None:
+                        _bzx2, _bzy2, _bzw2, _bzh2 = self._ball_zone_rect
+                        _sry1 = max(0, _bzy2 // 2 - 20)
+                        _sry2 = min(_bh2, (_bzy2 + _bzh2) // 2 + 20)
+                    else:
+                        _sry1, _sry2 = _bh2 // 2 - 30, _bh2 // 2 + 30
+                    _band = _gray_h[_sry1:_sry2, :]
+                    # Seuil luminosité élevée → balle blanche
+                    _, _ball_mask = cv2.threshold(_band, BALL_BRIGHT_THR, 255, cv2.THRESH_BINARY)
+                    _ball_cnts, _ = cv2.findContours(
+                        _ball_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if _ball_cnts:
+                        _bc = max(_ball_cnts, key=cv2.contourArea)
+                        if cv2.contourArea(_bc) >= BALL_MIN_PX:
+                            _bM = cv2.moments(_bc)
+                            if _bM["m00"] > 0:
+                                _bcx = int(_bM["m10"] / _bM["m00"])
+                                _bcy = int(_bM["m01"] / _bM["m00"]) + _sry1
+                                # Stocker en coordonnées half-res
+                                self._ball_last_pos = (_bcx, _bcy)
 
                 # Ring buffer for impact-timing look-back
                 self._half_buf.append(_half.copy())
@@ -1675,6 +1740,8 @@ class PutterLive:
                     self._ball_moved      = False
                     self._half_buf.clear()
                     self._ball_init_pos  = None
+                    self._ball_last_pos  = None
+                    self._last_yolo_half_pos = None
                     print("[reset] READY – repositionnez balle et putter, puis SPACE pour démarrer")
 
             elif key in (ord('z'), ord('Z')):
@@ -1737,6 +1804,8 @@ class PutterLive:
                 self._ball_moved      = False
                 self._half_buf.clear()
                 self._ball_init_pos  = None
+                self._ball_last_pos  = None
+                self._last_yolo_half_pos = None
                 print("[reset]")
 
             elif key in (ord('f'), ord('F')):
