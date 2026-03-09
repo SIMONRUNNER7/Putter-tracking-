@@ -1016,7 +1016,7 @@ class PutterLive:
         h, w = composite.shape[:2]
         col_w = w // N_COLS
 
-        preds = self._yolo.predict(composite, conf=0.05, verbose=False)
+        preds = self._yolo.predict(composite, conf=0.15, verbose=False)
         boxes = preds[0].boxes
         if boxes is None or len(boxes) == 0:
             print("[yolo] composite: no detection")
@@ -1025,12 +1025,17 @@ class PutterLive:
         xywh  = boxes.xywh.tolist()
         confs = boxes.conf.tolist()
 
-        # Associer chaque détection à sa colonne (la plus haute conf gagne)
+        # Associer chaque détection à sa colonne (la plus haute conf gagne).
+        # Rejeter les détections dont le centre est trop loin du centre attendu
+        # de la colonne (évite les faux positifs aux frontières).
         best_conf = [-1.0] * N_COLS
         for j in range(len(xywh)):
             cx, cy, bw, bh = xywh[j][:4]
             conf = confs[j]
             col = min(int(cx // col_w), N_COLS - 1)
+            expected_cx = (col + 0.5) * col_w
+            if abs(cx - expected_cx) > col_w * 0.65:
+                continue   # trop loin du centre de colonne → ignorer
             if conf > best_conf[col]:
                 best_conf[col] = conf
                 result[col] = (cx, cy, bw, bh, 0.0)
@@ -1118,13 +1123,55 @@ class PutterLive:
             centers_disp[i] = (dcx, dcy)
 
         # ── 3. Putter arc: thick red spline through all column centres ─────
+        def _fill_col_gaps(pts, n_cols, cw):
+            """Interpolate missing columns + reject y-outliers.
+
+            Pass 1 – fit a polynomial to valid y values and reject points
+                      that deviate more than 75 px from the trend.
+            Pass 2 – fill remaining None slots with linear y-interpolation
+                      so the arc never breaks.  The arc can only move in
+                      one direction (column order = left → right).
+            """
+            result = list(pts)
+            # Pass 1: outlier rejection via polynomial fit on column index
+            valid = [(i, p) for i, p in enumerate(result) if p is not None]
+            if len(valid) >= 3:
+                vi = np.array([i for i, _ in valid], float)
+                vy = np.array([p[1] for _, p in valid], float)
+                degree = min(2, len(valid) - 1)
+                coeffs = np.polyfit(vi, vy, degree)
+                for i, p in list(valid):
+                    if abs(p[1] - np.polyval(coeffs, i)) > 75:
+                        result[i] = None   # outlier – drop it
+            # Pass 2: gap fill by linear interpolation in column order
+            valid_idx = [i for i, p in enumerate(result) if p is not None]
+            if len(valid_idx) < 2:
+                return result
+            first, last = valid_idx[0], valid_idx[-1]
+            for i in range(first, last + 1):
+                if result[i] is not None:
+                    continue
+                prev_i = max(j for j in valid_idx if j < i)
+                next_i = min(j for j in valid_idx if j > i)
+                t = (i - prev_i) / (next_i - prev_i)
+                _, py = result[prev_i]
+                _, ny = result[next_i]
+                expected_x = int((i + 0.5) * cw)   # column centre x
+                result[i] = (expected_x, int(py + t * (ny - py)))
+            return result
+
         def _spline_through(pts_list, n_fine=500):
-            valid = sorted([p for p in pts_list if p is not None], key=lambda p: p[0])
+            """Cubic spline in column order (enforces single left→right direction)."""
+            valid = [(i, p) for i, p in enumerate(pts_list) if p is not None]
             if len(valid) < 2:
                 return None
             t_k = np.linspace(0.0, 1.0, len(valid))
-            xs  = np.array([p[0] for p in valid], float)
-            ys  = np.array([p[1] for p in valid], float)
+            xs = np.array([p[0] for _, p in valid], float)
+            ys = np.array([p[1] for _, p in valid], float)
+            # Enforce strictly increasing x so the arc never reverses direction
+            for j in range(1, len(xs)):
+                if xs[j] <= xs[j - 1]:
+                    xs[j] = xs[j - 1] + 1.0
             try:
                 cs_x = CubicSpline(t_k, xs)
                 cs_y = CubicSpline(t_k, ys)
@@ -1133,7 +1180,8 @@ class PutterLive:
             t_f = np.linspace(0.0, 1.0, n_fine)
             return np.stack([cs_x(t_f), cs_y(t_f)], axis=1).astype(np.int32).reshape(-1, 1, 2)
 
-        smooth = _spline_through(centers_disp)
+        centers_filled = _fill_col_gaps(centers_disp, N_COLS, col_w_disp)
+        smooth = _spline_through(centers_filled)
         if smooth is not None:
             self._draw_tapered_arc(out, smooth,
                                    shadow_color=(0, 0, 50),
@@ -1170,12 +1218,23 @@ class PutterLive:
             cv2.circle(out, (bix, biy), 12, CYAN,         2, cv2.LINE_AA)
 
         # ── 5. Putter-head centre markers (gold dot + white ring) ─────────
-        for pt in centers_disp:
+        # Draw actual detections (solid); interpolated/filtered positions
+        # (from centers_filled) are shown with a dashed ring so the user
+        # can distinguish measured vs. estimated columns.
+        actual_set = {i for i, p in enumerate(centers_disp) if p is not None}
+        for i, pt in enumerate(centers_filled):
             if pt is None:
                 continue
-            cv2.circle(out, pt,  9, (0,   0,   0),   -1, cv2.LINE_AA)
-            cv2.circle(out, pt,  7, (30, 160, 220),   -1, cv2.LINE_AA)
-            cv2.circle(out, pt,  9, (200, 200, 200),   1, cv2.LINE_AA)
+            if i in actual_set:
+                # Actual detection – solid ring
+                cv2.circle(out, pt,  9, (0,   0,   0),   -1, cv2.LINE_AA)
+                cv2.circle(out, pt,  7, (30, 160, 220),   -1, cv2.LINE_AA)
+                cv2.circle(out, pt,  9, (200, 200, 200),   1, cv2.LINE_AA)
+            else:
+                # Interpolated / filtered – smaller dashed ring
+                cv2.circle(out, pt,  6, (0,   0,   0),   -1, cv2.LINE_AA)
+                cv2.circle(out, pt,  5, (30, 100, 160),   -1, cv2.LINE_AA)
+                cv2.circle(out, pt,  6, (120, 120, 120),   1, cv2.LINE_AA)
 
         # ── 6. Column dividers ─────────────────────────────────────────────
         for i in range(1, N_COLS):
@@ -1443,8 +1502,8 @@ class PutterLive:
                 _yolo_cx_h: Optional[int] = None
                 _yolo_cy_h: Optional[int] = None
 
-                # ── YOLO tracking toutes les 3 frames sur _half ─────────────
-                if self._yolo is not None and self._rep_ctr % 3 == 0:
+                # ── YOLO tracking toutes les 2 frames sur _half ─────────────
+                if self._yolo is not None and self._rep_ctr % 2 == 0:
                     try:
                         _pr = self._yolo.predict(_half, conf=0.08, verbose=False)
                         _br = _pr[0].boxes
