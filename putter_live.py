@@ -1155,14 +1155,31 @@ class PutterLive:
         # Dynamic column bounds available (used for assignment, not for display scaling)
         dyn_b = self._dyn_col_bounds_half
 
+        # Track x-offset of each column's crop (in source/half-res coords)
+        # so ball and putter positions can be remapped correctly.
+        crop_offsets_src = [i * col_w_src for i in range(N_COLS)]
+
         for i, kf in enumerate(src_cols[:N_COLS]):
             if kf is None:
                 continue
-            # Static column crop: each column shows its corresponding x-range
-            # of the keyframe – no overlap, no background repetition.
             x0 = i * col_w_src
             x1 = sf_w if i == N_COLS - 1 else x0 + col_w_src
-            composite[:, x0:x1] = kf[:, x0:x1]
+            col_actual_w = x1 - x0
+
+            # Centre strip on putter head so the full putter is always visible.
+            if (self._kf_col_centers[i] is not None
+                    and self._kf_col_centers[i][0] is not None):
+                cx_h = int(self._kf_col_centers[i][0])
+                strip_x0 = max(0, cx_h - col_actual_w // 2)
+                strip_x1 = strip_x0 + col_actual_w
+                if strip_x1 > sf_w:
+                    strip_x1 = sf_w
+                    strip_x0 = max(0, strip_x1 - col_actual_w)
+                crop_offsets_src[i] = strip_x0
+            else:
+                strip_x0, strip_x1 = x0, x1
+
+            composite[:, x0:x1] = kf[:, strip_x0:strip_x1]
 
         out[:self.H] = cv2.resize(composite, (self.W, self.H))
         out[self.H:] = (out[self.H:].astype(np.int32) * 55 // 100).astype(np.uint8)
@@ -1182,7 +1199,8 @@ class PutterLive:
             det_from_rec = [None] * N_COLS
             for _ci, _ctr in enumerate(self._kf_col_centers):
                 if _ctr is not None:
-                    _dcx = int(_ctr[0] * self.W / sf_w)   # position réelle dans display
+                    # With putter-centred crop the head always lands at column centre.
+                    _dcx = _ci * col_w_disp + col_w_disp // 2
                     _dcy = int(_ctr[1] * self.H / sf_h)
                     _ang = float(_ctr[2]) if len(_ctr) > 2 else 0.0
                     det_from_rec[_ci] = (
@@ -1334,7 +1352,10 @@ class PutterLive:
                                    shadow_color=(0, 0, 50),
                                    main_color=RED, max_thick=7)
 
-        # ── 4. Ball trajectory (impact col 4 → dernière pos balle col 1) ───
+        # ── 4. Balle – visible exactement 2 fois ─────────────────────────
+        # scale_f : coordonnées source (half-res) → coordonnées display
+        scale_f = col_w_disp / col_w_src   # ≈ 2.0
+
         ball_init = self._ball_init_pos
         if ball_init is None and self._ball_zone_rect is not None:
             _bx, _by, _bw, _bh = self._ball_zone_rect
@@ -1343,26 +1364,29 @@ class PutterLive:
         if ball_init is not None:
             bix, biy = int(ball_init[0]), int(ball_init[1])
 
-            # Dernière position réelle de la balle après impact (half-res × 2 → display)
+            # ── Balle 1 : colonne 3 (impact) – balle à sa position de départ ──
+            col3_x0 = 3 * col_w_disp
+            b1_x = col3_x0 + int((bix // 2 - crop_offsets_src[3]) * scale_f)
+            b1_x = max(col3_x0, min(col3_x0 + col_w_disp - 1, b1_x))
+            b1_y = biy
+            cv2.circle(out, (b1_x, b1_y), 14, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(out, (b1_x, b1_y), 12, CYAN,        2, cv2.LINE_AA)
+
+            # ── Balle 2 : colonne 6 (dernière frame) – balle après l'impact ──
+            col6_x0  = 6 * col_w_disp
             ball_last = self._ball_last_pos
             if ball_last is not None:
-                tgt_x = int(ball_last[0] * 2)
-                tgt_y = int(ball_last[1] * 2)
+                b2_x = col6_x0 + int((int(ball_last[0]) - crop_offsets_src[6]) * scale_f)
+                b2_x = max(col6_x0, min(self.W - 1, b2_x))
+                b2_y = int(ball_last[1] * self.H / sf_h)
             else:
-                # Fallback : centre de la col 1 à la même hauteur que l'impact
-                tgt_x = col_w_disp // 2
-                tgt_y = biy
+                b2_x = col6_x0 + col_w_disp // 2
+                b2_y = b1_y
+            cv2.circle(out, (b2_x, b2_y), 22, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(out, (b2_x, b2_y), 20, CYAN,        2, cv2.LINE_AA)
 
-            # Ligne cyan : position impact → dernière position balle
-            cv2.line(out, (bix, biy), (tgt_x, tgt_y), (200, 80, 0), 2, cv2.LINE_AA)
-
-            # Grand cercle cyan à la dernière position balle (direction de la balle)
-            cv2.circle(out, (tgt_x, tgt_y), 22, (0, 0, 0),  -1, cv2.LINE_AA)
-            cv2.circle(out, (tgt_x, tgt_y), 20, CYAN,         2, cv2.LINE_AA)
-
-            # Petit cercle cyan à la position d'impact (col 4)
-            cv2.circle(out, (bix, biy), 14, (0, 0, 0),  -1, cv2.LINE_AA)
-            cv2.circle(out, (bix, biy), 12, CYAN,         2, cv2.LINE_AA)
+            # Ligne entre les deux positions balle
+            cv2.line(out, (b1_x, b1_y), (b2_x, b2_y), (200, 80, 0), 2, cv2.LINE_AA)
 
         # ── 5. Putter-head centre markers (gold dot + white ring) ─────────
         # Draw actual detections (solid); interpolated/filtered positions
