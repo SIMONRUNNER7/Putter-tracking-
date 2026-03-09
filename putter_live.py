@@ -222,6 +222,9 @@ class PutterLive:
         self._kf_col_frames: list   = [None] * 7
         self._kf_col_offs:   list   = [float('inf')] * 7
         self._kf_col_centers: list  = [None] * 7   # (cx,cy) in _half px, motion centroid
+        self._all_live_detections: list        = []    # [(cx_h, cy_h, half_frame), ...]
+        self._address_x_half: Optional[float]  = None  # putter x at address (half-res)
+        self._dyn_col_bounds_half: Optional[list] = None  # 8 x-values for 7 dynamic cols (half-res)
         self._rec_bg_live:   Optional[np.ndarray] = None
         self._ball_roi_ref:  Optional[np.ndarray] = None
         self._ball_moved:    bool = False
@@ -1002,6 +1005,104 @@ class PutterLive:
         offset = abs(cx - (col + 0.5) * col_w)
         return col, offset
 
+    # ── Dynamic column computation ────────────────────────────────────────────
+
+    def _compute_dynamic_columns(self) -> None:
+        """Compute dynamic column boundaries from the actual stroke range,
+        then assign the best half-res keyframe to each of the 7 columns.
+
+        Column layout (0-indexed):
+          Col 0-2 : backswing  (left of address, 3 equal slices)
+          Col 3   : address/impact (centred on ball zone)
+          Col 4-6 : follow-through (right of address, 3 equal slices)
+
+        Col 3 is preserved from ball-impact detection done during RECORDING.
+        """
+        N = 7
+        detections = self._all_live_detections   # [(cx_h, cy_h, frame), ...]
+        if not detections:
+            return
+
+        # Preserve the impact frame set during RECORDING (ball-moved detection)
+        impact_frame  = self._kf_col_frames[3]
+        impact_center = self._kf_col_centers[3]
+        impact_offs   = self._kf_col_offs[3]
+
+        # Address x (half-res) – prefer ball zone centre as stable reference
+        if self._ball_zone_rect is not None:
+            _bzx, _bzy, _bzw, _bzh = self._ball_zone_rect
+            x_addr_h = float(_bzx + _bzw // 2) / 2.0   # full-res → half-res
+        elif self._address_x_half is not None:
+            x_addr_h = self._address_x_half
+        else:
+            x_addr_h = float(detections[0][0])
+
+        xs          = [d[0] for d in detections]
+        x_min_h     = min(xs)
+        x_max_h     = max(xs)
+        left_range  = max(x_addr_h - x_min_h, 30.0)
+        right_range = max(x_max_h - x_addr_h, 30.0)
+
+        # Skip if stroke range is too small to be meaningful
+        if left_range + right_range < 60:
+            return
+
+        lcw = left_range  / 3.0    # backswing column width (half-res px)
+        rcw = right_range / 3.0    # follow-through column width
+        acw = (lcw + rcw) / 2.0    # address column width
+
+        # 8 boundaries for 7 columns:
+        # Col i occupies [b[i], b[i+1]]
+        b    = [0.0] * 8
+        b[3] = x_addr_h - acw / 2.0   # left edge of address col
+        b[4] = x_addr_h + acw / 2.0   # right edge of address col
+        b[2] = b[3] - lcw
+        b[1] = b[2] - lcw
+        b[0] = b[1] - lcw
+        b[5] = b[4] + rcw
+        b[6] = b[5] + rcw
+        b[7] = b[6] + rcw
+
+        self._dyn_col_bounds_half = b
+
+        # Reset column data
+        self._kf_col_frames  = [None] * N
+        self._kf_col_offs    = [float('inf')] * N
+        self._kf_col_centers = [None] * N
+
+        # Restore impact frame for col 3
+        if impact_frame is not None:
+            self._kf_col_frames[3]  = impact_frame
+            self._kf_col_offs[3]    = impact_offs if impact_offs != float('inf') else 0.0
+            self._kf_col_centers[3] = impact_center
+
+        # Assign each detection to its dynamic column
+        for cx_h, cy_h, frame_h in detections:
+            assigned = False
+            for col in range(N):
+                if b[col] <= cx_h < b[col + 1]:
+                    if col == 3:
+                        assigned = True
+                        break   # preserve impact col
+                    col_cx = (b[col] + b[col + 1]) / 2.0
+                    offset  = abs(cx_h - col_cx)
+                    if offset < self._kf_col_offs[col]:
+                        self._kf_col_offs[col]    = offset
+                        self._kf_col_frames[col]  = frame_h
+                        self._kf_col_centers[col] = (cx_h, cy_h)
+                    assigned = True
+                    break
+            if not assigned:
+                # Outside [b[0], b[7]] – clamp to col 0 or col 6
+                col = 0 if cx_h < b[0] else N - 1
+                if col != 3:
+                    col_cx = (b[col] + b[col + 1]) / 2.0
+                    offset  = abs(cx_h - col_cx)
+                    if offset < self._kf_col_offs[col]:
+                        self._kf_col_offs[col]    = offset
+                        self._kf_col_frames[col]  = frame_h
+                        self._kf_col_centers[col] = (cx_h, cy_h)
+
     # ── Strobe composite ──────────────────────────────────────────────────────
 
     def _run_yolo_strobe(self, composite: np.ndarray) -> list:
@@ -1075,12 +1176,27 @@ class PutterLive:
         composite  = (frames[0].copy() if frames
                       else np.zeros((sf_h, sf_w, 3), dtype=np.uint8))
 
+        # Dynamic column bounds (half-res coords), or None → fallback to uniform
+        dyn_b = self._dyn_col_bounds_half
+
         for i, kf in enumerate(src_cols[:N_COLS]):
             if kf is None:
                 continue
-            x0 = i * col_w_src
-            x1 = sf_w if i == N_COLS - 1 else x0 + col_w_src
-            composite[:, x0:x1] = kf[:, x0:x1]
+            if dyn_b is not None:
+                # Extract the actual stroke-range slice and stretch to column slot
+                src_x0 = max(0, int(round(dyn_b[i])))
+                src_x1 = min(sf_w, int(round(dyn_b[i + 1])))
+                if src_x0 >= src_x1:
+                    src_x0 = max(0, int(dyn_b[i]))
+                    src_x1 = min(sf_w, src_x0 + max(1, int(dyn_b[i + 1] - dyn_b[i])))
+                dst_x0 = i * col_w_src
+                dst_x1 = sf_w if i == N_COLS - 1 else dst_x0 + col_w_src
+                composite[:, dst_x0:dst_x1] = cv2.resize(
+                    kf[:, src_x0:src_x1], (dst_x1 - dst_x0, sf_h))
+            else:
+                x0 = i * col_w_src
+                x1 = sf_w if i == N_COLS - 1 else x0 + col_w_src
+                composite[:, x0:x1] = kf[:, x0:x1]
 
         out[:self.H] = cv2.resize(composite, (self.W, self.H))
         out[self.H:] = (out[self.H:].astype(np.int32) * 55 // 100).astype(np.uint8)
@@ -1091,17 +1207,33 @@ class PutterLive:
 
         # Taille de boîte par défaut en pixels display
         _DEF_BOX_W = int(self.W / N_COLS * 0.72)
-        _DEF_BOX_H = int(self.H * 0.20)
+        _DEF_BOX_H = int(self.H * 0.35)
 
         if self._strobe_det is None:
-            # Priorité : réutiliser les centres YOLO capturés pendant l'enregistrement
-            # (coordonnées half-res → display ×2).  Ces détections sont fiables car
-            # YOLO tournait sur des frames individuelles de bonne qualité.
+            # Priorité : réutiliser les centres YOLO capturés pendant l'enregistrement.
+            # Avec colonnes dynamiques, mapper half-res x via le remap de colonne.
             det_from_rec = [None] * N_COLS
             for _ci, _ctr in enumerate(self._kf_col_centers):
                 if _ctr is not None:
+                    if dyn_b is not None:
+                        # Map half-res x through dynamic-slice → display coordinates
+                        _src_x0_h = max(0.0, dyn_b[_ci])
+                        _src_x1_h = min(float(sf_w), dyn_b[_ci + 1])
+                        _col_range_h = _src_x1_h - _src_x0_h
+                        if _col_range_h > 0:
+                            _frac = (_ctr[0] - _src_x0_h) / _col_range_h
+                            _disp_x0_c = _ci * col_w_disp
+                            _disp_x1_c = (col_w_disp * (_ci + 1)
+                                          if _ci < N_COLS - 1 else self.W)
+                            _dcx = int(_disp_x0_c + _frac * (_disp_x1_c - _disp_x0_c))
+                        else:
+                            _dcx = _ci * col_w_disp + col_w_disp // 2
+                        _dcy = int(_ctr[1] * self.H / sf_h)
+                    else:
+                        _dcx = int(_ctr[0] * 2)
+                        _dcy = int(_ctr[1] * 2)
                     det_from_rec[_ci] = (
-                        int(_ctr[0] * 2), int(_ctr[1] * 2),
+                        _dcx, _dcy,
                         float(_DEF_BOX_W), float(_DEF_BOX_H), 0.0,
                     )
             if any(d is not None for d in det_from_rec):
@@ -1605,15 +1737,12 @@ class PutterLive:
                     except Exception:
                         pass
 
-                # ── Assignation de colonne via YOLO (sans background subtraction) ──
+                # ── Collecte détections YOLO pour colonnes dynamiques ─────────
                 if _yolo_cx_h is not None:
-                    _col_wh = _half.shape[1] // 7
-                    _col_h  = min(_yolo_cx_h // _col_wh, 6)
-                    _off_h  = abs(_yolo_cx_h - (_col_h + 0.5) * _col_wh)
-                    if _off_h < self._kf_col_offs[_col_h]:
-                        self._kf_col_offs[_col_h]    = _off_h
-                        self._kf_col_frames[_col_h]  = _half.copy()
-                        self._kf_col_centers[_col_h] = (_yolo_cx_h, _yolo_cy_h)
+                    if self._address_x_half is None:
+                        self._address_x_half = float(_yolo_cx_h)
+                    self._all_live_detections.append(
+                        (_yolo_cx_h, _yolo_cy_h, _half.copy()))
 
                 _gray_h = cv2.GaussianBlur(
                     cv2.cvtColor(_half, cv2.COLOR_BGR2GRAY), (21, 21), 0)
@@ -1656,16 +1785,15 @@ class PutterLive:
                                 if _yolo_cx_h is not None:
                                     _cx_h = _yolo_cx_h
                                     _cy_h = _yolo_cy_h
-                                _col_wh = _half.shape[1] // 7
-                                _col_h  = min(_cx_h // _col_wh, 6)
-                                _off_h  = abs(_cx_h - (_col_h + 0.5) * _col_wh)
-                                if _off_h < self._kf_col_offs[_col_h]:
-                                    self._kf_col_offs[_col_h]    = _off_h
-                                    self._kf_col_frames[_col_h]  = _half.copy()
-                                    self._kf_col_centers[_col_h] = (_cx_h, _cy_h)
+                                # Collecte pour colonnes dynamiques (bg-sub si YOLO absent)
+                                if _yolo_cx_h is None:
+                                    if self._address_x_half is None:
+                                        self._address_x_half = float(_cx_h)
+                                    self._all_live_detections.append(
+                                        (_cx_h, _cy_h, _half.copy()))
                     # Ball impact detection
                     if (not self._ball_moved
-                            and any(f is not None for f in self._kf_col_frames)
+                            and bool(self._all_live_detections)
                             and self._ball_roi_ref is not None):
                         _bh2, _bw2 = _half.shape[:2]
                         if self._ball_zone_rect is not None:
@@ -1751,6 +1879,7 @@ class PutterLive:
                 if self.result:
                     self._save_json(self.result)
                     self._last_path = list(self.result.positions)
+                self._compute_dynamic_columns()   # dynamic column boundaries from stroke
                 self._kf_init    = False
                 self._strobe_det = None
                 self._kf_done   = False
@@ -1842,9 +1971,21 @@ class PutterLive:
                               and self._strobe_indices[i] < len(self._rep_frames)):
                             src_f = self._rep_frames[self._strobe_indices[i]]
                         if src_f is not None:
-                            x0 = i * cw_src
-                            x1 = sf_w2 if i == N_COLS - 1 else x0 + cw_src
-                            composite2[:, x0:x1] = src_f[:, x0:x1]
+                            _dyn_b2 = self._dyn_col_bounds_half
+                            if _dyn_b2 is not None:
+                                _sx0 = max(0, int(round(_dyn_b2[i])))
+                                _sx1 = min(sf_w2, int(round(_dyn_b2[i + 1])))
+                                _dx0 = i * cw_src
+                                _dx1 = sf_w2 if i == N_COLS - 1 else _dx0 + cw_src
+                                if _sx0 < _sx1:
+                                    composite2[:, _dx0:_dx1] = cv2.resize(
+                                        src_f[:, _sx0:_sx1], (_dx1 - _dx0, sf_h2))
+                                else:
+                                    composite2[:, _dx0:_dx1] = src_f[:, _dx0:_dx1]
+                            else:
+                                x0 = i * cw_src
+                                x1 = sf_w2 if i == N_COLS - 1 else x0 + cw_src
+                                composite2[:, x0:x1] = src_f[:, x0:x1]
 
                     frame = np.zeros((self.H + PANEL_H, self.W, 3), dtype=np.uint8)
                     frame[:vid_h] = cv2.resize(composite2, (self.W, vid_h))
@@ -1932,6 +2073,9 @@ class PutterLive:
                     self._kf_col_frames   = [None] * 7
                     self._kf_col_offs     = [float('inf')] * 7
                     self._kf_col_centers  = [None] * 7
+                    self._all_live_detections = []
+                    self._address_x_half      = None
+                    self._dyn_col_bounds_half = None
                     self._rec_bg_live     = None
                     self._ball_roi_ref    = None
                     self._ball_moved      = False
