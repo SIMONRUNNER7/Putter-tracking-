@@ -269,6 +269,7 @@ class PutterLive:
         self.state      = AppState.READY
         self._cd_start  = 0.0
         self._rec_start = 0.0
+        self._putter_was_in_zone: bool = False   # putter was at address last frame
 
         # ── Recording ─────────────────────────────────────────────────────
         self.records: list[FrameRec] = []
@@ -1471,6 +1472,39 @@ class PutterLive:
 
         return out
 
+    def _start_recording(self, now: float) -> None:
+        """Transition immédiatement vers RECORDING (sans compte à rebours)."""
+        self.state          = AppState.RECORDING
+        self._rec_start     = now
+        self.records        = []
+        self._rep_frames    = []
+        self._rep_positions = []
+        self._rep_ctr       = 0
+        self._pos_buf.clear()
+        self._ang_buf.clear()
+        self._kf_col_frames   = [None] * 7
+        self._kf_col_offs     = [float('inf')] * 7
+        self._kf_col_centers  = [None] * 7
+        self._rec_bg_live     = None
+        self._ball_roi_ref    = None
+        self._ball_moved      = False
+        self._half_buf.clear()
+        self._ball_init_pos   = None
+        self._ball_last_pos   = None
+        self._last_yolo_half_pos = None
+        if self._zone_rect is not None:
+            _zx, _zy, _zw, _zh = self._zone_rect
+            self._last_yolo_half_pos = (
+                (_zx + _zw // 2) // 2,
+                (_zy + _zh // 2) // 2,
+            )
+        elif self._yolo_ready_box is not None:
+            _rx1, _ry1, _rx2, _ry2 = self._yolo_ready_box
+            self._last_yolo_half_pos = (
+                int((_rx1 + _rx2) / 4),
+                int((_ry1 + _ry2) / 4),
+            )
+
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run(self):
@@ -1587,6 +1621,22 @@ class PutterLive:
                     if pos:
                         cv2.circle(frame, pos, 7, C["green"], -1)
 
+                # ── Déclenchement supplémentaire : sortie de la zone vers la droite ──
+                # Si le putter était en zone et YOLO le détecte maintenant à droite
+                # de la zone → démarrer l'enregistrement immédiatement, sans compte à rebours.
+                if putter_in_zone:
+                    self._putter_was_in_zone = True
+                elif self._putter_was_in_zone and self._zone_rect is not None:
+                    _zx2, _zy2, _zw2, _zh2 = self._zone_rect
+                    _zone_right = _zx2 + _zw2
+                    if self._yolo_ready_box is not None:
+                        _px1, _py1, _px2, _py2 = self._yolo_ready_box
+                        _putter_cx = (_px1 + _px2) // 2
+                        if _putter_cx > _zone_right + 15:
+                            self._putter_was_in_zone = False
+                            self._both_since         = None
+                            self._start_recording(now)
+
                 extra = [f"Face : {angle:+.1f}"] if angle is not None else []
                 self._draw_hud(frame, fps, extra)
 
@@ -1622,38 +1672,7 @@ class PutterLive:
                 self._draw_countdown(frame, rem)
                 self._draw_hud(frame, fps)
                 if rem <= 0:
-                    self.state          = AppState.RECORDING
-                    self._rec_start     = now
-                    self.records        = []
-                    self._rep_frames    = []
-                    self._rep_positions = []
-                    self._rep_ctr       = 0
-                    self._pos_buf.clear()
-                    self._ang_buf.clear()
-                    self._kf_col_frames   = [None] * 7
-                    self._kf_col_offs     = [float('inf')] * 7
-                    self._kf_col_centers  = [None] * 7
-                    self._rec_bg_live     = None
-                    self._ball_roi_ref    = None
-                    self._ball_moved      = False
-                    self._half_buf.clear()
-                    self._ball_init_pos   = None
-                    self._ball_last_pos   = None
-                    # Initialiser le tracking YOLO depuis le centre de la zone putter
-                    # pour éviter de partir sur un putter du rack
-                    self._last_yolo_half_pos = None
-                    if self._zone_rect is not None:
-                        _zx, _zy, _zw, _zh = self._zone_rect
-                        self._last_yolo_half_pos = (
-                            (_zx + _zw // 2) // 2,
-                            (_zy + _zh // 2) // 2,
-                        )
-                    elif self._yolo_ready_box is not None:
-                        _rx1, _ry1, _rx2, _ry2 = self._yolo_ready_box
-                        self._last_yolo_half_pos = (
-                            int((_rx1 + _rx2) / 4),
-                            int((_ry1 + _ry2) / 4),
-                        )
+                    self._start_recording(now)
 
             # ── RECORDING ─────────────────────────────────────────────────
             elif self.state == AppState.RECORDING:
@@ -2038,6 +2057,7 @@ class PutterLive:
                     self._ball_init_pos  = None
                     self._ball_last_pos  = None
                     self._last_yolo_half_pos = None
+                    self._putter_was_in_zone = False
                     print("[reset] READY – repositionnez balle et putter, puis SPACE pour démarrer")
 
             elif key in (ord('z'), ord('Z')):
