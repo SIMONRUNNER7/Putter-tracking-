@@ -1624,18 +1624,33 @@ class PutterLive:
                 # ── Déclenchement supplémentaire : sortie de la zone vers la droite ──
                 # Si le putter était en zone et YOLO le détecte maintenant à droite
                 # de la zone → démarrer l'enregistrement immédiatement, sans compte à rebours.
+                # Fallback luminosité utilisé quand YOLO n'est pas disponible (ex. imports).
                 if putter_in_zone:
                     self._putter_was_in_zone = True
                 elif self._putter_was_in_zone and self._zone_rect is not None:
                     _zx2, _zy2, _zw2, _zh2 = self._zone_rect
                     _zone_right = _zx2 + _zw2
+                    _exit_right = False
                     if self._yolo_ready_box is not None:
                         _px1, _py1, _px2, _py2 = self._yolo_ready_box
                         _putter_cx = (_px1 + _px2) // 2
                         if _putter_cx > _zone_right + 15:
-                            self._putter_was_in_zone = False
-                            self._both_since         = None
-                            self._start_recording(now)
+                            _exit_right = True
+                    else:
+                        # Fallback pour imports/absence YOLO : luminosité à droite de la zone
+                        _rx1 = _zone_right + 15
+                        _rx2 = min(self.W, _rx1 + _zw2)
+                        _ry1, _ry2 = _zy2, _zy2 + _zh2
+                        if _rx2 > _rx1 and _ry2 > _ry1:
+                            _right_roi = frame[_ry1:_ry2, _rx1:_rx2]
+                            if _right_roi.size > 0:
+                                _rg = cv2.cvtColor(_right_roi, cv2.COLOR_BGR2GRAY)
+                                if int(np.sum(_rg > BALL_BRIGHT_THR)) > BALL_MIN_PX * 2:
+                                    _exit_right = True
+                    if _exit_right:
+                        self._putter_was_in_zone = False
+                        self._both_since         = None
+                        self._start_recording(now)
 
                 extra = [f"Face : {angle:+.1f}"] if angle is not None else []
                 self._draw_hud(frame, fps, extra)
