@@ -249,6 +249,9 @@ class PutterLive:
         self._kf_best_off: dict = {}
         self._kf_bg: Optional[np.ndarray] = None
         self._strobe_det: Optional[list] = None
+        self._strobe_cache: Optional[np.ndarray] = None
+        self._kf_reveal_step: int = 0
+        self._kf_reveal_last: float = 0.0
 
         # ── YOLO model ────────────────────────────────────────────────────
         self._yolo = None
@@ -1146,7 +1149,7 @@ class PutterLive:
 
         # Taille de boîte par défaut en pixels display
         _DEF_BOX_W = int(self.W / N_COLS * 0.72)
-        _DEF_BOX_H = int(self.H * 0.35)
+        _DEF_BOX_H = int(self.H * 0.18)
 
         if self._strobe_det is None:
             # Priorité : réutiliser les centres YOLO capturés pendant l'enregistrement.
@@ -1805,11 +1808,14 @@ class PutterLive:
                     self._save_json(self.result)
                     self._last_path = list(self.result.positions)
                 self._compute_dynamic_columns()   # dynamic column boundaries from stroke
-                self._kf_init    = False
-                self._strobe_det = None
-                self._kf_done   = False
-                self._shot_count += 1
-                self.state      = AppState.KEYFRAMES
+                self._kf_init        = False
+                self._strobe_det     = None
+                self._strobe_cache   = None
+                self._kf_reveal_step = 0
+                self._kf_reveal_last = 0.0
+                self._kf_done        = False
+                self._shot_count    += 1
+                self.state           = AppState.KEYFRAMES
 
             # ── REPLAY ────────────────────────────────────────────────────
             elif self.state == AppState.REPLAY:
@@ -1840,74 +1846,38 @@ class PutterLive:
 
             # ── KEYFRAMES ─────────────────────────────────────────────────
             elif self.state == AppState.KEYFRAMES:
-                if not self._kf_init:
-                    self._kf_init      = True
-                    self._kf_idx       = 0
-                    self._kf_last      = now
-                    self._kf_done      = False
-                    self._kf_cur_col   = None
-                    self._kf_flash_col = -1
-                    self._kf_flash_t   = 0.0
-                    self._kf_best_off  = {}
-                    self._strobe_indices = [None] * 7
-                    if self._rep_frames:
-                        bg_raw      = cv2.cvtColor(self._rep_frames[0], cv2.COLOR_BGR2GRAY)
-                        self._kf_bg = cv2.GaussianBlur(bg_raw, (21, 21), 0).astype(np.float32)
-
-                KF_FPS  = 6
+                REVEAL_INTERVAL = 0.30   # seconds per column
                 N_COLS  = 7
                 vid_h   = self.H
                 col_w_d = self.W // N_COLS
 
-                if not self._kf_done and self._rep_frames:
-                    if now - self._kf_last >= 1.0 / KF_FPS:
-                        self._kf_last = now
-                        det = self._detect_putter_col(self._kf_idx)
-                        if det is not None:
-                            col, offset = det
-                            self._kf_cur_col = col
-                            best = self._kf_best_off.get(col, float('inf'))
-                            if offset < best:
-                                self._kf_best_off[col]    = offset
-                                self._strobe_indices[col] = self._kf_idx
-                                self._kf_flash_col        = col
-                                self._kf_flash_t          = now
-                        else:
-                            self._kf_cur_col = None
-                        self._kf_idx += 1
-                        if self._kf_idx >= len(self._rep_frames):
-                            self._kf_done = True
+                if not self._kf_init:
+                    self._kf_init        = True
+                    self._kf_done        = True
+                    self._strobe_det     = None
+                    self._strobe_cache   = None
+                    self._kf_reveal_step = 0
+                    self._kf_reveal_last = now
 
-                if not self._kf_done:
-                    f_idx  = min(self._kf_idx, len(self._rep_frames) - 1)
-                    cur_f  = self._rep_frames[f_idx]
-                    sf_h2, sf_w2 = cur_f.shape[:2]
-                    cw_src = sf_w2 // N_COLS
+                # Build/cache the full strobe composite once
+                if self._strobe_cache is None:
+                    self._strobe_cache = self._draw_strobe_composite()
 
-                    # Gel progressif : colonnes scannées = frame figée, autres = frame courante
-                    composite2 = cur_f.copy()
-                    for i in range(N_COLS):
-                        src_f = None
-                        # Priorité : frame capturée en live (RECORDING)
-                        if self._kf_col_frames[i] is not None:
-                            src_f = self._kf_col_frames[i]
-                        # Sinon : meilleur index replay trouvé jusqu'ici
-                        elif (self._strobe_indices[i] is not None
-                              and self._strobe_indices[i] < len(self._rep_frames)):
-                            src_f = self._rep_frames[self._strobe_indices[i]]
-                        if src_f is not None:
-                            # Static column crop – même approche que le composite final
-                            _dx0 = i * cw_src
-                            _dx1 = sf_w2 if i == N_COLS - 1 else _dx0 + cw_src
-                            composite2[:, _dx0:_dx1] = src_f[:, _dx0:_dx1]
+                # Advance reveal right → left (one column every REVEAL_INTERVAL s)
+                if self._kf_reveal_step < N_COLS - 1:
+                    if now - self._kf_reveal_last >= REVEAL_INTERVAL:
+                        self._kf_reveal_step += 1
+                        self._kf_reveal_last  = now
 
-                    frame = np.zeros((self.H + PANEL_H, self.W, 3), dtype=np.uint8)
-                    frame[:vid_h] = cv2.resize(composite2, (self.W, vid_h))
-                    for i in range(1, N_COLS):
-                        cv2.line(frame, (i * col_w_d, 0),
-                                 (i * col_w_d, vid_h), (80, 80, 80), 1)
-                else:
-                    frame = self._draw_strobe_composite()
+                frame = self._strobe_cache.copy()
+
+                # Darken columns not yet revealed (right-to-left: step 0 = col 6 only)
+                first_visible = N_COLS - 1 - self._kf_reveal_step
+                if first_visible > 0:
+                    cover_x = first_visible * col_w_d
+                    frame[:vid_h, :cover_x] = (
+                        frame[:vid_h, :cover_x].astype(np.int32) * 30 // 100
+                    ).astype(np.uint8)
 
             # ── ANNOTATE ──────────────────────────────────────────────────
             elif self.state == AppState.ANNOTATE:
@@ -1984,6 +1954,9 @@ class PutterLive:
                     self._kf_init        = False
                     self._strobe_indices = []
                     self._strobe_det     = None
+                    self._strobe_cache   = None
+                    self._kf_reveal_step = 0
+                    self._kf_reveal_last = 0.0
                     self._kf_col_frames   = [None] * 7
                     self._kf_col_offs     = [float('inf')] * 7
                     self._kf_col_centers  = [None] * 7
@@ -2051,6 +2024,9 @@ class PutterLive:
                 self._kf_init        = False
                 self._strobe_indices = []
                 self._strobe_det     = None
+                self._strobe_cache   = None
+                self._kf_reveal_step = 0
+                self._kf_reveal_last = 0.0
                 self._kf_col_frames   = [None] * 7
                 self._kf_col_offs     = [float('inf')] * 7
                 self._kf_col_centers  = [None] * 7
