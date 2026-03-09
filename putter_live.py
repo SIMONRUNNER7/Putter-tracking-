@@ -39,7 +39,7 @@ except ImportError:
 
 _MODEL_PATH = os.path.join(
     os.path.dirname(__file__),
-    "runs", "detect", "putter_det", "weights", "best.pt"
+    "runs", "detect", "runs", "putter", "putter_detector", "weights", "best.pt"
 )
 from collections import deque
 from scipy.interpolate import CubicSpline
