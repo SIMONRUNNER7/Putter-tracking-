@@ -883,7 +883,7 @@ class PutterLive:
         ]
         x, y = 14, y0 + 36
         for i, v in enumerate(vals):
-            self._put(frame, v + "°", (x, y), scale=0.46)
+            self._put(frame, v, (x, y), scale=0.46)
             x += 145
             if i == 1:
                 x, y = 14, y0 + 58
@@ -1405,7 +1405,7 @@ class PutterLive:
             if v is None:
                 return "--"
             side = "R" if v > 0.05 else ("L" if v < -0.05 else "")
-            return f"{side}{abs(v):.1f}°"
+            return f"{side}{abs(v):.1f}"
 
         r_res = self.result
         face_str = _angle_str(r_res.face_impact if r_res else None)
@@ -1587,7 +1587,7 @@ class PutterLive:
                     if pos:
                         cv2.circle(frame, pos, 7, C["green"], -1)
 
-                extra = [f"Face : {angle:+.1f}°"] if angle is not None else []
+                extra = [f"Face : {angle:+.1f}"] if angle is not None else []
                 self._draw_hud(frame, fps, extra)
 
             # ── ZONE_SETUP ────────────────────────────────────────────────
@@ -1863,7 +1863,7 @@ class PutterLive:
 
                 extra = [f"REC {rem:.1f}s"]
                 if angle is not None:
-                    extra.append(f"Face : {angle:+.1f}°")
+                    extra.append(f"Face : {angle:+.1f}")
                 self._draw_hud(frame, fps, extra)
 
                 if rem <= 0:
