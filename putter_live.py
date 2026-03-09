@@ -1437,7 +1437,33 @@ class PutterLive:
         cv2.putText(out, shot_str, (self.W - sw - 12, HDR_H - 11),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.52, GOLD, 1, cv2.LINE_AA)
 
-        # ── 10. Bottom hint ────────────────────────────────────────────────
+        # ── 10. Panel metrics ──────────────────────────────────────────────
+        if r_res is not None:
+            panel_items = [
+                ("Face @ impact", face_str,  WHITE),
+                ("Path",          path_str,  WHITE),
+                ("Arc",           arc_str,   arc_clr),
+                ("Face @ addr",   _angle_str(r_res.face_address), (180, 180, 180)),
+                ("Tempo (s)",
+                 f"{r_res.timestamps[-1] - r_res.timestamps[0]:.2f}"
+                 if len(r_res.timestamps) >= 2 else "--",
+                 (180, 180, 180)),
+            ]
+            col_w_panel = self.W // len(panel_items)
+            py_label = self.H + 30
+            py_value = self.H + 62
+            for ci, (lbl, val, clr) in enumerate(panel_items):
+                px = ci * col_w_panel + col_w_panel // 2
+                (lw, _), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+                cv2.putText(out, lbl, (px - lw // 2, py_label),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (130, 130, 130), 1, cv2.LINE_AA)
+                (vw, _), _ = cv2.getTextSize(val, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 1)
+                cv2.putText(out, val, (px - vw // 2, py_value),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.58, clr, 1, cv2.LINE_AA)
+            # Separator line between video and panel
+            cv2.line(out, (0, self.H), (self.W, self.H), (60, 60, 60), 1)
+
+        # ── 11. Bottom hint ────────────────────────────────────────────────
         hint = "L: retour live   SPACE: repositionner + nouveau coup   T: annoter   Q: quitter"
         (hw, _), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.36, 1)
         cv2.putText(out, hint, (self.W - hw - 8, self.H + PANEL_H - 8),
@@ -1743,6 +1769,23 @@ class PutterLive:
                                         self._address_x_half = float(_cx_h)
                                     self._all_live_detections.append(
                                         (_cx_h, _cy_h, _half.copy()))
+                                    # Alimenter records pour l'analyse (Face/Path)
+                                    if pos is None:
+                                        _bgsub_x = _cx_h * 2
+                                        _bgsub_y = _cy_h * 2
+                                        _bgsub_v = (
+                                            math.hypot(
+                                                _bgsub_x - self.records[-1].pos[0],
+                                                _bgsub_y - self.records[-1].pos[1],
+                                            ) / max(1e-6, now - self.records[-1].ts)
+                                            if self.records else 0.0
+                                        )
+                                        self.records.append(FrameRec(
+                                            ts=now,
+                                            pos=(_bgsub_x, _bgsub_y),
+                                            angle=0.0,
+                                            vel=_bgsub_v,
+                                        ))
                     # Ball impact detection
                     if (not self._ball_moved
                             and bool(self._all_live_detections)
