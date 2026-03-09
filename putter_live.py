@@ -944,17 +944,10 @@ class PutterLive:
                 result.append(None)
                 continue
             kf_h, kf_w = kf.shape[:2]
-
-            # Expected position: use stored motion centroid if available,
-            # otherwise fall back to geometric column centre.
-            known = (self._kf_col_centers[i]
-                     if i < len(self._kf_col_centers) else None)
-            if known is not None:
-                expected_cx, expected_cy = float(known[0]), float(known[1])
-            else:
-                col_w  = kf_w // N_COLS
-                expected_cx = (i + 0.5) * col_w
-                expected_cy = kf_h / 2.0
+            col_w = kf_w // N_COLS
+            # Column i x range in frame coordinates
+            x0_col = i * col_w
+            x1_col = kf_w if i == N_COLS - 1 else (i + 1) * col_w
 
             # Run YOLO on the full frame (no crop — narrow crops break detection)
             preds = self._yolo.predict(kf, conf=0.03, verbose=False)
@@ -967,12 +960,26 @@ class PutterLive:
             xywh  = boxes.xywh.tolist()
             confs = boxes.conf.tolist()
 
-            # Pick detection whose centre is nearest to the expected position
-            best_j = min(range(len(xywh)),
-                         key=lambda j: math.hypot(xywh[j][0] - expected_cx,
-                                                   xywh[j][1] - expected_cy))
-            cx, cy, w, h = xywh[best_j][:4]
-            print(f"[yolo] col {i}: cx={cx:.0f} cy={cy:.0f} conf={confs[best_j]:.2f}")
+            # Filter: keep detections whose centre falls within column i x range
+            in_col = [
+                (j, xywh[j], confs[j])
+                for j in range(len(xywh))
+                if x0_col <= xywh[j][0] < x1_col
+            ]
+
+            if in_col:
+                # Pick highest confidence detection in this column
+                best = max(in_col, key=lambda t: t[2])
+                cx, cy, w, h = best[1][:4]
+                print(f"[yolo] col {i}: cx={cx:.0f} cy={cy:.0f} conf={best[2]:.2f}")
+            else:
+                # Fallback: pick detection whose centre x is nearest to column centre
+                col_cx = (x0_col + x1_col) / 2.0
+                best_j = min(range(len(xywh)),
+                             key=lambda j: abs(xywh[j][0] - col_cx))
+                cx, cy, w, h = xywh[best_j][:4]
+                print(f"[yolo] col {i}: fallback nearest cx={cx:.0f} conf={confs[best_j]:.2f}")
+
             result.append((cx, cy, w, h, 0.0))
         return result
 
@@ -1355,20 +1362,25 @@ class PutterLive:
                 zone_pos_rec = self._detect_in_zone(frame)
                 track_pos = zone_pos_rec or pos   # prefer zone centroid
 
-                # Per-column live capture using background subtraction
+                # Per-column live capture using YOLO detection
                 _half  = cv2.resize(frame, (self.W // 2, self.H // 2))
+                _yolo_cx_h: Optional[int] = None
+                _yolo_cy_h: Optional[int] = None
 
-                # ── YOLO tracking toutes les 6 frames sur _half (rapide) ───
-                if self._yolo is not None and self._rep_ctr % 6 == 0:
+                # ── YOLO tracking toutes les 3 frames sur _half ─────────────
+                if self._yolo is not None and self._rep_ctr % 3 == 0:
                     try:
                         _pr = self._yolo.predict(_half, conf=0.12, verbose=False)
                         _br = _pr[0].boxes
                         if _br is not None and len(_br) > 0:
                             _ci  = int(max(range(len(_br.conf.tolist())),
                                           key=lambda k: _br.conf.tolist()[k]))
-                            # _half est à moitié résolution → ×2 pour coordonnées réelles
-                            _ycx = int(_br.xywh[_ci][0]) * 2
-                            _ycy = int(_br.xywh[_ci][1]) * 2
+                            # Coordonnées en demi-résolution
+                            _yolo_cx_h = int(_br.xywh[_ci][0])
+                            _yolo_cy_h = int(_br.xywh[_ci][1])
+                            # Pleine résolution pour track_pos et records
+                            _ycx = _yolo_cx_h * 2
+                            _ycy = _yolo_cy_h * 2
                             track_pos = (_ycx, _ycy)   # meilleure source pour la colonne
                             if pos is None:             # ajouter aux records si pas d'ArUco
                                 _rv = (
@@ -1381,6 +1393,16 @@ class PutterLive:
                                     FrameRec(ts=now, pos=(_ycx, _ycy), angle=0.0, vel=_rv))
                     except Exception:
                         pass
+
+                # ── Assignation de colonne via YOLO (sans background subtraction) ──
+                if _yolo_cx_h is not None:
+                    _col_wh = _half.shape[1] // 7
+                    _col_h  = min(_yolo_cx_h // _col_wh, 6)
+                    _off_h  = abs(_yolo_cx_h - (_col_h + 0.5) * _col_wh)
+                    if _off_h < self._kf_col_offs[_col_h]:
+                        self._kf_col_offs[_col_h]    = _off_h
+                        self._kf_col_frames[_col_h]  = _half.copy()
+                        self._kf_col_centers[_col_h] = (_yolo_cx_h, _yolo_cy_h)
 
                 _gray_h = cv2.GaussianBlur(
                     cv2.cvtColor(_half, cv2.COLOR_BGR2GRAY), (21, 21), 0)
@@ -1405,26 +1427,7 @@ class PutterLive:
                         _bzx, _bzy, _bzw, _bzh = self._ball_zone_rect
                         self._ball_init_pos = (_bzx + _bzw // 2, _bzy + _bzh // 2)
                 else:
-                    _diff_h = np.abs(_gray_h.astype(np.float32) - self._rec_bg_live)
-                    _, _th_h = cv2.threshold(
-                        _diff_h.astype(np.uint8), 8, 255, cv2.THRESH_BINARY)
-                    _th_h = cv2.dilate(_th_h, None, iterations=3)
-                    _cnts_h, _ = cv2.findContours(
-                        _th_h, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    if _cnts_h:
-                        _c_h = max(_cnts_h, key=cv2.contourArea)
-                        if cv2.contourArea(_c_h) >= 60:
-                            _M_h = cv2.moments(_c_h)
-                            if _M_h["m00"] > 0:
-                                _cx_h   = int(_M_h["m10"] / _M_h["m00"])
-                                _cy_h   = int(_M_h["m01"] / _M_h["m00"])
-                                _col_wh = _half.shape[1] // 7
-                                _col_h  = min(_cx_h // _col_wh, 6)
-                                _off_h  = abs(_cx_h - (_col_h + 0.5) * _col_wh)
-                                if _off_h < self._kf_col_offs[_col_h]:
-                                    self._kf_col_offs[_col_h]    = _off_h
-                                    self._kf_col_frames[_col_h]  = _half.copy()
-                                    self._kf_col_centers[_col_h] = (_cx_h, _cy_h)
+                    pass  # column assignment now done via YOLO above
                     # Ball impact detection
                     if (not self._ball_moved
                             and any(f is not None for f in self._kf_col_frames)
