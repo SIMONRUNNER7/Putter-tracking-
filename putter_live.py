@@ -565,6 +565,26 @@ class PutterLive:
                 self._dbg_info = {"roi": (x, y, w, h), "fallback": True}
                 return center, raw
 
+        # ── YOLO fallback ─────────────────────────────────────────────────
+        if self._yolo is not None:
+            try:
+                _half = cv2.resize(frame, (self.W // 2, self.H // 2))
+                _preds = self._yolo.predict(_half, conf=0.25, verbose=False)
+                _boxes = _preds[0].boxes
+                if _boxes is not None and len(_boxes) > 0:
+                    _confs = _boxes.conf.tolist()
+                    _bi = int(max(range(len(_confs)), key=lambda k: _confs[k]))
+                    _x1, _y1, _x2, _y2 = [int(v) for v in _boxes.xyxy[_bi].tolist()]
+                    center = ((_x1 + _x2), (_y1 + _y2))  # half-res × 2 = full-res
+                    # Angle from box orientation (width vs height)
+                    bw, bh = _x2 - _x1, _y2 - _y1
+                    raw = 0.0 if bw >= bh else 90.0
+                    self._track_mode = "yolo"
+                    self._yolo_ready_box = (_x1 * 2, _y1 * 2, _x2 * 2, _y2 * 2)
+                    return center, raw
+            except Exception:
+                pass
+
         self._track_mode = "none"
         return None, None
 
@@ -1497,7 +1517,31 @@ class PutterLive:
                         _bzx, _bzy, _bzw, _bzh = self._ball_zone_rect
                         self._ball_init_pos = (_bzx + _bzw // 2, _bzy + _bzh // 2)
                 else:
-                    pass  # column assignment now done via YOLO above
+                    # ── Background subtraction → colonne par mouvement ──────
+                    _diff_h = np.abs(_gray_h.astype(np.float32) - self._rec_bg_live)
+                    _, _th_h = cv2.threshold(
+                        _diff_h.astype(np.uint8), 8, 255, cv2.THRESH_BINARY)
+                    _th_h = cv2.dilate(_th_h, None, iterations=3)
+                    _cnts_h, _ = cv2.findContours(
+                        _th_h, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if _cnts_h:
+                        _c_h = max(_cnts_h, key=cv2.contourArea)
+                        if cv2.contourArea(_c_h) >= 60:
+                            _M_h = cv2.moments(_c_h)
+                            if _M_h["m00"] > 0:
+                                _cx_h   = int(_M_h["m10"] / _M_h["m00"])
+                                _cy_h   = int(_M_h["m01"] / _M_h["m00"])
+                                # Si YOLO a détecté cette frame, affiner le centre
+                                if _yolo_cx_h is not None:
+                                    _cx_h = _yolo_cx_h
+                                    _cy_h = _yolo_cy_h
+                                _col_wh = _half.shape[1] // 7
+                                _col_h  = min(_cx_h // _col_wh, 6)
+                                _off_h  = abs(_cx_h - (_col_h + 0.5) * _col_wh)
+                                if _off_h < self._kf_col_offs[_col_h]:
+                                    self._kf_col_offs[_col_h]    = _off_h
+                                    self._kf_col_frames[_col_h]  = _half.copy()
+                                    self._kf_col_centers[_col_h] = (_cx_h, _cy_h)
                     # Ball impact detection
                     if (not self._ball_moved
                             and any(f is not None for f in self._kf_col_frames)
