@@ -329,10 +329,41 @@ class PutterLive:
             "• macOS: grant camera permission in System Settings → Privacy."
         )
 
+    def _load_video(self, path: str) -> bool:
+        """Switch capture source to a video file. Returns True on success."""
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            print(f"[video] Impossible d'ouvrir : {path}")
+            return False
+
+        self.cap.release()
+        self.cap = cap
+        self.W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self._replay_sub = max(1, round(vid_fps / 60))
+        self._video_mode = True
+        self._video_path = path
+
+        self._zone_rect = (
+            int(PUTTER_ZONE_REL[0] * self.W), int(PUTTER_ZONE_REL[1] * self.H),
+            int(PUTTER_ZONE_REL[2] * self.W), int(PUTTER_ZONE_REL[3] * self.H),
+        )
+        self._ball_zone_rect = (
+            int(BALL_ZONE_REL[0] * self.W), int(BALL_ZONE_REL[1] * self.H),
+            int(BALL_ZONE_REL[2] * self.W), int(BALL_ZONE_REL[3] * self.H),
+        )
+        self._zone_mog2 = cv2.createBackgroundSubtractorMOG2(
+            history=120, varThreshold=36, detectShadows=False)
+        self._zone_pos_hist.clear()
+        self._zone_still_since = None
+
+        cv2.resizeWindow("Putter Live", self.W, self.H + PANEL_H)
+        print(f"[video] chargé : {os.path.basename(path)}  fps={vid_fps:.0f}")
+        return True
+
     def _open_video_file(self) -> None:
-        """Open a file dialog (subprocess) to select a video file and switch to offline mode."""
-        # Run the file dialog in a separate process to avoid conflicts with the
-        # OpenCV event loop (tkinter and OpenCV both use X11 and deadlock otherwise).
+        """Open a file dialog (subprocess) then load the chosen video."""
         _dialog_script = (
             "import tkinter as tk; from tkinter import filedialog; "
             "root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True); "
@@ -351,40 +382,8 @@ class PutterLive:
         except Exception as e:
             print(f"[video] Erreur boîte de dialogue : {e}")
             return
-        if not path:
-            return
-
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            print(f"[video] Impossible d'ouvrir : {path}")
-            return
-
-        # Release previous capture and replace
-        self.cap.release()
-        self.cap = cap
-        self.W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        self._replay_sub = max(1, round(vid_fps / 60))
-        self._video_mode = True
-        self._video_path = path
-
-        # Reset detection zones to match new resolution
-        self._zone_rect = (
-            int(PUTTER_ZONE_REL[0] * self.W), int(PUTTER_ZONE_REL[1] * self.H),
-            int(PUTTER_ZONE_REL[2] * self.W), int(PUTTER_ZONE_REL[3] * self.H),
-        )
-        self._ball_zone_rect = (
-            int(BALL_ZONE_REL[0] * self.W), int(BALL_ZONE_REL[1] * self.H),
-            int(BALL_ZONE_REL[2] * self.W), int(BALL_ZONE_REL[3] * self.H),
-        )
-        self._zone_mog2 = cv2.createBackgroundSubtractorMOG2(
-            history=120, varThreshold=36, detectShadows=False)
-        self._zone_pos_hist.clear()
-        self._zone_still_since = None
-
-        cv2.resizeWindow("Putter Live", self.W, self.H + PANEL_H)
-        print(f"[video] chargé : {os.path.basename(path)}  fps={vid_fps:.0f}")
+        if path:
+            self._load_video(path)
 
     # ── Mouse callback ────────────────────────────────────────────────────────
 
@@ -1858,9 +1857,134 @@ class PutterLive:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Launch menu
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _show_launch_menu() -> Optional[str]:
+    """
+    Show a PyQt6 launch menu with two buttons.
+    Returns:
+      'camera'     → use live camera
+      '<filepath>' → use that video file
+      None         → user closed the window (quit)
+    """
+    from PyQt6.QtWidgets import (
+        QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+        QPushButton, QLabel, QFileDialog, QFrame,
+    )
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QFont, QColor
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    choice: list[Optional[str]] = [None]
+
+    win = QWidget()
+    win.setWindowTitle("PutterTrack Pro")
+    win.setFixedSize(480, 340)
+    win.setStyleSheet("background: #0e0e22;")
+
+    root_layout = QVBoxLayout(win)
+    root_layout.setContentsMargins(40, 36, 40, 36)
+    root_layout.setSpacing(0)
+
+    # ── Title ────────────────────────────────────────────────────────────────
+    title = QLabel("PutterTrack Pro")
+    title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    title.setFont(QFont("Segoe UI", 22, QFont.Weight.Bold))
+    title.setStyleSheet("color: #60c060; background: transparent;")
+    root_layout.addWidget(title)
+
+    sub = QLabel("Choisissez votre mode d'analyse")
+    sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    sub.setStyleSheet("color: #666; font-size: 12px; background: transparent;")
+    root_layout.addWidget(sub)
+
+    root_layout.addSpacing(28)
+
+    # ── Separator ────────────────────────────────────────────────────────────
+    sep = QFrame()
+    sep.setFrameShape(QFrame.Shape.HLine)
+    sep.setStyleSheet("color: #1a1a3a;")
+    root_layout.addWidget(sep)
+
+    root_layout.addSpacing(28)
+
+    # ── Button style ─────────────────────────────────────────────────────────
+    BTN = """
+        QPushButton {
+            background: #14143a;
+            color: #ddd;
+            border: 2px solid #2a2a6a;
+            border-radius: 10px;
+            padding: 18px 12px;
+            font-size: 15px;
+            text-align: left;
+        }
+        QPushButton:hover  { background: #1e1e52; border-color: #5050b0; color: #fff; }
+        QPushButton:pressed{ background: #282870; }
+    """
+
+    # ── Camera button ────────────────────────────────────────────────────────
+    btn_live = QPushButton("  \U0001f4f7   Caméra en direct")
+    btn_live.setStyleSheet(BTN)
+    btn_live.setFixedHeight(70)
+    btn_live.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def _pick_camera():
+        choice[0] = "camera"
+        win.close()
+
+    btn_live.clicked.connect(_pick_camera)
+    root_layout.addWidget(btn_live)
+
+    root_layout.addSpacing(16)
+
+    # ── Import video button ───────────────────────────────────────────────────
+    btn_video = QPushButton("  \U0001f4c1   Importer une vidéo  (hors live)")
+    btn_video.setStyleSheet(BTN)
+    btn_video.setFixedHeight(70)
+    btn_video.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def _pick_video():
+        path, _ = QFileDialog.getOpenFileName(
+            win,
+            "Importer une vidéo",
+            os.path.expanduser("~"),
+            "Fichiers vidéo (*.mp4 *.mov *.avi *.mkv *.m4v);;Tous les fichiers (*.*)",
+        )
+        if path:
+            choice[0] = path
+            win.close()
+
+    btn_video.clicked.connect(_pick_video)
+    root_layout.addWidget(btn_video)
+
+    root_layout.addSpacing(24)
+
+    # ── Quit hint ────────────────────────────────────────────────────────────
+    hint = QLabel("Fermer cette fenêtre pour quitter")
+    hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    hint.setStyleSheet("color: #444; font-size: 10px; background: transparent;")
+    root_layout.addWidget(hint)
+
+    win.show()
+    app.exec()
+
+    return choice[0]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    selection = _show_launch_menu()
+    if selection is None:
+        sys.exit(0)
+
     try:
-        PutterLive().run()
+        pl = PutterLive()
+        if selection != "camera":
+            pl._load_video(selection)
+        pl.run()
     except RuntimeError as e:
         print(f"\n[error] {e}\n")
         sys.exit(1)
