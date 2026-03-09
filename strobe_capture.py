@@ -209,7 +209,7 @@ def make_strobe(kf_frames, W, H, bg_frame=None, head_positions=None):
         sy = H / (H // 2)
         arc_pts = []
         hw = HEAD_BOX_W // 2
-        hh = HEAD_BOX_H // 2
+        hh = int(H * 0.175)  # hauteur complète de la tête : ~35% de H
         for i, pos_h in enumerate(head_positions):
             if pos_h is None or kf_frames[i] is None:
                 continue
@@ -735,6 +735,15 @@ def main():
                                     cy_h if cy_h is not None else half.shape[0] // 2)
                 else:
                     # Cols 1-3 et 5-7 : meilleure frame = tête au centre de la col
+                    # Ne retenir que le mouvement droite→gauche (coup avant).
+                    # Condition : pic vu ET position actuelle déjà en dessous du pic.
+                    moving_forward = (
+                        sw_peaked
+                        and sw_cx_max > 0
+                        and cx_h < sw_cx_max - SWING_PEAK_DELTA
+                    )
+                    if not moving_forward:
+                        continue
                     col_center = (col + 0.5) * cw_h
                     off = abs(cx_h - col_center)
                     if off < kf_offs[col]:

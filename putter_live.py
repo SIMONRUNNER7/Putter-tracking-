@@ -1043,8 +1043,18 @@ class PutterLive:
             self._kf_col_offs[3]    = impact_offs if impact_offs != float('inf') else 0.0
             self._kf_col_centers[3] = impact_center
 
+        # Filtrer : ne garder que les frames du mouvement droite→gauche (coup avant).
+        # On trouve le pic de x (fin du backswing) et on ne retient que
+        # les détections à partir de ce point (x décroissant = forward stroke).
+        if len(detections) >= 2:
+            xs = [cx for cx, cy, f in detections]
+            peak_idx = max(range(len(xs)), key=lambda i: xs[i])
+            forward_detections = detections[peak_idx:]
+        else:
+            forward_detections = detections
+
         # Assign each detection to its static column (closest to column centre)
-        for cx_h, cy_h, frame_h in detections:
+        for cx_h, cy_h, frame_h in forward_detections:
             col = min(cx_h // col_w_h, N - 1)
             if col == 3:
                 continue   # preserve impact col
@@ -1149,7 +1159,7 @@ class PutterLive:
 
         # Taille de boîte par défaut en pixels display
         _DEF_BOX_W = int(self.W / N_COLS * 0.72)
-        _DEF_BOX_H = int(self.H * 0.18)
+        _DEF_BOX_H = int(self.H * 0.35)
 
         if self._strobe_det is None:
             # Priorité : réutiliser les centres YOLO capturés pendant l'enregistrement.
