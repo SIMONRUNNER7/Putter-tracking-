@@ -13,6 +13,7 @@ Controls:
   D      – Toggle debug overlay
   R      – Reset session
   F      – Enter CSRT-ROI selection (click-drag over putter head)
+  V      – Import video file (offline / hors live mode)
   T      – Enter annotation/training mode (from KEYFRAMES view)
   S      – Save annotation (in annotation mode)
   Esc    – Cancel annotation / Quit
@@ -28,6 +29,8 @@ import math
 import os
 import sys
 import time
+import tkinter as tk
+from tkinter import filedialog
 
 try:
     from ultralytics import YOLO as _YOLO
@@ -179,6 +182,8 @@ class PutterLive:
 
     def __init__(self):
         self._replay_sub = 2   # overwritten by _open_camera based on actual fps
+        self._video_mode = False   # True when reading from a file instead of camera
+        self._video_path: Optional[str] = None
         self.cap = self._open_camera()
         self.W   = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.H   = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -324,6 +329,54 @@ class PutterLive:
             "• Make sure no other app is using it.\n"
             "• macOS: grant camera permission in System Settings → Privacy."
         )
+
+    def _open_video_file(self) -> None:
+        """Open a file dialog to select a video file and switch to offline mode."""
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askopenfilename(
+            title="Importer une vidéo",
+            filetypes=[
+                ("Fichiers vidéo", "*.mp4 *.mov *.avi *.mkv *.m4v"),
+                ("Tous les fichiers", "*.*"),
+            ],
+        )
+        root.destroy()
+        if not path:
+            return
+
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            print(f"[video] Impossible d'ouvrir : {path}")
+            return
+
+        # Release previous capture and replace
+        self.cap.release()
+        self.cap = cap
+        self.W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self._replay_sub = max(1, round(vid_fps / 60))
+        self._video_mode = True
+        self._video_path = path
+
+        # Reset detection zones to match new resolution
+        self._zone_rect = (
+            int(PUTTER_ZONE_REL[0] * self.W), int(PUTTER_ZONE_REL[1] * self.H),
+            int(PUTTER_ZONE_REL[2] * self.W), int(PUTTER_ZONE_REL[3] * self.H),
+        )
+        self._ball_zone_rect = (
+            int(BALL_ZONE_REL[0] * self.W), int(BALL_ZONE_REL[1] * self.H),
+            int(BALL_ZONE_REL[2] * self.W), int(BALL_ZONE_REL[3] * self.H),
+        )
+        self._zone_mog2 = cv2.createBackgroundSubtractorMOG2(
+            history=120, varThreshold=36, detectShadows=False)
+        self._zone_pos_hist.clear()
+        self._zone_still_since = None
+
+        cv2.resizeWindow("Putter Live", self.W, self.H + PANEL_H)
+        print(f"[video] chargé : {os.path.basename(path)}  fps={vid_fps:.0f}")
 
     # ── Mouse callback ────────────────────────────────────────────────────────
 
@@ -674,10 +727,15 @@ class PutterLive:
     def _draw_hud(self, frame, fps: float, extra: list = None):
         track_label = {"aruco": "ArUco", "csrt": "CSRT",
                        "zone": "Zone", "none": "None ✗"}.get(self._track_mode, "?")
+        source_label = (
+            f"VIDEO : {os.path.basename(self._video_path)}" if self._video_mode
+            else "SOURCE: Camera"
+        )
         lines = [
             f"STATE : {self.state.value}",
             f"FPS   : {fps:>4.0f}",
             f"TRACK : {track_label}",
+            source_label,
         ]
         if extra:
             lines.extend(extra)
@@ -706,7 +764,7 @@ class PutterLive:
         tips = [
             zone_hint,
             "C = calibrate target   |   F = CSRT ROI   |   M = print markers",
-            "SPACE = lancer compte a rebours",
+            "V = importer video (hors live)   |   SPACE = lancer compte a rebours",
         ]
         for i, t in enumerate(tips):
             sz = cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, 0.47, 1)[0]
@@ -1164,8 +1222,16 @@ class PutterLive:
         while True:
             ret, frame = self.cap.read()
             if not ret:
-                print("[error] Camera read failed.")
-                break
+                if self._video_mode:
+                    # Loop video back to the beginning
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        print("[video] Impossible de relire la vidéo.")
+                        break
+                else:
+                    print("[error] Camera read failed.")
+                    break
             self._last_frame = frame.copy()
 
             now = time.time()
@@ -1774,6 +1840,10 @@ class PutterLive:
 
             elif key in (ord('m'), ord('M')):
                 _save_markers(self._aruco_dict)
+
+            elif key in (ord('v'), ord('V')):
+                if self.state == AppState.READY:
+                    self._open_video_file()
 
         self.cap.release()
         cv2.destroyAllWindows()
