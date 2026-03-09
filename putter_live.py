@@ -29,8 +29,7 @@ import math
 import os
 import sys
 import time
-import tkinter as tk
-from tkinter import filedialog
+import subprocess
 
 try:
     from ultralytics import YOLO as _YOLO
@@ -331,18 +330,27 @@ class PutterLive:
         )
 
     def _open_video_file(self) -> None:
-        """Open a file dialog to select a video file and switch to offline mode."""
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        path = filedialog.askopenfilename(
-            title="Importer une vidéo",
-            filetypes=[
-                ("Fichiers vidéo", "*.mp4 *.mov *.avi *.mkv *.m4v"),
-                ("Tous les fichiers", "*.*"),
-            ],
+        """Open a file dialog (subprocess) to select a video file and switch to offline mode."""
+        # Run the file dialog in a separate process to avoid conflicts with the
+        # OpenCV event loop (tkinter and OpenCV both use X11 and deadlock otherwise).
+        _dialog_script = (
+            "import tkinter as tk; from tkinter import filedialog; "
+            "root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True); "
+            "p = filedialog.askopenfilename("
+            "    title='Importer une video',"
+            "    filetypes=[('Fichiers video', '*.mp4 *.mov *.avi *.mkv *.m4v'),"
+            "               ('Tous les fichiers', '*.*')]);"
+            "root.destroy(); print(p)"
         )
-        root.destroy()
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", _dialog_script],
+                capture_output=True, text=True, timeout=120,
+            )
+            path = result.stdout.strip()
+        except Exception as e:
+            print(f"[video] Erreur boîte de dialogue : {e}")
+            return
         if not path:
             return
 
