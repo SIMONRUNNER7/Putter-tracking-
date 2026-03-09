@@ -92,18 +92,24 @@ def detect_ball(frame: np.ndarray,
     circles = cv2.HoughCircles(
         blurred, cv2.HOUGH_GRADIENT,
         dp=1.2, minDist=20,
-        param1=50, param2=20,
-        minRadius=4, maxRadius=35,
+        param1=50, param2=15,
+        minRadius=4, maxRadius=50,
     )
     if circles is None:
         return None
 
     circles = np.uint16(np.around(circles[0]))
+    best_ball = None
+    best_brightness = 0
     for cx, cy, r in circles:
         mask = np.zeros(gray.shape, np.uint8)
         cv2.circle(mask, (int(cx), int(cy)), int(r), 255, -1)
-        if cv2.mean(gray, mask=mask)[0] > 155:
-            return (int(cx) + off_x, int(cy) + off_y, int(r))
+        brightness = cv2.mean(gray, mask=mask)[0]
+        if brightness > 130 and brightness > best_brightness:
+            best_brightness = brightness
+            best_ball = (int(cx) + off_x, int(cy) + off_y, int(r))
+    if best_ball:
+        return best_ball
     return None
 
 
@@ -240,22 +246,36 @@ def create_strobe(keyframes: List[np.ndarray],
         # ── Détection tête putter ─────────────────────────────────────────
         det = detector.detect(frame, i)
 
-        if det.bbox is not None and det.confidence > 0.05:
-            x1, y1, x2, y2 = [int(v) for v in det.bbox]
-            x1c = max(0, x1); y1c = max(0, y1)
-            x2c = min(w, x2); y2c = min(h, y2)
+        if det.confidence > 0.05:
+            cx, cy = int(det.head_x), int(det.head_y)
+
+            # Determine box size: use bbox if available but enforce minimum,
+            # always center the box on the detected head position
+            if det.bbox is not None:
+                x1b, y1b, x2b, y2b = det.bbox
+                raw_w = max(int(x2b - x1b), 90)
+                raw_h = max(int(y2b - y1b), 60)
+            else:
+                raw_w, raw_h = 90, 60   # default size when no bbox
+
+            half_w, half_h = raw_w // 2, raw_h // 2
+            x1c = max(0, cx - half_w)
+            y1c = max(0, cy - half_h)
+            x2c = min(w, cx + half_w)
+            y2c = min(h, cy + half_h)
 
             if x2c > x1c and y2c > y1c:
-                # Coller le crop à sa position réelle
+                # Coller le crop centré sur la tête
                 crop = frame[y1c:y2c, x1c:x2c]
                 bg[y1c:y2c, x1c:x2c] = crop
 
-                # Rectangle bleu
+                # Rectangle blanc centré
                 cv2.rectangle(bg, (x1c, y1c), (x2c, y2c),
-                              C_BLUE_BOX, 2, cv2.LINE_AA)
+                              C_WHITE, 2, cv2.LINE_AA)
 
-                cx = (x1c + x2c) // 2
-                cy = (y1c + y2c) // 2
+                # Point central
+                cv2.circle(bg, (cx, cy), 4, C_BLUE_BOX, -1, cv2.LINE_AA)
+
                 putter_centers.append((cx, cy))
 
                 # Ligne shaft (rouge) : bas du rectangle → point grip
@@ -263,15 +283,14 @@ def create_strobe(keyframes: List[np.ndarray],
                 cv2.line(bg, shaft_start, (grip_x, grip_y),
                          C_SHAFT, 2, cv2.LINE_AA)
 
-        elif det.confidence > 0.05:
-            cx, cy = int(det.head_x), int(det.head_y)
-            putter_centers.append((cx, cy))
-
         # ── Détection balle ───────────────────────────────────────────────
         ball = detect_ball(frame)
         if ball:
             bx, by, br = ball
-            cv2.circle(bg, (bx, by), br + 4, C_GREEN_LN, 2, cv2.LINE_AA)
+            draw_r = max(br, 14)
+            cv2.circle(bg, (bx, by), draw_r + 5, C_GREEN_LN, 2, cv2.LINE_AA)
+            cv2.circle(bg, (bx, by), draw_r + 5, C_GREEN_LN, 1, cv2.LINE_AA)
+            cv2.circle(bg, (bx, by), 4, C_GREEN_LN, -1, cv2.LINE_AA)
             ball_centers.append((bx, by))
 
     # ── Arc club (bleu-cyan) ──────────────────────────────────────────────
