@@ -995,18 +995,30 @@ class PutterLive:
         out[:self.H] = cv2.resize(composite, (self.W, self.H))
         out[self.H:] = (out[self.H:].astype(np.int32) * 55 // 100).astype(np.uint8)
 
-        # ── 2. YOLO: détection de toutes les têtes sur l'image composite ─────
-        # On tourne YOLO directement sur l'image assemblée (résolution display) —
-        # toutes les têtes sont visibles d'un coup, plus de problème de frame/colonne.
-        if self._strobe_det is None:
-            self._strobe_det = self._run_yolo_strobe(out[:self.H].copy())
-
+        # ── 2. Détection des têtes ─────────────────────────────────────────
         col_w_disp = self.W  // N_COLS
         centers_disp: list = [None] * N_COLS
 
         # Taille de boîte par défaut en pixels display
         _DEF_BOX_W = int(self.W / N_COLS * 0.72)
         _DEF_BOX_H = int(self.H * 0.20)
+
+        if self._strobe_det is None:
+            # Priorité : réutiliser les centres YOLO capturés pendant l'enregistrement
+            # (coordonnées half-res → display ×2).  Ces détections sont fiables car
+            # YOLO tournait sur des frames individuelles de bonne qualité.
+            det_from_rec = [None] * N_COLS
+            for _ci, _ctr in enumerate(self._kf_col_centers):
+                if _ctr is not None:
+                    det_from_rec[_ci] = (
+                        int(_ctr[0] * 2), int(_ctr[1] * 2),
+                        float(_DEF_BOX_W), float(_DEF_BOX_H), 0.0,
+                    )
+            if any(d is not None for d in det_from_rec):
+                self._strobe_det = det_from_rec
+            else:
+                # Fallback : YOLO sur l'image composite assemblée
+                self._strobe_det = self._run_yolo_strobe(out[:self.H].copy())
 
         for i, box in enumerate(self._strobe_det):
             if box is None:
