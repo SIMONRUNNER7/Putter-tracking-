@@ -1176,27 +1176,30 @@ class PutterLive:
         composite  = (frames[0].copy() if frames
                       else np.zeros((sf_h, sf_w, 3), dtype=np.uint8))
 
-        # Dynamic column bounds (half-res coords), or None → fallback to uniform
+        # Dynamic column bounds available (used for assignment, not for display scaling)
         dyn_b = self._dyn_col_bounds_half
 
         for i, kf in enumerate(src_cols[:N_COLS]):
             if kf is None:
                 continue
-            if dyn_b is not None:
-                # Extract the actual stroke-range slice and stretch to column slot
-                src_x0 = max(0, int(round(dyn_b[i])))
-                src_x1 = min(sf_w, int(round(dyn_b[i + 1])))
-                if src_x0 >= src_x1:
-                    src_x0 = max(0, int(dyn_b[i]))
-                    src_x1 = min(sf_w, src_x0 + max(1, int(dyn_b[i + 1] - dyn_b[i])))
-                dst_x0 = i * col_w_src
-                dst_x1 = sf_w if i == N_COLS - 1 else dst_x0 + col_w_src
-                composite[:, dst_x0:dst_x1] = cv2.resize(
-                    kf[:, src_x0:src_x1], (dst_x1 - dst_x0, sf_h))
+            # Source slice centered on the detected putter position – NO resize/deformation.
+            # The slice is the same width as the display column (col_w_src in half-res).
+            if self._kf_col_centers[i] is not None:
+                cx_src = int(self._kf_col_centers[i][0])
+            elif dyn_b is not None:
+                cx_src = int((dyn_b[i] + dyn_b[i + 1]) / 2.0)
             else:
-                x0 = i * col_w_src
-                x1 = sf_w if i == N_COLS - 1 else x0 + col_w_src
-                composite[:, x0:x1] = kf[:, x0:x1]
+                cx_src = int((i + 0.5) * col_w_src)
+            half_w = col_w_src // 2
+            src_x0 = max(0, cx_src - half_w)
+            src_x1 = src_x0 + col_w_src
+            if src_x1 > sf_w:
+                src_x1 = sf_w
+                src_x0 = max(0, sf_w - col_w_src)
+            dst_x0 = i * col_w_src
+            dst_x1 = sf_w if i == N_COLS - 1 else dst_x0 + col_w_src
+            # Direct copy – slice width equals column width, no stretching
+            composite[:, dst_x0:dst_x1] = kf[:, src_x0:src_x1]
 
         out[:self.H] = cv2.resize(composite, (self.W, self.H))
         out[self.H:] = (out[self.H:].astype(np.int32) * 55 // 100).astype(np.uint8)
@@ -1211,27 +1214,14 @@ class PutterLive:
 
         if self._strobe_det is None:
             # Priorité : réutiliser les centres YOLO capturés pendant l'enregistrement.
-            # Avec colonnes dynamiques, mapper half-res x via le remap de colonne.
+            # Comme le putter est centré dans sa colonne (pas d'étirement), le centre
+            # display est toujours le milieu de la colonne d'affichage.
             det_from_rec = [None] * N_COLS
             for _ci, _ctr in enumerate(self._kf_col_centers):
                 if _ctr is not None:
-                    if dyn_b is not None:
-                        # Map half-res x through dynamic-slice → display coordinates
-                        _src_x0_h = max(0.0, dyn_b[_ci])
-                        _src_x1_h = min(float(sf_w), dyn_b[_ci + 1])
-                        _col_range_h = _src_x1_h - _src_x0_h
-                        if _col_range_h > 0:
-                            _frac = (_ctr[0] - _src_x0_h) / _col_range_h
-                            _disp_x0_c = _ci * col_w_disp
-                            _disp_x1_c = (col_w_disp * (_ci + 1)
-                                          if _ci < N_COLS - 1 else self.W)
-                            _dcx = int(_disp_x0_c + _frac * (_disp_x1_c - _disp_x0_c))
-                        else:
-                            _dcx = _ci * col_w_disp + col_w_disp // 2
-                        _dcy = int(_ctr[1] * self.H / sf_h)
-                    else:
-                        _dcx = int(_ctr[0] * 2)
-                        _dcy = int(_ctr[1] * 2)
+                    # Putter toujours centré dans sa colonne display
+                    _dcx = _ci * col_w_disp + col_w_disp // 2
+                    _dcy = int(_ctr[1] * self.H / sf_h)
                     det_from_rec[_ci] = (
                         _dcx, _dcy,
                         float(_DEF_BOX_W), float(_DEF_BOX_H), 0.0,
@@ -1971,21 +1961,23 @@ class PutterLive:
                               and self._strobe_indices[i] < len(self._rep_frames)):
                             src_f = self._rep_frames[self._strobe_indices[i]]
                         if src_f is not None:
-                            _dyn_b2 = self._dyn_col_bounds_half
-                            if _dyn_b2 is not None:
-                                _sx0 = max(0, int(round(_dyn_b2[i])))
-                                _sx1 = min(sf_w2, int(round(_dyn_b2[i + 1])))
-                                _dx0 = i * cw_src
-                                _dx1 = sf_w2 if i == N_COLS - 1 else _dx0 + cw_src
-                                if _sx0 < _sx1:
-                                    composite2[:, _dx0:_dx1] = cv2.resize(
-                                        src_f[:, _sx0:_sx1], (_dx1 - _dx0, sf_h2))
-                                else:
-                                    composite2[:, _dx0:_dx1] = src_f[:, _dx0:_dx1]
+                            # Slice centré sur la position putter – pas de déformation
+                            if self._kf_col_centers[i] is not None:
+                                _cx_s = int(self._kf_col_centers[i][0])
+                            elif self._dyn_col_bounds_half is not None:
+                                _db = self._dyn_col_bounds_half
+                                _cx_s = int((_db[i] + _db[i + 1]) / 2.0)
                             else:
-                                x0 = i * cw_src
-                                x1 = sf_w2 if i == N_COLS - 1 else x0 + cw_src
-                                composite2[:, x0:x1] = src_f[:, x0:x1]
+                                _cx_s = int((i + 0.5) * cw_src)
+                            _hw2  = cw_src // 2
+                            _sx0  = max(0, _cx_s - _hw2)
+                            _sx1  = _sx0 + cw_src
+                            if _sx1 > sf_w2:
+                                _sx1 = sf_w2
+                                _sx0 = max(0, sf_w2 - cw_src)
+                            _dx0 = i * cw_src
+                            _dx1 = sf_w2 if i == N_COLS - 1 else _dx0 + cw_src
+                            composite2[:, _dx0:_dx1] = src_f[:, _sx0:_sx1]
 
                     frame = np.zeros((self.H + PANEL_H, self.W, 3), dtype=np.uint8)
                     frame[:vid_h] = cv2.resize(composite2, (self.W, vid_h))
