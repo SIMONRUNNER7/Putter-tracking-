@@ -704,7 +704,7 @@ class PutterLive:
         tips = [
             zone_hint,
             "C = calibrate target   |   F = CSRT ROI   |   M = print markers",
-            "SPACE = start manually",
+            "SPACE = lancer compte a rebours",
         ]
         for i, t in enumerate(tips):
             sz = cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, 0.47, 1)[0]
@@ -804,7 +804,7 @@ class PutterLive:
                   (self.W - sz[0] - 14, y0 + 55),
                   scale=0.72, color=arc_clr, thick=2)
 
-        self._put(frame, "SPACE: new shot   R: reset   Q: quit",
+        self._put(frame, "SPACE: start countdown   R: reset   Q: quit",
                   (14, self.H - 7), scale=0.38, color=C["gray"])
 
     def _draw_sel_rect(self, frame):
@@ -1181,7 +1181,7 @@ class PutterLive:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.52, GOLD, 1, cv2.LINE_AA)
 
         # ── 10. Bottom hint ────────────────────────────────────────────────
-        hint = "L: retour live   SPACE: nouveau coup   T: annoter   Q: quitter"
+        hint = "L: retour live   SPACE: repositionner + nouveau coup   T: annoter   Q: quitter"
         (hw, _), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.36, 1)
         cv2.putText(out, hint, (self.W - hw - 8, self.H + PANEL_H - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.36, (100, 100, 100), 1, cv2.LINE_AA)
@@ -1651,9 +1651,31 @@ class PutterLive:
                 break
 
             elif key == ord(' '):
-                if self.state in (AppState.READY, AppState.REPLAY, AppState.KEYFRAMES):
+                if self.state == AppState.READY:
+                    # READY → démarrer le compte à rebours
                     self.state     = AppState.COUNTDOWN
                     self._cd_start = now
+                elif self.state in (AppState.REPLAY, AppState.KEYFRAMES):
+                    # Après un coup : revenir en READY pour repositionner
+                    self.state          = AppState.READY
+                    self.records        = []
+                    self._rep_frames    = []
+                    self._rep_positions = []
+                    self.result         = None
+                    self._pos_buf.clear()
+                    self._ang_buf.clear()
+                    self._kf_init        = False
+                    self._strobe_indices = []
+                    self._strobe_det     = None
+                    self._kf_col_frames   = [None] * 7
+                    self._kf_col_offs     = [float('inf')] * 7
+                    self._kf_col_centers  = [None] * 7
+                    self._rec_bg_live     = None
+                    self._ball_roi_ref    = None
+                    self._ball_moved      = False
+                    self._half_buf.clear()
+                    self._ball_init_pos  = None
+                    print("[reset] READY – repositionnez balle et putter, puis SPACE pour démarrer")
 
             elif key in (ord('z'), ord('Z')):
                 if self.state == AppState.READY:
