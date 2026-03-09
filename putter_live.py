@@ -1182,23 +1182,23 @@ class PutterLive:
         for i, kf in enumerate(src_cols[:N_COLS]):
             if kf is None:
                 continue
-            # Source slice centered on the detected putter position – NO resize/deformation.
-            # The slice is the same width as the display column (col_w_src in half-res).
+            # Destination column bounds in composite (half-res)
+            dst_x0   = i * col_w_src
+            dst_x1   = sf_w if i == N_COLS - 1 else dst_x0 + col_w_src
+            dst_col_w = dst_x1 - dst_x0   # actual width (last col may differ by 1-6 px)
+            # Source slice centered on the detected putter – same width as destination.
+            # No resize → no deformation.
             if self._kf_col_centers[i] is not None:
                 cx_src = int(self._kf_col_centers[i][0])
             elif dyn_b is not None:
                 cx_src = int((dyn_b[i] + dyn_b[i + 1]) / 2.0)
             else:
                 cx_src = int((i + 0.5) * col_w_src)
-            half_w = col_w_src // 2
-            src_x0 = max(0, cx_src - half_w)
-            src_x1 = src_x0 + col_w_src
+            src_x0 = max(0, cx_src - dst_col_w // 2)
+            src_x1 = src_x0 + dst_col_w
             if src_x1 > sf_w:
                 src_x1 = sf_w
-                src_x0 = max(0, sf_w - col_w_src)
-            dst_x0 = i * col_w_src
-            dst_x1 = sf_w if i == N_COLS - 1 else dst_x0 + col_w_src
-            # Direct copy – slice width equals column width, no stretching
+                src_x0 = max(0, sf_w - dst_col_w)
             composite[:, dst_x0:dst_x1] = kf[:, src_x0:src_x1]
 
         out[:self.H] = cv2.resize(composite, (self.W, self.H))
@@ -1962,6 +1962,9 @@ class PutterLive:
                             src_f = self._rep_frames[self._strobe_indices[i]]
                         if src_f is not None:
                             # Slice centré sur la position putter – pas de déformation
+                            _dx0 = i * cw_src
+                            _dx1 = sf_w2 if i == N_COLS - 1 else _dx0 + cw_src
+                            _dcw = _dx1 - _dx0   # largeur réelle (dernière col peut différer)
                             if self._kf_col_centers[i] is not None:
                                 _cx_s = int(self._kf_col_centers[i][0])
                             elif self._dyn_col_bounds_half is not None:
@@ -1969,14 +1972,11 @@ class PutterLive:
                                 _cx_s = int((_db[i] + _db[i + 1]) / 2.0)
                             else:
                                 _cx_s = int((i + 0.5) * cw_src)
-                            _hw2  = cw_src // 2
-                            _sx0  = max(0, _cx_s - _hw2)
-                            _sx1  = _sx0 + cw_src
+                            _sx0 = max(0, _cx_s - _dcw // 2)
+                            _sx1 = _sx0 + _dcw
                             if _sx1 > sf_w2:
                                 _sx1 = sf_w2
-                                _sx0 = max(0, sf_w2 - cw_src)
-                            _dx0 = i * cw_src
-                            _dx1 = sf_w2 if i == N_COLS - 1 else _dx0 + cw_src
+                                _sx0 = max(0, sf_w2 - _dcw)
                             composite2[:, _dx0:_dx1] = src_f[:, _sx0:_sx1]
 
                     frame = np.zeros((self.H + PANEL_H, self.W, 3), dtype=np.uint8)
