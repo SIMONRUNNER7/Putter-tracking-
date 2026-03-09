@@ -1160,28 +1160,90 @@ class PutterLive:
                 result[i] = (expected_x, int(py + t * (ny - py)))
             return result
 
-        def _spline_through(pts_list, n_fine=500):
-            """Cubic spline in column order (enforces single left→right direction)."""
+        def _normalize_x(pts, col_w):
+            """Rescale x-coordinates so the leftmost point → col1 centre,
+            rightmost point → col7 centre.  Y-coordinates are unchanged."""
+            valid_xs = [p[0] for p in pts if p is not None]
+            if len(valid_xs) < 2:
+                return pts
+            x_min, x_max = min(valid_xs), max(valid_xs)
+            if x_max <= x_min:
+                return pts
+            col1_cx = 0.5 * col_w         # col 1 centre  (0-indexed col 0)
+            col7_cx = 6.5 * col_w         # col 7 centre  (0-indexed col 6)
+            result = []
+            for p in pts:
+                if p is None:
+                    result.append(None)
+                else:
+                    new_x = col1_cx + (p[0] - x_min) / (x_max - x_min) * (col7_cx - col1_cx)
+                    result.append((int(round(new_x)), p[1]))
+            return result
+
+        def _spline_through(pts_list, n_fine=500, col_w=None):
+            """Cubic spline with horizontal tangents (dy/dt = 0) at both extremes
+            and at the impact column (col 4, 0-indexed col 3).
+
+            The arc is split into two segments at the impact point so that:
+              • backswing extreme  → horizontal tangent (arc is "taut" to the left)
+              • col-4 impact point → horizontal tangent (arc tangent to baseline)
+              • follow-through extreme → horizontal tangent (arc is "taut" to the right)
+            """
             valid = [(i, p) for i, p in enumerate(pts_list) if p is not None]
             if len(valid) < 2:
                 return None
-            t_k = np.linspace(0.0, 1.0, len(valid))
             xs = np.array([p[0] for _, p in valid], float)
             ys = np.array([p[1] for _, p in valid], float)
             # Enforce strictly increasing x so the arc never reverses direction
             for j in range(1, len(xs)):
                 if xs[j] <= xs[j - 1]:
                     xs[j] = xs[j - 1] + 1.0
+
+            n = len(xs)
+
+            # Find impact split point (x closest to col-4 centre = 3.5 * col_w)
+            imp_idx = None
+            if col_w is not None and n >= 3:
+                imp_x = 3.5 * col_w
+                imp_idx = int(np.argmin(np.abs(xs - imp_x)))
+                if imp_idx == 0 or imp_idx == n - 1:
+                    imp_idx = None   # degenerate – fall back to single segment
+
+            if imp_idx is None:
+                # Single segment: clamp y-derivative to 0 at both endpoints
+                t_k = np.linspace(0.0, 1.0, n)
+                try:
+                    cs_x = CubicSpline(t_k, xs)
+                    cs_y = CubicSpline(t_k, ys, bc_type=((1, 0.0), (1, 0.0)))
+                except Exception:
+                    return None
+                t_f = np.linspace(0.0, 1.0, n_fine)
+                return np.stack([cs_x(t_f), cs_y(t_f)], axis=1).astype(np.int32).reshape(-1, 1, 2)
+
+            # Two segments: left (0..imp_idx) and right (imp_idx..n-1)
+            xs_L, ys_L = xs[:imp_idx + 1], ys[:imp_idx + 1]
+            xs_R, ys_R = xs[imp_idx:],     ys[imp_idx:]
+            t_L = np.linspace(0.0, 1.0, len(xs_L))
+            t_R = np.linspace(0.0, 1.0, len(xs_R))
+            n_L = n_fine // 2
+            n_R = n_fine - n_L
             try:
-                cs_x = CubicSpline(t_k, xs)
-                cs_y = CubicSpline(t_k, ys)
+                cs_xL = CubicSpline(t_L, xs_L)
+                cs_yL = CubicSpline(t_L, ys_L, bc_type=((1, 0.0), (1, 0.0)))
+                cs_xR = CubicSpline(t_R, xs_R)
+                cs_yR = CubicSpline(t_R, ys_R, bc_type=((1, 0.0), (1, 0.0)))
             except Exception:
                 return None
-            t_f = np.linspace(0.0, 1.0, n_fine)
-            return np.stack([cs_x(t_f), cs_y(t_f)], axis=1).astype(np.int32).reshape(-1, 1, 2)
+            t_fL = np.linspace(0.0, 1.0, n_L)
+            t_fR = np.linspace(0.0, 1.0, n_R)
+            pts_L = np.stack([cs_xL(t_fL), cs_yL(t_fL)], axis=1)
+            pts_R = np.stack([cs_xR(t_fR), cs_yR(t_fR)], axis=1)
+            all_pts = np.vstack([pts_L, pts_R[1:]])   # skip duplicate junction point
+            return all_pts.astype(np.int32).reshape(-1, 1, 2)
 
-        centers_filled = _fill_col_gaps(centers_disp, N_COLS, col_w_disp)
-        smooth = _spline_through(centers_filled)
+        centers_filled   = _fill_col_gaps(centers_disp, N_COLS, col_w_disp)
+        centers_filled   = _normalize_x(centers_filled, col_w_disp)
+        smooth = _spline_through(centers_filled, col_w=col_w_disp)
         if smooth is not None:
             self._draw_tapered_arc(out, smooth,
                                    shadow_color=(0, 0, 50),
