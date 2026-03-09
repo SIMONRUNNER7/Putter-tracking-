@@ -1008,67 +1008,31 @@ class PutterLive:
     # ── Dynamic column computation ────────────────────────────────────────────
 
     def _compute_dynamic_columns(self) -> None:
-        """Compute dynamic column boundaries from the actual stroke range,
-        then assign the best half-res keyframe to each of the 7 columns.
+        """Assign the best half-res keyframe to each of the 7 static columns.
 
-        Column layout (0-indexed):
-          Col 0-2 : backswing  (left of address, 3 equal slices)
-          Col 3   : address/impact (centred on ball zone)
-          Col 4-6 : follow-through (right of address, 3 equal slices)
-
-        Col 3 is preserved from ball-impact detection done during RECORDING.
+        Uses uniform static column boundaries (sf_w // 7 wide each) so that
+        the putter, which appears at cx_h*2 in the display, is always near the
+        center of its display column.  Col 3 (impact) is preserved from
+        ball-moved detection done during RECORDING.
         """
         N = 7
         detections = self._all_live_detections   # [(cx_h, cy_h, frame), ...]
         if not detections:
             return
 
+        sf_w = detections[0][2].shape[1]   # half-res frame width (e.g. 640)
+        col_w_h = sf_w // N                # static column width in half-res
+
         # Preserve the impact frame set during RECORDING (ball-moved detection)
         impact_frame  = self._kf_col_frames[3]
         impact_center = self._kf_col_centers[3]
         impact_offs   = self._kf_col_offs[3]
 
-        # Address x (half-res) – prefer ball zone centre as stable reference
-        if self._ball_zone_rect is not None:
-            _bzx, _bzy, _bzw, _bzh = self._ball_zone_rect
-            x_addr_h = float(_bzx + _bzw // 2) / 2.0   # full-res → half-res
-        elif self._address_x_half is not None:
-            x_addr_h = self._address_x_half
-        else:
-            x_addr_h = float(detections[0][0])
-
-        xs          = [d[0] for d in detections]
-        x_min_h     = min(xs)
-        x_max_h     = max(xs)
-        left_range  = max(x_addr_h - x_min_h, 30.0)
-        right_range = max(x_max_h - x_addr_h, 30.0)
-
-        # Skip if stroke range is too small to be meaningful
-        if left_range + right_range < 60:
-            return
-
-        lcw = left_range  / 3.0    # backswing column width (half-res px)
-        rcw = right_range / 3.0    # follow-through column width
-        acw = (lcw + rcw) / 2.0    # address column width
-
-        # 8 boundaries for 7 columns:
-        # Col i occupies [b[i], b[i+1]]
-        b    = [0.0] * 8
-        b[3] = x_addr_h - acw / 2.0   # left edge of address col
-        b[4] = x_addr_h + acw / 2.0   # right edge of address col
-        b[2] = b[3] - lcw
-        b[1] = b[2] - lcw
-        b[0] = b[1] - lcw
-        b[5] = b[4] + rcw
-        b[6] = b[5] + rcw
-        b[7] = b[6] + rcw
-
-        self._dyn_col_bounds_half = b
-
         # Reset column data
         self._kf_col_frames  = [None] * N
         self._kf_col_offs    = [float('inf')] * N
         self._kf_col_centers = [None] * N
+        self._dyn_col_bounds_half = None   # static mode – no dynamic bounds
 
         # Restore impact frame for col 3
         if impact_frame is not None:
@@ -1076,32 +1040,17 @@ class PutterLive:
             self._kf_col_offs[3]    = impact_offs if impact_offs != float('inf') else 0.0
             self._kf_col_centers[3] = impact_center
 
-        # Assign each detection to its dynamic column
+        # Assign each detection to its static column (closest to column centre)
         for cx_h, cy_h, frame_h in detections:
-            assigned = False
-            for col in range(N):
-                if b[col] <= cx_h < b[col + 1]:
-                    if col == 3:
-                        assigned = True
-                        break   # preserve impact col
-                    col_cx = (b[col] + b[col + 1]) / 2.0
-                    offset  = abs(cx_h - col_cx)
-                    if offset < self._kf_col_offs[col]:
-                        self._kf_col_offs[col]    = offset
-                        self._kf_col_frames[col]  = frame_h
-                        self._kf_col_centers[col] = (cx_h, cy_h)
-                    assigned = True
-                    break
-            if not assigned:
-                # Outside [b[0], b[7]] – clamp to col 0 or col 6
-                col = 0 if cx_h < b[0] else N - 1
-                if col != 3:
-                    col_cx = (b[col] + b[col + 1]) / 2.0
-                    offset  = abs(cx_h - col_cx)
-                    if offset < self._kf_col_offs[col]:
-                        self._kf_col_offs[col]    = offset
-                        self._kf_col_frames[col]  = frame_h
-                        self._kf_col_centers[col] = (cx_h, cy_h)
+            col = min(cx_h // col_w_h, N - 1)
+            if col == 3:
+                continue   # preserve impact col
+            col_center = (col + 0.5) * col_w_h
+            offset = abs(cx_h - col_center)
+            if offset < self._kf_col_offs[col]:
+                self._kf_col_offs[col]    = offset
+                self._kf_col_frames[col]  = frame_h
+                self._kf_col_centers[col] = (cx_h, cy_h)
 
     # ── Strobe composite ──────────────────────────────────────────────────────
 
@@ -1182,24 +1131,11 @@ class PutterLive:
         for i, kf in enumerate(src_cols[:N_COLS]):
             if kf is None:
                 continue
-            # Destination column bounds in composite (half-res)
-            dst_x0   = i * col_w_src
-            dst_x1   = sf_w if i == N_COLS - 1 else dst_x0 + col_w_src
-            dst_col_w = dst_x1 - dst_x0   # actual width (last col may differ by 1-6 px)
-            # Source slice centered on the detected putter – same width as destination.
-            # No resize → no deformation.
-            if self._kf_col_centers[i] is not None:
-                cx_src = int(self._kf_col_centers[i][0])
-            elif dyn_b is not None:
-                cx_src = int((dyn_b[i] + dyn_b[i + 1]) / 2.0)
-            else:
-                cx_src = int((i + 0.5) * col_w_src)
-            src_x0 = max(0, cx_src - dst_col_w // 2)
-            src_x1 = src_x0 + dst_col_w
-            if src_x1 > sf_w:
-                src_x1 = sf_w
-                src_x0 = max(0, sf_w - dst_col_w)
-            composite[:, dst_x0:dst_x1] = kf[:, src_x0:src_x1]
+            # Static column crop: each column shows its corresponding x-range
+            # of the keyframe – no overlap, no background repetition.
+            x0 = i * col_w_src
+            x1 = sf_w if i == N_COLS - 1 else x0 + col_w_src
+            composite[:, x0:x1] = kf[:, x0:x1]
 
         out[:self.H] = cv2.resize(composite, (self.W, self.H))
         out[self.H:] = (out[self.H:].astype(np.int32) * 55 // 100).astype(np.uint8)
@@ -1214,13 +1150,12 @@ class PutterLive:
 
         if self._strobe_det is None:
             # Priorité : réutiliser les centres YOLO capturés pendant l'enregistrement.
-            # Comme le putter est centré dans sa colonne (pas d'étirement), le centre
-            # display est toujours le milieu de la colonne d'affichage.
+            # Avec le crop statique, cx_h * (W/sf_w) donne la position réelle du putter
+            # dans l'image display – on centre le rectangle sur cette position exacte.
             det_from_rec = [None] * N_COLS
             for _ci, _ctr in enumerate(self._kf_col_centers):
                 if _ctr is not None:
-                    # Putter toujours centré dans sa colonne display
-                    _dcx = _ci * col_w_disp + col_w_disp // 2
+                    _dcx = int(_ctr[0] * self.W / sf_w)   # position réelle dans display
                     _dcy = int(_ctr[1] * self.H / sf_h)
                     det_from_rec[_ci] = (
                         _dcx, _dcy,
@@ -1961,23 +1896,10 @@ class PutterLive:
                               and self._strobe_indices[i] < len(self._rep_frames)):
                             src_f = self._rep_frames[self._strobe_indices[i]]
                         if src_f is not None:
-                            # Slice centré sur la position putter – pas de déformation
+                            # Static column crop – même approche que le composite final
                             _dx0 = i * cw_src
                             _dx1 = sf_w2 if i == N_COLS - 1 else _dx0 + cw_src
-                            _dcw = _dx1 - _dx0   # largeur réelle (dernière col peut différer)
-                            if self._kf_col_centers[i] is not None:
-                                _cx_s = int(self._kf_col_centers[i][0])
-                            elif self._dyn_col_bounds_half is not None:
-                                _db = self._dyn_col_bounds_half
-                                _cx_s = int((_db[i] + _db[i + 1]) / 2.0)
-                            else:
-                                _cx_s = int((i + 0.5) * cw_src)
-                            _sx0 = max(0, _cx_s - _dcw // 2)
-                            _sx1 = _sx0 + _dcw
-                            if _sx1 > sf_w2:
-                                _sx1 = sf_w2
-                                _sx0 = max(0, sf_w2 - _dcw)
-                            composite2[:, _dx0:_dx1] = src_f[:, _sx0:_sx1]
+                            composite2[:, _dx0:_dx1] = src_f[:, _dx0:_dx1]
 
                     frame = np.zeros((self.H + PANEL_H, self.W, 3), dtype=np.uint8)
                     frame[:vid_h] = cv2.resize(composite2, (self.W, vid_h))
