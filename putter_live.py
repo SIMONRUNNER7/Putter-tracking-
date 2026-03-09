@@ -1047,11 +1047,24 @@ class PutterLive:
         # On trouve le pic de x (fin du backswing) et on ne retient que
         # les détections à partir de ce point (x décroissant = forward stroke).
         if len(detections) >= 2:
-            xs = [cx for cx, cy, f in detections]
+            xs = [d[0] for d in detections]
             peak_idx = max(range(len(xs)), key=lambda i: xs[i])
             forward_detections = detections[peak_idx:]
         else:
             forward_detections = detections
+
+        # Calculer l'angle de rotation des cadres à partir de la direction du coup.
+        # L'axe "face" est perpendiculaire au chemin → le cadre doit être orienté
+        # selon la pente du chemin (pour que la grande dimension soit ⊥ au déplacement).
+        box_angle = 0.0
+        if len(forward_detections) >= 2:
+            first_x, first_y = forward_detections[0][0], forward_detections[0][1]
+            last_x,  last_y  = forward_detections[-1][0], forward_detections[-1][1]
+            path_deg = math.degrees(math.atan2(last_y - first_y, last_x - first_x))
+            # Normaliser à -90..90 : rotation du cadre portrait par rapport à la vertical
+            box_angle = path_deg % 180
+            if box_angle > 90:
+                box_angle -= 180
 
         # Assign each detection to its static column (closest to column centre)
         for cx_h, cy_h, frame_h in forward_detections:
@@ -1063,7 +1076,7 @@ class PutterLive:
             if offset < self._kf_col_offs[col]:
                 self._kf_col_offs[col]    = offset
                 self._kf_col_frames[col]  = frame_h
-                self._kf_col_centers[col] = (cx_h, cy_h)
+                self._kf_col_centers[col] = (cx_h, cy_h, box_angle)
 
     # ── Strobe composite ──────────────────────────────────────────────────────
 
@@ -1170,9 +1183,10 @@ class PutterLive:
                 if _ctr is not None:
                     _dcx = int(_ctr[0] * self.W / sf_w)   # position réelle dans display
                     _dcy = int(_ctr[1] * self.H / sf_h)
+                    _ang = float(_ctr[2]) if len(_ctr) > 2 else 0.0
                     det_from_rec[_ci] = (
                         _dcx, _dcy,
-                        float(_DEF_BOX_W), float(_DEF_BOX_H), 0.0,
+                        float(_DEF_BOX_W), float(_DEF_BOX_H), _ang,
                     )
             if any(d is not None for d in det_from_rec):
                 self._strobe_det = det_from_rec
@@ -1757,6 +1771,7 @@ class PutterLive:
                                 self._kf_col_centers[3] = (
                                     (_bzx + _bzw // 2) // 2,  # half-res
                                     (_bzy + _bzh // 2) // 2,
+                                    0.0,  # impact col: cadre droit (face square)
                                 )
 
                 # ── Suivi de la balle après l'impact ─────────────────────────
