@@ -183,6 +183,8 @@ class PutterLive:
         self._replay_sub = 2   # overwritten by _open_camera based on actual fps
         self._video_mode = False   # True when reading from a file instead of camera
         self._video_path: Optional[str] = None
+        # CLAHE for brightening dark high-shutter-speed frames (à la GolfBoy)
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         self.cap = self._open_camera()
         self.W   = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.H   = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -304,6 +306,15 @@ class PutterLive:
         cv2.namedWindow("Putter Live", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Putter Live", self.W, self.H + PANEL_H)
         cv2.setMouseCallback("Putter Live", self._on_mouse)
+
+    # ── Image enhancement ─────────────────────────────────────────────────────
+
+    def _enhance_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Brighten a dark high-shutter-speed frame with CLAHE (per channel)."""
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l = self._clahe.apply(l)
+        return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
     # ── Camera ────────────────────────────────────────────────────────────────
 
@@ -1549,6 +1560,7 @@ class PutterLive:
                     print("[error] Camera read failed.")
                     break
             self._last_frame = frame.copy()
+            frame = self._enhance_frame(frame)
 
             now = time.time()
             fps_buf.append(1.0 / max(1e-6, now - t_last))
