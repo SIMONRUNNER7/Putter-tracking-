@@ -2293,7 +2293,26 @@ def _show_launch_menu() -> Optional[str]:
 
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    selection = _show_launch_menu()
+    # Si un fichier vidéo est passé en argument, l'utiliser directement
+    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
+        selection = sys.argv[1]
+    else:
+        try:
+            selection = _show_launch_menu()
+        except Exception:
+            # PyQt6 non disponible : demander dans le terminal
+            print("\nPyQt6 non disponible – mode terminal.")
+            print("  [C] Caméra en direct")
+            print("  [V] Chemin vers une vidéo")
+            choix = input("Choix (C/V) : ").strip().upper()
+            if choix == "V":
+                selection = input("Chemin vidéo : ").strip().strip('"').strip("'")
+                if not os.path.isfile(selection):
+                    print(f"[error] Fichier introuvable : {selection}")
+                    sys.exit(1)
+            else:
+                selection = "camera"
+
     if selection is None:
         sys.exit(0)
 
