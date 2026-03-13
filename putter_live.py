@@ -771,7 +771,7 @@ class PutterLive:
 
     def _draw_hud(self, frame, fps: float, extra: list = None):
         track_label = {"aruco": "ArUco", "csrt": "CSRT",
-                       "zone": "Zone", "none": "None ✗"}.get(self._track_mode, "?")
+                       "zone": "Zone", "none": "None ???"}.get(self._track_mode, "None ???")
         source_label = (
             f"VIDEO : {os.path.basename(self._video_path)}" if self._video_mode
             else "SOURCE: Camera"
@@ -1433,10 +1433,6 @@ class PutterLive:
             avg_y = int(np.mean([pt[1] for pt in valid_c]))
             cv2.line(out, (0, avg_y), (self.W, avg_y), (100, 120, 180), 1, cv2.LINE_AA)
 
-        # ── 9. Dark header bar (reference UI style) ────────────────────────
-        cv2.rectangle(out, (0, 0), (self.W, HDR_H), (25, 40, 65), -1)
-        cv2.line(out, (0, HDR_H), (self.W, HDR_H), (0, 110, 180), 1)
-
         def _angle_str(v):
             if v is None:
                 return "--"
@@ -1446,64 +1442,45 @@ class PutterLive:
         r_res = self.result
         face_str = _angle_str(r_res.face_impact if r_res else None)
         path_str = _angle_str(r_res.launch_dir  if r_res else None)
-        arc_str  = r_res.arc_class if r_res else "--"
-        arc_clr  = ((30, 200,  60) if r_res and r_res.arc_class == "Straight" else
-                    (30, 200, 200) if r_res and r_res.arc_class == "Slight Arc" else
-                    (0, 140, 255))
 
-        # Left: title
-        cv2.putText(out, "ANALYSE  SWING", (12, HDR_H - 11),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, GOLD, 1, cv2.LINE_AA)
+        # ── 9. Separator line between video and panel ──────────────────────
+        cv2.line(out, (0, self.H), (self.W, self.H), (60, 60, 60), 1)
 
-        # Centre: metrics
-        mx = 205
-        for txt, clr in [(f"Face {face_str}", WHITE),
-                         (f"Path {path_str}", WHITE),
-                         (arc_str,            arc_clr)]:
-            (tw, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
-            cv2.putText(out, txt, (mx, HDR_H - 11),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 2, cv2.LINE_AA)
-            cv2.putText(out, txt, (mx, HDR_H - 11),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, clr, 1, cv2.LINE_AA)
-            mx += tw + 22
+        # ── 10. Panel: Face Angle (left) + Launch Direction (right) ───────
+        half_w   = self.W // 2
+        py_label = self.H + 38
+        py_val   = self.H + 75
+        py_dash  = self.H + 100
 
-        # Right: shot counter
-        shot_str = f"#{self._shot_count:03d}"
-        (sw, _), _ = cv2.getTextSize(shot_str, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
-        cv2.putText(out, shot_str, (self.W - sw - 12, HDR_H - 11),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, GOLD, 1, cv2.LINE_AA)
+        # Face Angle – left half
+        lbl_fa = "Face Angle"
+        (lw, _), _ = cv2.getTextSize(lbl_fa, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
+        cv2.putText(out, lbl_fa, (half_w // 2 - lw // 2, py_label),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1, cv2.LINE_AA)
+        (vw, _), _ = cv2.getTextSize(face_str, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 1)
+        cv2.putText(out, face_str, (half_w // 2 - vw // 2, py_val),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, WHITE, 1, cv2.LINE_AA)
+        # Dash indicator
+        dash_cx = half_w // 2
+        cv2.line(out, (dash_cx - 28, py_dash), (dash_cx - 8,  py_dash), WHITE, 3, cv2.LINE_AA)
+        cv2.line(out, (dash_cx + 8,  py_dash), (dash_cx + 28, py_dash), WHITE, 3, cv2.LINE_AA)
 
-        # ── 10. Panel metrics ──────────────────────────────────────────────
-        if r_res is not None:
-            panel_items = [
-                ("Face @ impact", face_str,  WHITE),
-                ("Path",          path_str,  WHITE),
-                ("Arc",           arc_str,   arc_clr),
-                ("Face @ addr",   _angle_str(r_res.face_address), (180, 180, 180)),
-                ("Tempo (s)",
-                 f"{r_res.timestamps[-1] - r_res.timestamps[0]:.2f}"
-                 if len(r_res.timestamps) >= 2 else "--",
-                 (180, 180, 180)),
-            ]
-            col_w_panel = self.W // len(panel_items)
-            py_label = self.H + 30
-            py_value = self.H + 62
-            for ci, (lbl, val, clr) in enumerate(panel_items):
-                px = ci * col_w_panel + col_w_panel // 2
-                (lw, _), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
-                cv2.putText(out, lbl, (px - lw // 2, py_label),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (130, 130, 130), 1, cv2.LINE_AA)
-                (vw, _), _ = cv2.getTextSize(val, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 1)
-                cv2.putText(out, val, (px - vw // 2, py_value),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.58, clr, 1, cv2.LINE_AA)
-            # Separator line between video and panel
-            cv2.line(out, (0, self.H), (self.W, self.H), (60, 60, 60), 1)
+        # Vertical divider
+        cv2.line(out, (half_w, self.H + 10), (half_w, self.H + PANEL_H - 10),
+                 (80, 80, 80), 1)
 
-        # ── 11. Bottom hint ────────────────────────────────────────────────
-        hint = "L: retour live   SPACE: repositionner + nouveau coup   T: annoter   Q: quitter"
-        (hw, _), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.36, 1)
-        cv2.putText(out, hint, (self.W - hw - 8, self.H + PANEL_H - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (100, 100, 100), 1, cv2.LINE_AA)
+        # Launch Direction – right half
+        lbl_ld = "Launch Direction"
+        (lw2, _), _ = cv2.getTextSize(lbl_ld, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
+        cv2.putText(out, lbl_ld, (half_w + half_w // 2 - lw2 // 2, py_label),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1, cv2.LINE_AA)
+        (vw2, _), _ = cv2.getTextSize(path_str, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 1)
+        cv2.putText(out, path_str, (half_w + half_w // 2 - vw2 // 2, py_val),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, WHITE, 1, cv2.LINE_AA)
+        # Dash indicator
+        dash_cx2 = half_w + half_w // 2
+        cv2.line(out, (dash_cx2 - 28, py_dash), (dash_cx2 - 8,  py_dash), WHITE, 3, cv2.LINE_AA)
+        cv2.line(out, (dash_cx2 + 8,  py_dash), (dash_cx2 + 28, py_dash), WHITE, 3, cv2.LINE_AA)
 
         return out
 
@@ -2016,6 +1993,8 @@ class PutterLive:
                     frame[:vid_h, :cover_x] = (
                         frame[:vid_h, :cover_x].astype(np.int32) * 30 // 100
                     ).astype(np.uint8)
+
+                self._draw_hud(frame, fps, ["SPACE = new shot   T = annotate"])
 
             # ── ANNOTATE ──────────────────────────────────────────────────
             elif self.state == AppState.ANNOTATE:
